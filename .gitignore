@@ -1,0 +1,119 @@
+# ===========================
+# OS & Editor
+# ===========================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# ===========================
+# Backend (Go)
+# ===========================
+# Compiled binary
+backend/server
+
+# Xray core binary (downloaded at runtime)
+backend/xray
+
+# GeoIP / GeoSite data files (large, downloaded at runtime)
+backend/geoip.dat
+backend/geosite.dat
+
+# Runtime generated config
+backend/xray.json
+backend/xray-sidecar.json
+backend/sing-box.json
+backend/sing-box
+backend/sing-box.exe
+
+# User data / runtime state
+backend/data/
+backend/rulesets/
+backend/.device.key
+backend/nodes.json
+backend/listeners.json
+backend/settings.json
+
+# ===========================
+# Frontend (Vite + React)
+# ===========================
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+*.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ===========================
+# Frontend - Tauri / Rust
+# ===========================
+frontend/src-tauri/target/
+frontend/src-tauri/gen/schemas
+
+# ===========================
+# Misc
+# ===========================
+*.tmp
+*.bak
+*.orig
+
+# Local secrets (keep sanitized examples trackable)
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# Windows backend binaries
+backend/server.exe
+backend/xray.exe
+
+# CI packaging outputs and Python caches
+/artifacts/
+__pycache__/
+*.pyc
+/backend/coverage.out
+
+/frontend/src-tauri/binaries/
+/backend/*.snapshot
+/backend/preferences.json
+/backend/subscriptions.json
+/backend/system-proxy-backup.json
+
+/frontend/src-tauri/updater.generated.json
+/frontend/src-tauri/full.generated.json
+/frontend/src-tauri/gen/android/app/build/
+/frontend/src-tauri/gen/android/.gradle/
+/frontend/src-tauri/gen/android/local.properties
+/frontend/src-tauri/gen/android/app/src/main/jniLibs/
+/backend/cores/
+/backend/health.json
+/backend/tun.json
+/backend/xray-sidecar.json
+/backend/sing-box.json
+
+/backend/restore.pending.json
+/backend/*.db
+/backend/*.db-shm
+/backend/*.db-wal
+
+/release-downloads/
+/release-assets/
+/releases/
+/docs-debug/
+/keystore/
+*.jks
+*.keystore
+keystore.properties

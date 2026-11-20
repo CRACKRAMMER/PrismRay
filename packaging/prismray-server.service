@@ -1,0 +1,15 @@
+[Unit]
+Description=PrismRay headless Web service
+
+[Service]
+Type=simple
+ConfigurationDirectory=prismray
+StateDirectory=prismray
+WorkingDirectory=%S/prismray
+ExecStart=/usr/bin/prismray-server --config %E/prismray/settings.json --data-dir %S/prismray --web-dir /usr/share/prismray-server/web
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,100 @@
+name: Publish Homebrew Cask to tap
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (e.g. v1.0.0; defaults to latest published release)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-tap-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-cask:
+    name: Update CRACKRAMMER/homebrew-tap Casks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Check Homebrew tap token configuration
+        id: config
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO || 'CRACKRAMMER/homebrew-tap' }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::notice::HOMEBREW_TAP_TOKEN secret is not configured; skipping Homebrew tap update."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "tap_repo=$TAP_REPO" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve release tag and download SHA256SUMS.txt
+        id: release
+        if: steps.config.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag || '' }}
+          EVENT_TAG: ${{ github.event.release.tag_name || '' }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          elif [ -n "$EVENT_TAG" ]; then
+            TAG="$EVENT_TAG"
+          else
+            TAG="$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName --jq .tagName)"
+          fi
+          echo "==> Target release tag: $TAG"
+          mkdir -p release-meta
+          gh release download "$TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "SHA256SUMS.txt" \
+            --dir release-meta \
+            --clobber
+          if grep -Eq 'prismray-macos-arm64-(full|lite)\.dmg' release-meta/SHA256SUMS.txt; then
+            echo "has_macos_dmg=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No macOS DMG entries found in SHA256SUMS.txt for $TAG; skipping Homebrew tap update."
+            echo "has_macos_dmg=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Update Casks/prismray.rb and Casks/prismray-lite.rb in tap repository
+        if: steps.config.outputs.enabled == 'true' && steps.release.outputs.has_macos_dmg == 'true'
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPO: ${{ steps.config.outputs.tap_repo }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPO}.git" homebrew-tap
+          python3 scripts/update_homebrew_cask.py \
+            --tap-dir homebrew-tap \
+            --version "$RELEASE_TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --checksums release-meta/SHA256SUMS.txt
+          cd homebrew-tap
+          if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+            git checkout -B main
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/
+          if git diff --cached --quiet; then
+            echo "==> Homebrew Casks are already up to date for $RELEASE_TAG."
+            exit 0
+          fi
+          git commit -m "chore(prismray): bump casks to ${RELEASE_TAG}"
+          git push origin HEAD:main

@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">PrismRay</string>
+    <string name="main_activity_title">PrismRay</string>
+    <string name="widget_vpn_label">PrismRay VPN</string>
+    <string name="widget_vpn_description">One-tap VPN toggle with live node and throughput status</string>
+    <string name="widget_status_connected">Connected</string>
+    <string name="widget_status_disconnected">Disconnected</string>
+    <string name="widget_status_connecting">Connecting…</string>
+    <string name="widget_toggle_cd">Toggle PrismRay VPN</string>
+</resources>

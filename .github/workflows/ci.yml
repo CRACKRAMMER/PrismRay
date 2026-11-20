@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Go tests and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Test artifact packaging
+        working-directory: .
+        run: python -m unittest discover -s scripts -p 'test_*.py'
+      - name: Check Go formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+      - run: go test -race -coverprofile=coverage.out ./...
+      - run: go vet ./...
+      - run: go build -trimpath -o server ./cmd/server
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: go-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: backend/coverage.out
+          if-no-files-found: error
+          retention-days: 14
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Headless Web integration
+        working-directory: .
+        env:
+          CGO_ENABLED: '0'
+          PRISMRAY_TEST_BINARY: backend/server
+          PRISMRAY_WEB_DIR: frontend/dist
+        run: |
+          go -C backend build -o server ./cmd/server
+          python3 scripts/test_headless_backend.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: frontend-dist-${{ github.run_id }}-${{ github.run_attempt }}
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  desktop:
+    name: Tauri compile check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev build-essential libssl-dev libxdo-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: frontend/src-tauri -> target
+          key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - run: python3 scripts/build_sidecar.py
+      - name: Desktop backend integration
+        env:
+          PRISMRAY_TEST_BINARY: frontend/src-tauri/binaries/prismray-server-x86_64-unknown-linux-gnu
+        run: |
+          python3 scripts/test_desktop_backend.py
+          python3 scripts/test_subscription_backend.py
+      - name: Check Tauri with locked dependencies
+        working-directory: frontend/src-tauri
+        run: cargo check --locked

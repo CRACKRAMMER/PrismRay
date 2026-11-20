@@ -1,0 +1,380 @@
+name: Build desktop packages and draft release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Check tag against application versions
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_VALIDATE_ONLY: '1'
+        run: python3 scripts/release.py
+
+  package:
+    name: Package ${{ matrix.platform }}
+    needs: [checks, version]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            goos: linux
+            goarch: amd64
+            bundles: deb,rpm,appimage
+            extension: ''
+          - platform: windows-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            goos: windows
+            goarch: amd64
+            bundles: nsis,msi
+            extension: .exe
+          - platform: macos-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            goos: darwin
+            goarch: arm64
+            bundles: dmg
+            extension: ''
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUST_TARGET: ${{ matrix.target }}
+      BUNDLE_TYPES: ${{ matrix.bundles }}
+      BACKEND_NAME: prismray-server${{ matrix.extension }}
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev build-essential libssl-dev libxdo-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils libfuse2 rpm
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: frontend/src-tauri -> target
+          key: package-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Stage bundled sidecar
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: python scripts/build_sidecar.py
+      - name: Use ad-hoc signing on macOS
+        if: runner.os == 'macOS'
+        run: printf '%s\n' 'APPLE_SIGNING_IDENTITY=-' >> "$GITHUB_ENV"
+      - name: Configure signed updater artifacts
+        env:
+          UPDATER_PUBLIC_KEY: ${{ vars.UPDATER_PUBLIC_KEY }}
+          UPDATER_ENDPOINT: ${{ vars.UPDATER_ENDPOINT }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: python scripts/configure_updater.py
+      - name: Build desktop installers (Lite edition)
+        working-directory: frontend
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+          NO_STRIP: 'true'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri -- build --ci --ignore-version-mismatches --config src-tauri/updater.generated.json --target "$RUST_TARGET" --bundles "$BUNDLE_TYPES" -- --locked
+      - name: Verify Lite AppImage excludes host Wayland client library
+        if: runner.os == 'Linux'
+        working-directory: frontend
+        run: |
+          APPIMAGE_FILE="$(find "src-tauri/target/$RUST_TARGET/release/bundle/appimage" -maxdepth 1 -name '*.AppImage' | head -n1)"
+          test -f "$APPIMAGE_FILE"
+          TMP_EXTRACT="$(mktemp -d)"
+          (cd "$TMP_EXTRACT" && "$OLDPWD/$APPIMAGE_FILE" --appimage-extract >/dev/null)
+          if find "$TMP_EXTRACT/squashfs-root/usr/lib" -name 'libwayland-client.so*' | grep -q .; then
+            echo "Error: AppImage still bundles libwayland-client.so*" >&2
+            rm -rf "$TMP_EXTRACT"
+            exit 1
+          fi
+          rm -rf "$TMP_EXTRACT"
+      - name: Export Lite installers
+        env:
+          PACKAGE_PLATFORM: ${{ matrix.platform }}
+        run: python scripts/package_artifacts.py --platform "$PACKAGE_PLATFORM" --target "$RUST_TARGET" --variant lite
+      - name: Stage bundled sing-box + Xray cores for Full edition
+        run: |
+          rm -rf "frontend/src-tauri/target/$RUST_TARGET/release/bundle"
+          python scripts/stage_desktop_cores.py --target "$RUST_TARGET"
+      - name: Build desktop installers (Full edition with sing-box + Xray)
+        working-directory: frontend
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+          NO_STRIP: 'true'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri -- build --ci --ignore-version-mismatches --config src-tauri/full.generated.json --target "$RUST_TARGET" --bundles "$BUNDLE_TYPES" -- --locked
+      - name: Verify Full AppImage excludes host Wayland client library and bundles cores
+        if: runner.os == 'Linux'
+        working-directory: frontend
+        run: |
+          APPIMAGE_FILE="$(find "src-tauri/target/$RUST_TARGET/release/bundle/appimage" -maxdepth 1 -name '*.AppImage' | head -n1)"
+          test -f "$APPIMAGE_FILE"
+          TMP_EXTRACT="$(mktemp -d)"
+          (cd "$TMP_EXTRACT" && "$OLDPWD/$APPIMAGE_FILE" --appimage-extract >/dev/null)
+          if find "$TMP_EXTRACT/squashfs-root/usr/lib" -name 'libwayland-client.so*' | grep -q .; then
+            echo "Error: Full AppImage still bundles libwayland-client.so*" >&2
+            rm -rf "$TMP_EXTRACT"
+            exit 1
+          fi
+          test -f "$TMP_EXTRACT/squashfs-root/usr/bin/sing-box"
+          test -f "$TMP_EXTRACT/squashfs-root/usr/bin/xray"
+          rm -rf "$TMP_EXTRACT"
+      - name: Export Full installers
+        env:
+          PACKAGE_PLATFORM: ${{ matrix.platform }}
+        run: python scripts/package_artifacts.py --platform "$PACKAGE_PLATFORM" --target "$RUST_TARGET" --variant full
+      - name: Upload platform packages (Lite + Full)
+        id: upload_pkg
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: prismray-${{ matrix.platform }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/prismray-${{ matrix.platform }}-*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Wait before retrying platform package upload
+        if: steps.upload_pkg.outcome == 'failure'
+        run: sleep 15
+      - name: Retry platform package upload
+        if: steps.upload_pkg.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: prismray-${{ matrix.platform }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/prismray-${{ matrix.platform }}-*
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+      - name: Upload signed updater files
+        id: upload_updater
+        continue-on-error: true
+        if: vars.UPDATER_PUBLIC_KEY != '' && vars.UPDATER_ENDPOINT != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: updater-${{ matrix.platform }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.sig
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.tar.gz
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
+          if-no-files-found: error
+      - name: Retry signed updater upload
+        if: vars.UPDATER_PUBLIC_KEY != '' && vars.UPDATER_ENDPOINT != '' && steps.upload_updater.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: updater-${{ matrix.platform }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.sig
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.tar.gz
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
+            frontend/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.exe
+          if-no-files-found: error
+          overwrite: true
+
+  android:
+    name: Package android-arm64
+    needs: [checks, version]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Configure Android SDK & install NDK
+        run: |
+          ANDROID_SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$ANDROID_SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_SDK/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK/platform-tools" >> "$GITHUB_PATH"
+          SDKMANAGER="$ANDROID_SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(ls -1 "$ANDROID_SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n1)"
+          fi
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager)"
+          fi
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$ANDROID_SDK" --install \
+            "platform-tools" "platforms;android-36" "build-tools;35.0.0" "ndk;29.0.14206865"
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: frontend/src-tauri -> target
+          key: package-android-arm64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Stage Android native libraries (Go backend, sing-box, Xray)
+        run: python3 scripts/build_android_natives.py --download --abi arm64-v8a
+      - name: Build Android APK
+        working-directory: frontend
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          PRISMRAY_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          PRISMRAY_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          PRISMRAY_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          export NDK_HOME="$ANDROID_HOME/ndk/29.0.14206865"
+          export ANDROID_NDK_HOME="$NDK_HOME"
+          export CC_aarch64_linux_android="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          export AR_aarch64_linux_android="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$PRISMRAY_ANDROID_KEYSTORE_PASSWORD" ] && [ -n "$PRISMRAY_ANDROID_KEY_ALIAS" ]; then
+            export PRISMRAY_ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/prismray-release.jks"
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$PRISMRAY_ANDROID_KEYSTORE_PATH"
+            chmod 600 "$PRISMRAY_ANDROID_KEYSTORE_PATH"
+            echo "Building signed Release APK (aarch64)"
+            npm run tauri -- android build --ci --ignore-version-mismatches --apk --target aarch64
+          else
+            echo "ANDROID_KEYSTORE_BASE64 not configured; falling back to Debug APK (aarch64)"
+            npm run tauri -- android build --ci --ignore-version-mismatches --apk --debug --target aarch64
+          fi
+      - name: Package Android APK artifact
+        run: python3 scripts/package_artifacts.py --platform android-arm64 --target aarch64-linux-android
+      - name: Upload Android APK artifact
+        id: upload_android
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: prismray-android-arm64-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/prismray-android-arm64.*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Wait before retrying Android artifact upload
+        if: steps.upload_android.outcome == 'failure'
+        run: sleep 15
+      - name: Retry Android APK artifact upload
+        if: steps.upload_android.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: prismray-android-arm64-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/prismray-android-arm64.*
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  headless:
+    name: Package headless Linux Web
+    needs: [checks, version]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+      - name: Build production Web frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+      - name: Package headless Linux x64 and arm64 archives
+        run: |
+          python3 scripts/build_headless.py --platform linux-x64 --goos linux --goarch amd64 --web-dist frontend/dist --output-dir artifacts
+          python3 scripts/build_headless.py --platform linux-arm64 --goos linux --goarch arm64 --web-dist frontend/dist --output-dir artifacts
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: prismray-headless-linux-x64-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/prismray-headless-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: prismray-headless-linux-arm64-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/prismray-headless-linux-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Create draft prerelease
+    if: github.ref_type == 'tag'
+    needs: [package, headless, android]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Collect packages and create draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py

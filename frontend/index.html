@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      try {
+        var s = localStorage.getItem("prismray-color-scheme");
+        var v = s === "light" ? "light" : s === "dark" ? "dark" : "light dark";
+        document.querySelector('meta[name="color-scheme"]').setAttribute("content", v);
+        var isDark = v === "dark" || (v === "light dark" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.classList.toggle("dark", isDark);
+        document.documentElement.style.colorScheme = v === "light dark" ? (isDark ? "dark" : "light") : v;
+        var rawLang = (localStorage.getItem("prismray-locale") || (navigator.languages && navigator.languages[0]) || navigator.language || "").toLowerCase();
+        var isZh = rawLang === "zh" || rawLang.indexOf("zh-") === 0 || rawLang.indexOf("zh_") === 0;
+        document.documentElement.lang = isZh ? "zh-CN" : "en-US";
+      } catch (e) {}
+    </script>
+    <meta name="description" content="PrismRay v1.0.0 - High-density multi-protocol proxy workbench" />
+    <title>PrismRay</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

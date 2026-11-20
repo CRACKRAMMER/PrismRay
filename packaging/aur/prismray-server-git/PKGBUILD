@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: MPL-2.0
+pkgname=prismray-server-git
+pkgver=1.0.0.r0.g0000000
+pkgrel=1
+pkgdesc='Dual-core headless proxy manager (sing-box + Xray) with a Web UI and subscriptions'
+arch=('x86_64' 'aarch64')
+url='https://github.com/CRACKRAMMER/PrismRay'
+license=('MPL-2.0')
+depends=('ca-certificates')
+makedepends=('git' 'go>=1.26.0' 'nodejs>=22' 'npm' 'python')
+optdepends=('sing-box: primary proxy & TUN core' 'xray: on-demand XHTTP / VLESS encryption coprocessor' 'systemd: optional user service')
+provides=("prismray-server=${pkgver}")
+conflicts=('prismray-server' 'prismray-server-bin')
+options=('!lto' '!debug')
+source=('prismray::git+https://github.com/CRACKRAMMER/PrismRay.git')
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/prismray"
+  local version
+  version=$(python -c 'import json; print(json.load(open("frontend/package.json"))["version"])')
+  printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+prepare() {
+  cd "$srcdir/prismray/frontend"
+  npm ci --no-audit --no-fund
+  cd ../backend
+  go mod download
+}
+build() {
+  cd "$srcdir/prismray/frontend"
+  npm run build
+  cd ../backend
+  CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o prismray-server ./cmd/server
+}
+check() {
+  cd "$srcdir/prismray/backend"
+  go test ./...
+  cd ..
+  PRISMRAY_TEST_BINARY=backend/prismray-server PRISMRAY_WEB_DIR=frontend/dist python scripts/test_headless_backend.py
+}
+package() {
+  cd "$srcdir/prismray"
+  install -Dm755 backend/prismray-server "$pkgdir/usr/bin/prismray-server"
+  install -d "$pkgdir/usr/share/prismray-server/web"
+  cp -a frontend/dist/. "$pkgdir/usr/share/prismray-server/web/"
+  install -Dm644 packaging/prismray-server.service "$pkgdir/usr/lib/systemd/user/prismray-server.service"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 THIRD_PARTY_NOTICES.md "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES.md"
+  install -Dm644 docs/HEADLESS.md "$pkgdir/usr/share/doc/$pkgname/HEADLESS.md"
+  install -Dm644 docs/SUBSCRIPTIONS.md "$pkgdir/usr/share/doc/$pkgname/SUBSCRIPTIONS.md"
+}

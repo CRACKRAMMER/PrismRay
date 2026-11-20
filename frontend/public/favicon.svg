@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="64" height="64">
+  <defs>
+    <linearGradient id="pr-bg" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1A1D2B" />
+      <stop offset="55%" stop-color="#11131A" />
+      <stop offset="100%" stop-color="#0B0C11" />
+    </linearGradient>
+    <linearGradient id="pr-in-beam" x1="88" y1="560" x2="360" y2="480" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.15" />
+      <stop offset="60%" stop-color="#EEF2FF" stop-opacity="0.88" />
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="1" />
+    </linearGradient>
+    <linearGradient id="pr-ray-cyan" x1="560" y1="480" x2="940" y2="360" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#67E8F9" />
+      <stop offset="55%" stop-color="#38BDF8" />
+      <stop offset="100%" stop-color="#0EA5E9" stop-opacity="0.25" />
+    </linearGradient>
+    <linearGradient id="pr-ray-indigo" x1="580" y1="530" x2="944" y2="530" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#818CF8" />
+      <stop offset="55%" stop-color="#5E6AD2" />
+      <stop offset="100%" stop-color="#4F46E5" stop-opacity="0.28" />
+    </linearGradient>
+    <linearGradient id="pr-ray-violet" x1="600" y1="580" x2="932" y2="690" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#C084FC" />
+      <stop offset="55%" stop-color="#9333EA" />
+      <stop offset="100%" stop-color="#7E22CE" stop-opacity="0.22" />
+    </linearGradient>
+    <linearGradient id="pr-facet-left" x1="250" y1="220" x2="488" y2="790" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="45%" stop-color="#E0E7FF" />
+      <stop offset="100%" stop-color="#93C5FD" />
+    </linearGradient>
+    <linearGradient id="pr-facet-right" x1="488" y1="180" x2="750" y2="790" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#818CF8" />
+      <stop offset="50%" stop-color="#5E6AD2" />
+      <stop offset="100%" stop-color="#0EA5E9" />
+    </linearGradient>
+    <linearGradient id="pr-facet-bottom" x1="214" y1="740" x2="762" y2="790" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#312E81" />
+      <stop offset="100%" stop-color="#1E3A8A" />
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#pr-bg)" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="12" />
+  <polygon points="88,542 368,438 386,496 88,588" fill="url(#pr-in-beam)" />
+  <polygon points="564,432 932,312 932,388 588,486" fill="url(#pr-ray-cyan)" />
+  <polygon points="588,486 942,468 942,544 612,540" fill="url(#pr-ray-indigo)" />
+  <polygon points="612,540 924,624 924,700 636,596" fill="url(#pr-ray-violet)" />
+  <polygon points="488,168 206,796 488,716" fill="url(#pr-facet-left)" />
+  <polygon points="488,168 770,796 488,716" fill="url(#pr-facet-right)" />
+  <polygon points="206,796 488,716 770,796" fill="url(#pr-facet-bottom)" fill-opacity="0.92" />
+  <line x1="488" y1="176" x2="488" y2="716" stroke="#FFFFFF" stroke-opacity="0.72" stroke-width="10" stroke-linecap="round" />
+  <polygon points="488,168 770,796 206,796" fill="none" stroke="#E0E7FF" stroke-opacity="0.48" stroke-width="12" stroke-linejoin="round" />
+</svg>

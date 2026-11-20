@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Incoming beam -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M2,13.2L8.2,11.3L8.7,12.8L2.5,14.7Z" />
+    <!-- Triangular prism outline -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M11.6,4.2C11.9,3.7 12.6,3.7 12.9,4.2L18.4,17.2C18.7,17.8 18.2,18.5 17.6,18.5H6.9C6.2,18.5 5.8,17.8 6.1,17.2L11.6,4.2ZM12.25,7.3L8.4,16.5H16.1L12.25,7.3Z" />
+    <!-- Refracted rays -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M16.2,10.5L21.8,8.5L22.2,9.8L16.6,11.8Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M16.8,12.4L22.2,12.4L22.2,13.8L16.8,13.8Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M17.2,14.4L22,16.3L21.5,17.6L16.7,15.7Z" />
+</vector>

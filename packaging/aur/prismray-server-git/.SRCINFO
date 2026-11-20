@@ -1,0 +1,26 @@
+pkgbase = prismray-server-git
+	pkgdesc = Dual-core headless proxy manager (sing-box + Xray) with a Web UI and subscriptions
+	pkgver = 1.0.0.r0.g0000000
+	pkgrel = 1
+	url = https://github.com/CRACKRAMMER/PrismRay
+	arch = x86_64
+	arch = aarch64
+	license = MPL-2.0
+	makedepends = git
+	makedepends = go>=1.26.0
+	makedepends = nodejs>=22
+	makedepends = npm
+	makedepends = python
+	depends = ca-certificates
+	optdepends = sing-box: primary proxy & TUN core
+	optdepends = xray: on-demand XHTTP / VLESS encryption coprocessor
+	optdepends = systemd: optional user service
+	provides = prismray-server=1.0.0.r0.g0000000
+	conflicts = prismray-server
+	conflicts = prismray-server-bin
+	options = !lto
+	options = !debug
+	source = prismray::git+https://github.com/CRACKRAMMER/PrismRay.git
+	sha256sums = SKIP
+
+pkgname = prismray-server-git

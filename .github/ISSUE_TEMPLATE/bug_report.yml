@@ -1,0 +1,51 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in PrismRay
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue! Please redact any private proxy addresses, UUIDs, passwords, or subscription URLs before submitting.
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux Desktop (AppImage / deb / rpm / Arch)
+        - Windows Desktop (exe / msi)
+        - macOS ARM64 (dmg)
+        - Android ARM64 (apk)
+        - Headless Linux / Web Server
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: PrismRay Version & Core Versions
+      placeholder: "e.g. PrismRay v1.0.0, sing-box 1.14.4, Xray 26.3.27"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug clearly and include expected vs actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Open ...
+        2. Enable ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs (Redacted)
+      description: Paste relevant sanitized logs from Settings → Logs (or Android Logcat).
+      render: text

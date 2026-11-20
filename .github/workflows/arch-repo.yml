@@ -1,0 +1,228 @@
+name: Build Arch Linux Pacman repository
+
+on:
+  workflow_dispatch:
+    inputs:
+      pkgrel:
+        description: Arch package release number (pkgrel)
+        required: false
+        default: '1'
+        type: string
+      publish_pages:
+        description: Publish static Pacman repo to gh-pages branch
+        required: false
+        default: true
+        type: boolean
+      attach_release_tag:
+        description: Optional GitHub Release tag to attach .pkg.tar.zst assets (defaults to v<version> if release exists)
+        required: false
+        default: ''
+        type: string
+  push:
+    tags: ['v*']
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arch-repo-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-arch:
+    name: Build native Arch Linux x86_64 packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      pkgver: ${{ steps.stage.outputs.pkgver }}
+      pkgrel: ${{ steps.stage.outputs.pkgrel }}
+      target_repo: ${{ steps.target.outputs.target_repo }}
+      repo_name: ${{ steps.target.outputs.repo_name }}
+      pages_url: ${{ steps.target.outputs.pages_url }}
+      use_external: ${{ steps.target.outputs.use_external }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve Pacman repository target
+        id: target
+        env:
+          ARCH_REPO_TOKEN: ${{ secrets.ARCH_REPO_TOKEN }}
+          ARCH_REPO_SLUG: ${{ vars.ARCH_REPO_SLUG || 'CRACKRAMMER/arch-repo' }}
+          ARCH_REPO_NAME: ${{ vars.ARCH_REPO_NAME || 'crackrammer' }}
+          ARCH_PAGES_URL: ${{ vars.ARCH_PAGES_URL || '' }}
+        run: |
+          if [ -n "$ARCH_REPO_TOKEN" ]; then
+            TARGET_REPO="$ARCH_REPO_SLUG"
+            REPO_NAME="$ARCH_REPO_NAME"
+            USE_EXTERNAL="true"
+          else
+            echo "::notice::ARCH_REPO_TOKEN not set; falling back to local ${GITHUB_REPOSITORY} gh-pages ([prismray])."
+            TARGET_REPO="${GITHUB_REPOSITORY}"
+            REPO_NAME="prismray"
+            USE_EXTERNAL="false"
+          fi
+          TARGET_OWNER="${TARGET_REPO%%/*}"
+          TARGET_NAME="${TARGET_REPO##*/}"
+          if [ -n "$ARCH_PAGES_URL" ] && [ "$USE_EXTERNAL" = "true" ]; then
+            PAGES_URL="$ARCH_PAGES_URL"
+          else
+            PAGES_URL="https://${TARGET_OWNER,,}.github.io/${TARGET_NAME}"
+          fi
+          echo "target_repo=$TARGET_REPO" >> "$GITHUB_OUTPUT"
+          echo "repo_name=$REPO_NAME" >> "$GITHUB_OUTPUT"
+          echo "pages_url=$PAGES_URL" >> "$GITHUB_OUTPUT"
+          echo "use_external=$USE_EXTERNAL" >> "$GITHUB_OUTPUT"
+          echo "==> Target Pacman repo: ${TARGET_REPO} ([${REPO_NAME}] @ ${PAGES_URL})"
+
+      - name: Stage Arch source tarball and PKGBUILDs
+        id: stage
+        env:
+          PKGREL: ${{ inputs.pkgrel || '1' }}
+        run: |
+          mkdir -p arch-work/staged arch-work/existing-site arch-out
+          python3 packaging/arch/build_repo.py stage-pkgbuilds \
+            --repo-root "$PWD" \
+            --out-dir "$PWD/arch-work/staged" \
+            --pkgrel "$PKGREL" > arch-work/stage.json
+          cat arch-work/stage.json
+          PKGVER="$(python3 -c 'import json; print(json.load(open("arch-work/stage.json"))["pkgver"])')"
+          PKGREL_OUT="$(python3 -c 'import json; print(json.load(open("arch-work/stage.json"))["pkgrel"])')"
+          echo "pkgver=$PKGVER" >> "$GITHUB_OUTPUT"
+          echo "pkgrel=$PKGREL_OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch existing multi-project gh-pages site for incremental merge
+        if: steps.target.outputs.use_external == 'true'
+        env:
+          ARCH_REPO_TOKEN: ${{ secrets.ARCH_REPO_TOKEN }}
+          TARGET_REPO: ${{ steps.target.outputs.target_repo }}
+        run: |
+          rm -rf arch-work/existing-site
+          if git clone --depth 1 --branch gh-pages "https://x-access-token:${ARCH_REPO_TOKEN}@github.com/${TARGET_REPO}.git" arch-work/existing-site 2>/dev/null; then
+            echo "==> Loaded existing gh-pages site from ${TARGET_REPO} for incremental merge"
+          else
+            echo "==> No existing gh-pages branch in ${TARGET_REPO} yet; initializing fresh Pacman site"
+            mkdir -p arch-work/existing-site
+          fi
+
+      - name: Build packages and Pacman database inside archlinux:base-devel
+        env:
+          ARCH_GPG_PRIVATE_KEY: ${{ secrets.ARCH_GPG_PRIVATE_KEY }}
+          ARCH_GPG_PASSPHRASE: ${{ secrets.ARCH_GPG_PASSPHRASE }}
+          PKG_VERSION: ${{ steps.stage.outputs.pkgver }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          REPO_NAME: ${{ steps.target.outputs.repo_name }}
+          PAGES_URL: ${{ steps.target.outputs.pages_url }}
+          EXISTING_SITE_DIR: /work/existing-site
+        run: |
+          chmod +x packaging/arch/docker_build_arch.sh
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/arch-work/staged:/work/staged:ro" \
+            -v "$PWD/arch-work/existing-site:/work/existing-site:ro" \
+            -v "$PWD/arch-out:/out" \
+            -e PKG_VERSION \
+            -e SOURCE_COMMIT \
+            -e REPO_NAME \
+            -e PAGES_URL \
+            -e EXISTING_SITE_DIR \
+            -e ARCH_GPG_PRIVATE_KEY \
+            -e ARCH_GPG_PASSPHRASE \
+            archlinux:base-devel \
+            bash /src/packaging/arch/docker_build_arch.sh
+
+      - name: Upload Arch packages artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: prismray-arch-x86_64-${{ github.sha }}-${{ github.run_attempt }}
+          path: arch-out/packages/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload static Pacman repository site artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: prismray-arch-site-${{ github.sha }}-${{ github.run_attempt }}
+          path: arch-out/site
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish gh-pages Pacman repo and attach Release assets
+    needs: [build-arch]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: prismray-arch-site-${{ github.sha }}-${{ github.run_attempt }}
+          path: arch-site
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: prismray-arch-x86_64-${{ github.sha }}-${{ github.run_attempt }}
+          path: arch-packages
+
+      - name: Push compact orphan commit to gh-pages
+        if: github.event_name != 'workflow_dispatch' || inputs.publish_pages != false
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCH_REPO_TOKEN: ${{ secrets.ARCH_REPO_TOKEN }}
+          TARGET_REPO: ${{ needs.build-arch.outputs.target_repo }}
+          REPO_NAME: ${{ needs.build-arch.outputs.repo_name }}
+          USE_EXTERNAL: ${{ needs.build-arch.outputs.use_external }}
+          PKGVER: ${{ needs.build-arch.outputs.pkgver }}
+          PKGREL: ${{ needs.build-arch.outputs.pkgrel }}
+        run: |
+          cd arch-site
+          test -f .nojekyll
+          test -f index.html
+          test -f "arch/x86_64/${REPO_NAME}.db"
+          test ! -L "arch/x86_64/${REPO_NAME}.db"
+          test -f "arch/x86_64/${REPO_NAME}.files"
+          test ! -L "arch/x86_64/${REPO_NAME}.files"
+          PUSH_TOKEN="$GH_TOKEN"
+          if [ "$USE_EXTERNAL" = "true" ]; then
+            PUSH_TOKEN="$ARCH_REPO_TOKEN"
+          fi
+          git init -b gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore(arch): publish prismray ${PKGVER}-${PKGREL} (${GITHUB_SHA::7})"
+          git remote add origin "https://x-access-token:${PUSH_TOKEN}@github.com/${TARGET_REPO}.git"
+          git push --force origin gh-pages:gh-pages
+
+      - name: Attach .pkg.tar.zst packages to matching GitHub Release if present
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.attach_release_tag || '' }}
+          PKGVER: ${{ needs.build-arch.outputs.pkgver }}
+          REPO_NAME: ${{ needs.build-arch.outputs.repo_name }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TARGET_TAG="$INPUT_TAG"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TARGET_TAG="${GITHUB_REF_NAME}"
+          else
+            TARGET_TAG="v${PKGVER}"
+          fi
+          if gh release view "$TARGET_TAG" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            shopt -s nullglob
+            FILES=(arch-packages/*.pkg.tar.zst arch-packages/*.pkg.tar.zst.sig)
+            if [ -f "arch-packages/${REPO_NAME}.gpg" ]; then
+              FILES+=("arch-packages/${REPO_NAME}.gpg")
+            fi
+            if [ "${#FILES[@]}" -gt 0 ]; then
+              echo "==> Uploading Arch packages to release $TARGET_TAG"
+              gh release upload "$TARGET_TAG" --repo "${GITHUB_REPOSITORY}" --clobber "${FILES[@]}"
+            fi
+          else
+            echo "==> No GitHub Release found for $TARGET_TAG yet; skipping release attachment (gh-pages repo is live)."
+          fi

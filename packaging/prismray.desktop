@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PrismRay
+Comment=Manage proxy subscriptions and local listeners
+Comment[zh_CN]=管理代理订阅和本地监听
+Exec=prismray
+Icon=prismray
+Terminal=false
+Categories=Network;
+StartupWMClass=com.crackrammer.prismray
