@@ -75,6 +75,63 @@ export function formatLatency(ms?: number): string {
   return `${ms} ms`;
 }
 
+export const DEFAULT_HIGH_LATENCY_MS = 800;
+
+export type NodeHealthState = "untested" | "ok" | "high" | "unavailable";
+
+export function getNodeHealthState(
+  latency: number | undefined | null,
+  highThresholdMs = DEFAULT_HIGH_LATENCY_MS,
+): NodeHealthState {
+  if (latency === undefined || latency === null || latency === 0) return "untested";
+  if (latency < 0) return "unavailable";
+  const threshold = Number.isFinite(highThresholdMs) && highThresholdMs > 0 ? highThresholdMs : DEFAULT_HIGH_LATENCY_MS;
+  if (latency >= threshold) return "high";
+  return "ok";
+}
+
+export interface NodeHealthStyles {
+  dotClass: string;
+  textClass: string;
+  badgeClass: string;
+}
+
+export function getNodeHealthStyles(state: NodeHealthState): NodeHealthStyles {
+  switch (state) {
+    case "unavailable":
+      return {
+        dotClass: "bg-red-500",
+        textClass: "text-red-500",
+        badgeClass: "border-red-500/40 bg-red-500/10 text-red-500",
+      };
+    case "high":
+      return {
+        dotClass: "bg-amber-500",
+        textClass: "text-amber-600 dark:text-amber-400",
+        badgeClass: "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400",
+      };
+    case "ok":
+      return {
+        dotClass: "bg-emerald-500",
+        textClass: "text-emerald-600 dark:text-emerald-400",
+        badgeClass: "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+      };
+    default:
+      return {
+        dotClass: "bg-muted-foreground/40",
+        textClass: "text-muted-foreground",
+        badgeClass: "border-border bg-muted/40 text-muted-foreground",
+      };
+  }
+}
+
+export function isRuleSetReady(
+  ruleSets: ReadonlyArray<{ id?: string; tag?: string; synced?: boolean; enabled?: boolean }>,
+  tag: string,
+): boolean {
+  return ruleSets.some((rs) => Boolean(rs.synced) && rs.enabled !== false && (rs.tag === tag || rs.id === tag));
+}
+
 export function formatSpeedMbps(mbps?: number): string {
   if (mbps === undefined || mbps <= 0) return "--";
   return mbps >= 10 ? `${mbps.toFixed(1)} Mbps` : `${mbps.toFixed(2)} Mbps`;
@@ -236,10 +293,14 @@ export function sortNodesByMetric<T extends NodeLike>(
   return copy;
 }
 
+export type NodeFilterTabKind = "builtin" | "subscription" | "custom";
+
 export interface NodeFilterTab {
   id: string;
   label: string;
   count: number;
+  kind?: NodeFilterTabKind;
+  deletable?: boolean;
   tagName?: string;
 }
 
@@ -264,6 +325,11 @@ export function nodeMatchesFilterTab(node: NodeLike, tabId: string): boolean {
   return true;
 }
 
+export function nodeMatchesFilterTabs(node: NodeLike, tabIds: ReadonlyArray<string>): boolean {
+  if (!tabIds || tabIds.length === 0 || tabIds.includes("all")) return true;
+  return tabIds.some((id) => nodeMatchesFilterTab(node, id));
+}
+
 export function buildNodeFilterTabs(
   nodes: NodeLike[],
   subscriptions: SubscriptionLike[],
@@ -274,23 +340,23 @@ export function buildNodeFilterTabs(
   const favCount = nodes.filter((n) => Boolean(n.favorite)).length;
 
   const tabs: NodeFilterTab[] = [
-    { id: "all", label: labels.all, count: nodes.length },
-    { id: "manual", label: labels.manual, count: manualCount },
-    { id: "favorites", label: labels.favorites, count: favCount },
+    { id: "all", label: labels.all, count: nodes.length, kind: "builtin", deletable: false },
+    { id: "manual", label: labels.manual, count: manualCount, kind: "builtin", deletable: false },
+    { id: "favorites", label: labels.favorites, count: favCount, kind: "builtin", deletable: false },
   ];
 
   const seenSubIds = new Set<string>();
   for (const s of subscriptions) {
     seenSubIds.add(s.id);
     const count = nodes.filter((n) => (n.sub_id || "").trim() === s.id).length;
-    tabs.push({ id: `sub:${s.id}`, label: s.name, count });
+    tabs.push({ id: `sub:${s.id}`, label: s.name, count, kind: "subscription", deletable: false });
   }
   for (const n of nodes) {
     const sid = n.sub_id?.trim();
     if (sid && !seenSubIds.has(sid)) {
       seenSubIds.add(sid);
       const count = nodes.filter((item) => (item.sub_id || "").trim() === sid).length;
-      tabs.push({ id: `sub:${sid}`, label: sid, count });
+      tabs.push({ id: `sub:${sid}`, label: sid, count, kind: "subscription", deletable: false });
     }
   }
 
@@ -309,7 +375,7 @@ export function buildNodeFilterTabs(
   }
   for (const tag of orderedTags) {
     const count = nodes.filter((n) => nodeHasTag(n, tag)).length;
-    tabs.push({ id: `utag:${tag}`, label: tag, count, tagName: tag });
+    tabs.push({ id: `utag:${tag}`, label: tag, count, kind: "custom", deletable: true, tagName: tag });
   }
   return tabs;
 }

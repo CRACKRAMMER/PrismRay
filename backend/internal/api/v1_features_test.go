@@ -524,8 +524,16 @@ func TestV5GroupReorderPerGroupFailoverAndLoadBalanceSimulator(t *testing.T) {
 	if w2.Code != http.StatusOK {
 		t.Fatalf("create g-lb failed: %d %s", w2.Code, w2.Body.String())
 	}
+	w3 := request(s, http.MethodPost, "/api/groups", `{
+		"id":"g-sel-auto","name":"Auto Failover Sel","strategy":"selector",
+		"node_ids":["lb-n1","lb-n2"],
+		"priority_rule":"speed_first","auto_failover":true
+	}`)
+	if w3.Code != http.StatusOK {
+		t.Fatalf("create g-sel-auto failed: %d %s", w3.Code, w3.Body.String())
+	}
 
-	wReorder := request(s, http.MethodPut, "/api/groups/reorder", `{"group_ids":["g-lb","g-sel-pin"]}`)
+	wReorder := request(s, http.MethodPut, "/api/groups/reorder", `{"group_ids":["g-lb","g-sel-pin","g-sel-auto"]}`)
 	if wReorder.Code != http.StatusOK {
 		t.Fatalf("PUT /api/groups/reorder failed: %d %s", wReorder.Code, wReorder.Body.String())
 	}
@@ -533,17 +541,22 @@ func TestV5GroupReorderPerGroupFailoverAndLoadBalanceSimulator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListGroups failed: %v", err)
 	}
-	if len(groups) != 2 || groups[0].ID != "g-lb" || groups[1].ID != "g-sel-pin" {
-		t.Fatalf("expected reordered groups [g-lb, g-sel-pin], got %+v", groups)
+	if len(groups) != 3 || groups[0].ID != "g-lb" || groups[1].ID != "g-sel-pin" || groups[2].ID != "g-sel-auto" {
+		t.Fatalf("expected reordered groups [g-lb, g-sel-pin, g-sel-auto], got %+v", groups)
 	}
 
 	// 2. Per-group auto_failover vs global Failover=false:
 	//    - g-sel-pin has auto_failover=false: reorders node_ids by speed_first, preserves selected_node_id="lb-n1".
-	//    - g-lb has auto_failover=true: overrides global Failover=false and promotes "lb-n2".
+	//    - g-sel-auto has auto_failover=true: overrides global Failover=false and promotes "lb-n2".
+	//    - g-lb (loadbalance): reorders node_ids so "lb-n2" becomes shard #1, never retains a single selected_node_id.
 	hs := HealthSettings{URL: defaultProbeURL, IntervalSeconds: 120, ToleranceMS: 50, PriorityRule: "latency_first", Failover: false}
 	gPin, _, _, err := s.probeAndReorderGroup(context.Background(), "g-sel-pin", "ping", "", hs, false)
 	if err != nil {
 		t.Fatalf("probeAndReorderGroup(g-sel-pin) failed: %v", err)
+	}
+	gSelAuto, _, _, err := s.probeAndReorderGroup(context.Background(), "g-sel-auto", "ping", "", hs, false)
+	if err != nil {
+		t.Fatalf("probeAndReorderGroup(g-sel-auto) failed: %v", err)
 	}
 	gLB, _, _, err := s.probeAndReorderGroup(context.Background(), "g-lb", "ping", "", hs, false)
 	if err != nil {
@@ -556,8 +569,11 @@ func TestV5GroupReorderPerGroupFailoverAndLoadBalanceSimulator(t *testing.T) {
 	if gPin.SelectedNodeID != "lb-n1" {
 		t.Fatalf("expected auto_failover=false on g-sel-pin to keep lb-n1 selected, got %q", gPin.SelectedNodeID)
 	}
-	if gLB.SelectedNodeID != "lb-n2" {
-		t.Fatalf("expected auto_failover=true on g-lb to override global failover=false and promote lb-n2, got %q", gLB.SelectedNodeID)
+	if gSelAuto.SelectedNodeID != "lb-n2" {
+		t.Fatalf("expected auto_failover=true on g-sel-auto to override global failover=false and promote lb-n2, got %q", gSelAuto.SelectedNodeID)
+	}
+	if gLB.NodeIDs[0] != "lb-n2" || gLB.SelectedNodeID != "" || gLB.ManualPin {
+		t.Fatalf("expected loadbalance g-lb to promote lb-n2 to shard #1 with empty selected_node_id, got %+v", gLB)
 	}
 
 	// 3. Simulate routing against active loadbalance group: github.com and api.github.com must share the same shard.
@@ -635,8 +651,8 @@ func TestNodeTabsMultiModePingGroupPriorityAndSubscriptionZero(t *testing.T) {
 		Group storage.Group `json:"group"`
 	}
 	_ = json.Unmarshal(probeGrpRes.Body.Bytes(), &pg)
-	if len(pg.Group.NodeIDs) != 2 || pg.Group.NodeIDs[0] != "n-ok" || pg.Group.SelectedNodeID != "n-ok" {
-		t.Fatalf("expected n-ok promoted to priority #1 & selected, got %+v", pg.Group)
+	if len(pg.Group.NodeIDs) != 2 || pg.Group.NodeIDs[0] != "n-ok" || pg.Group.ManualPin || pg.Group.SelectedNodeID != "" {
+		t.Fatalf("expected n-ok promoted to priority #1 in urltest auto mode, got %+v", pg.Group)
 	}
 	okNode := s.store.Get("n-ok")
 	if okNode == nil || okNode.PingMS <= 0 {

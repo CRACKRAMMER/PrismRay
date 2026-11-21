@@ -84,10 +84,12 @@ func (s *Server) handleAndroidVPNStatus(w http.ResponseWriter, r *http.Request) 
 	st := s.ensureOrchestrator().Status()
 	bypassLAN := true
 	allowLANBroadcast := false
+	ipv6Enabled := false
 	profile, err := s.routingProfile()
 	if err == nil {
 		bypassLAN = profile.BypassLAN
 		allowLANBroadcast = profile.BypassLAN && profile.AllowLANBroadcast
+		ipv6Enabled = profile.IPv6Enabled()
 		if vpnStatus.PerAppMode == "" || vpnStatus.PerAppMode == "all" {
 			if profile.PerAppMode != "" {
 				vpnStatus.PerAppMode = profile.PerAppMode
@@ -108,6 +110,7 @@ func (s *Server) handleAndroidVPNStatus(w http.ResponseWriter, r *http.Request) 
 		"active":              vpnStatus.Active,
 		"running":             st.Running,
 		"protect_path":        vpnStatus.ProtectPath,
+		"owner_path":          vpnStatus.OwnerPath,
 		"tun_socket_path":     tunBridge.SocketPath(),
 		"tun_active":          tunBridge.Active(),
 		"tun_fd":              vpnStatus.TunFD,
@@ -116,6 +119,7 @@ func (s *Server) handleAndroidVPNStatus(w http.ResponseWriter, r *http.Request) 
 		"per_app_packages":    vpnStatus.PerAppPackages,
 		"bypass_lan":          bypassLAN,
 		"allow_lan_broadcast": allowLANBroadcast,
+		"ipv6_enabled":        ipv6Enabled,
 		"active_node_id":      s.activeNodeID,
 		"active_group_id":     s.activeGroupID,
 		"updated_at":          vpnStatus.UpdatedAt,
@@ -138,6 +142,9 @@ func (s *Server) handleAndroidVPNStart(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(cfg.ProtectPath) == "" {
 		cfg.ProtectPath = filepath.Join(sockDir, "protect.sock")
 	}
+	if strings.TrimSpace(cfg.OwnerPath) == "" {
+		cfg.OwnerPath = filepath.Join(sockDir, "owner.sock")
+	}
 
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
@@ -156,6 +163,7 @@ func (s *Server) handleAndroidVPNStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.protectPath = strings.TrimSpace(cfg.ProtectPath)
+	s.ownerPath = strings.TrimSpace(cfg.OwnerPath)
 	nodeID := strings.TrimSpace(cfg.ActiveNodeID)
 	groupID := strings.TrimSpace(cfg.ActiveGroupID)
 	if nodeID == "" && groupID == "" {
@@ -180,17 +188,21 @@ func (s *Server) handleAndroidVPNStart(w http.ResponseWriter, r *http.Request) {
 		respondError(w, listenErr, http.StatusInternalServerError)
 		return
 	}
+	s.syncAndroidAppRouting(runtimeStatus)
 
 	bypassLAN := true
 	allowLANBroadcast := false
+	ipv6Enabled := false
 	if currentProfile, pErr := s.routingProfile(); pErr == nil {
 		bypassLAN = currentProfile.BypassLAN
 		allowLANBroadcast = currentProfile.BypassLAN && currentProfile.AllowLANBroadcast
+		ipv6Enabled = currentProfile.IPv6Enabled()
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"active":              vpnStatus.Active,
 		"protect_path":        vpnStatus.ProtectPath,
+		"owner_path":          vpnStatus.OwnerPath,
 		"tun_socket_path":     tunSockPath,
 		"tun_fd":              vpnStatus.TunFD,
 		"mixed_port":          vpnStatus.MixedPort,
@@ -198,6 +210,7 @@ func (s *Server) handleAndroidVPNStart(w http.ResponseWriter, r *http.Request) {
 		"per_app_packages":    vpnStatus.PerAppPackages,
 		"bypass_lan":          bypassLAN,
 		"allow_lan_broadcast": allowLANBroadcast,
+		"ipv6_enabled":        ipv6Enabled,
 		"updated_at":          vpnStatus.UpdatedAt,
 	})
 }
@@ -211,6 +224,8 @@ func (s *Server) handleAndroidVPNStop(w http.ResponseWriter, r *http.Request) {
 	defer s.opMu.Unlock()
 	s.wantRunning = false
 	s.protectPath = ""
+	s.ownerPath = ""
+	s.ensureAndroidTun().ConfigureAppRouting(androidvpn.AppRoutingConfig{})
 	s.ensureAndroidTun().Stop()
 	if err := s.ensureOrchestrator().Stop(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

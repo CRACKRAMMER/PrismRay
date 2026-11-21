@@ -119,6 +119,7 @@ export interface GroupConfig {
   name: string;
   strategy: string;
   selected_node_id?: string;
+  manual_pin?: boolean;
   filter?: string;
   priority_rule?: string;
   auto_failover?: boolean | null;
@@ -224,6 +225,7 @@ export interface HealthSettings {
   speed_up_url: string;
   interval_seconds: number;
   tolerance_ms: number;
+  high_latency_ms?: number;
   priority_rule: "latency_first" | "speed_first" | "hybrid_score";
   failover: boolean;
   recover: boolean;
@@ -303,6 +305,10 @@ export interface ProcessStatus {
   xray_pid?: number;
   active_node_id: string;
   active_group_id: string;
+  active_node_name?: string;
+  active_group_name?: string;
+  active_resolved_node_name?: string;
+  live_group_nodes?: Record<string, string>;
   active_tag: string;
   tun_enabled: boolean;
   system_proxy_enabled?: boolean;
@@ -813,8 +819,13 @@ export const api = {
         priority_rule: string;
       }>(apiUrl(`/groups/${id}/probe`), payload || {})
       .then((r) => r.data),
-  selectGroupNode: (groupId: string, nodeId: string) =>
-    axios.put<{ group_id: string; node_id: string }>(apiUrl(`/groups/${groupId}/select`), { node_id: nodeId }).then((r) => r.data),
+  selectGroupNode: (groupId: string, nodeId: string, auto?: boolean) =>
+    axios
+      .put<{ group_id: string; node_id: string; manual_pin?: boolean }>(apiUrl(`/groups/${groupId}/select`), {
+        node_id: nodeId,
+        auto,
+      })
+      .then((r) => r.data),
 
   getHealthSettings: () => axios.get<HealthSettings>(apiUrl("/health-settings")).then((r) => r.data),
   saveHealthSettings: (settings: HealthSettings) =>
@@ -845,7 +856,12 @@ export const api = {
   saveRuleSet: (spec: RuleSetSpec) => axios.post<RuleSetSpec[]>(apiUrl("/rulesets"), spec).then((r) => r.data),
   syncRuleSets: (ids?: string[]) =>
     axios
-      .post<{ rule_sets: RuleSetSpec[]; errors: Record<string, string> }>(apiUrl("/rulesets/sync"), ids ? { ids } : {})
+      .post<{
+        rule_sets: RuleSetSpec[];
+        errors: Record<string, string>;
+        synced_count?: number;
+        reloaded?: boolean;
+      }>(apiUrl("/rulesets/sync"), ids ? { ids } : {})
       .then((r) => r.data),
 
   getTUN: () => axios.get<TUNState>(apiUrl("/tun")).then((r) => r.data),

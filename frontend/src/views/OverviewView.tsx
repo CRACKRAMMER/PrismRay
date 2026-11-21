@@ -26,7 +26,7 @@ import {
 } from "recharts";
 import { api, formatApiError, isAndroidClient, type ListenConfig, type RoutingProfile } from "../lib/api.ts";
 import { formatRate } from "../lib/helpers.ts";
-import { useAppStore, useTelemetry } from "../store/appStore.ts";
+import { useAppStore, useTrafficTelemetry } from "../store/appStore.ts";
 import { Button } from "../components/ui/button.tsx";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card.tsx";
 import { Select } from "../components/ui/select.tsx";
@@ -40,7 +40,7 @@ const DEFAULT_ROUTING_BASE: RoutingProfile = {
   bypass_cn: true,
   webrtc_mode: "block",
   local_dns: "223.5.5.5",
-  remote_dns: "https://dns.google/dns-query",
+  remote_dns: "https://1.1.1.1/dns-query",
   custom_rules: [],
 };
 
@@ -63,7 +63,7 @@ export function OverviewView() {
     notify,
     setActiveTab,
   } = useAppStore();
-  const { trafficNow, trafficHistory } = useTelemetry();
+  const { trafficNow, trafficHistory } = useTrafficTelemetry();
 
   const [authorizing, setAuthorizing] = useState(false);
 
@@ -191,11 +191,11 @@ export function OverviewView() {
                     <strong className="inline-flex items-center font-semibold text-foreground">{activeGroup.name}</strong>
                     {isLoadBalanceGroup(activeGroup.strategy) ? (
                       <span className="inline-flex items-center text-xs text-muted-foreground">
-                        → {tr("overview.lbShardsSummary", { count: activeGroup.node_ids.length })}
+                        → {tr("overview.lbShardsSummary", { count: Math.min(4, activeGroup.node_ids.length) })}
                       </span>
-                    ) : resolvedGroupMember ? (
+                    ) : status?.active_resolved_node_name || resolvedGroupMember ? (
                       <span className="inline-flex items-center text-xs text-muted-foreground">
-                        → {resolvedGroupMember.user_alias || resolvedGroupMember.name}
+                        → {status?.active_resolved_node_name || resolvedGroupMember?.user_alias || resolvedGroupMember?.name}
                       </span>
                     ) : null}
                   </>
@@ -319,7 +319,11 @@ export function OverviewView() {
                 <div className="min-w-0">
                   <CardTitle className="text-sm font-semibold">{tr("overview.tunVpn")}</CardTitle>
                   <CardDescription className="text-xs">
-                    {isAndroid ? "Android VpnService · Full TUN" : `prismray0 · ${tunState?.stack || "mixed"}`}
+                    {isAndroid
+                      ? "Android VpnService · Full TUN"
+                      : tunState?.privilege?.os === "darwin"
+                        ? `macOS utun · ${tunState?.stack || "mixed"}`
+                        : `prismray0 · ${tunState?.stack || "mixed"}`}
                   </CardDescription>
                 </div>
               </div>
@@ -334,7 +338,7 @@ export function OverviewView() {
           {!isAndroid &&
           (tunState?.privilege?.os === "linux" || tunState?.privilege?.os === "darwin") &&
           !tunState.privilege.ready_without_password ? (
-            <CardContent className="pt-0">
+            <CardContent className="space-y-2 pt-0">
               <Button
                 type="button"
                 variant="outline"
@@ -345,6 +349,17 @@ export function OverviewView() {
                 <ShieldCheck className="mr-2 h-4 w-4" aria-hidden="true" />
                 {tr("overview.authorizeTun")}
               </Button>
+              {tunState.privilege.os === "darwin" ? (
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  {tr("overview.macosUtunHint")}
+                </p>
+              ) : null}
+            </CardContent>
+          ) : !isAndroid && tunState?.privilege?.os === "darwin" ? (
+            <CardContent className="pt-0">
+              <p className="text-[11px] leading-snug text-muted-foreground">
+                {tr("overview.macosUtunHint")}
+              </p>
             </CardContent>
           ) : !isAndroid &&
             tunState?.privilege?.os === "windows" &&
@@ -378,6 +393,13 @@ export function OverviewView() {
                 />
               </div>
             </CardHeader>
+            {tunState?.enabled && systemProxyEnabled ? (
+              <CardContent className="pt-0">
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  {tr("overview.tunAndSysProxyHint")}
+                </p>
+              </CardContent>
+            ) : null}
           </Card>
         ) : null}
 

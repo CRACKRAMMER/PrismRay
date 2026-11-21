@@ -129,7 +129,7 @@ func DefaultRoutingProfile() RoutingProfile {
 		AllowLANBroadcast: false,
 		BypassCN:          true,
 		LocalDNS:          "223.5.5.5",
-		RemoteDNS:         "https://dns.google/dns-query",
+		RemoteDNS:         "https://1.1.1.1/dns-query",
 		DomainStrategy:    "prefer_ipv4",
 		HijackDNS:         BoolPtr(true),
 		FakeIP:            false,
@@ -156,7 +156,7 @@ func (p *RoutingProfile) Normalize() {
 		p.LocalDNS = "223.5.5.5"
 	}
 	if strings.TrimSpace(p.RemoteDNS) == "" {
-		p.RemoteDNS = "https://dns.google/dns-query"
+		p.RemoteDNS = "https://1.1.1.1/dns-query"
 	}
 	switch p.DomainStrategy {
 	case "", "prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only", "as_is":
@@ -294,6 +294,24 @@ func BuiltinRuleSets(dir string) []RuleSetSpec {
 		}
 	}
 	return specs
+}
+
+// MirrorURLs returns fallback CDN mirror URLs for known upstream GitHub raw rule-set endpoints.
+func MirrorURLs(rawURL string) []string {
+	trimmed := strings.TrimSpace(rawURL)
+	const ghPrefix = "https://raw.githubusercontent.com/"
+	if !strings.HasPrefix(trimmed, ghPrefix) {
+		return nil
+	}
+	rest := strings.TrimPrefix(trimmed, ghPrefix)
+	parts := strings.SplitN(rest, "/", 4)
+	if len(parts) != 4 || parts[0] == "" || parts[1] == "" || parts[2] == "" || parts[3] == "" {
+		return nil
+	}
+	owner, repo, branch, filePath := parts[0], parts[1], parts[2], parts[3]
+	return []string{
+		fmt.Sprintf("https://cdn.jsdelivr.net/gh/%s/%s@%s/%s", owner, repo, branch, filePath),
+	}
 }
 
 // SyncRuleSet downloads one .srs binary rule set to disk safely.

@@ -47,7 +47,13 @@ import {
 } from "./lib/appearance.ts";
 import { formatRate } from "./lib/helpers.ts";
 import { useShiftHorizontalScroll } from "./lib/useShiftHorizontalScroll.ts";
-import { AppStoreProvider, type NavTab, useAppStore, useTelemetry } from "./store/appStore.ts";
+import {
+  AppStoreProvider,
+  type NavTab,
+  useAppStore,
+  useConnectionsTelemetry,
+  useTrafficTelemetry,
+} from "./store/appStore.ts";
 
 const OverviewView = lazy(() => import("./views/OverviewView.tsx").then((m) => ({ default: m.OverviewView })));
 const ProxiesView = lazy(() => import("./views/ProxiesView.tsx").then((m) => ({ default: m.ProxiesView })));
@@ -57,7 +63,7 @@ const RoutingView = lazy(() => import("./views/RoutingView.tsx").then((m) => ({ 
 const SettingsLogsView = lazy(() => import("./views/SettingsLogsView.tsx").then((m) => ({ default: m.SettingsLogsView })));
 
 function SidebarConnectionsBadge() {
-  const { connections } = useTelemetry();
+  const { connections } = useConnectionsTelemetry();
   if (connections.connections.length <= 0) return null;
   return (
     <span className="shrink-0 badge-radius border border-primary/30 bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold text-primary mono-num">
@@ -67,7 +73,7 @@ function SidebarConnectionsBadge() {
 }
 
 function MobileConnectionsBadge() {
-  const { connections } = useTelemetry();
+  const { connections } = useConnectionsTelemetry();
   if (connections.connections.length <= 0) return null;
   return (
     <span className="badge-radius bg-primary/15 text-primary px-2 py-0.5 text-xs mono-num">
@@ -77,7 +83,7 @@ function MobileConnectionsBadge() {
 }
 
 function SidebarTrafficRates() {
-  const { trafficNow } = useTelemetry();
+  const { trafficNow } = useTrafficTelemetry();
   return (
     <div className="flex items-center justify-between gap-2 mono-num text-[11px]">
       <span className="inline-flex items-center gap-1 text-emerald-500">
@@ -201,6 +207,20 @@ function Shell() {
 
   const asideRef = useRef<HTMLElement | null>(null);
   const scrollRootRef = useRef<HTMLDivElement>(null);
+  const [visitedTabs, setVisitedTabs] = useState<NavTab[]>(["overview"]);
+  const prevTabRef = useRef<NavTab>("overview");
+  const tabScrollPosRef = useRef<Partial<Record<NavTab, number>>>({});
+
+  useEffect(() => {
+    setVisitedTabs((prev) => (prev.includes(activeTab) ? prev : [...prev, activeTab]));
+    const scroller = scrollRootRef.current;
+    if (scroller) {
+      tabScrollPosRef.current[prevTabRef.current] = scroller.scrollTop;
+      const saved = tabScrollPosRef.current[activeTab] ?? 0;
+      scroller.scrollTo({ top: saved, behavior: "instant" as ScrollBehavior });
+    }
+    prevTabRef.current = activeTab;
+  }, [activeTab]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -415,10 +435,6 @@ function Shell() {
     applyAppearanceToDocument(appearance, resolvedTheme, Boolean(wallpaperUrl));
   }, [appearance, resolvedTheme, wallpaperUrl]);
 
-  useEffect(() => {
-    scrollRootRef.current?.scrollTo({ top: 0 });
-  }, [activeTab]);
-
   const cycleTheme = () => {
     if (themeMode === "system") setThemeMode("light");
     else if (themeMode === "light") setThemeMode("dark");
@@ -440,8 +456,8 @@ function Shell() {
         ? tr("sidebar.themeDark")
         : tr("sidebar.themeSystem");
 
-  const renderView = () => {
-    switch (activeTab) {
+  const renderTabComponent = (tab: NavTab) => {
+    switch (tab) {
       case "overview":
         return <OverviewView />;
       case "proxies":
@@ -896,17 +912,28 @@ function Shell() {
         </header>
 
         <main className="mobile-safe-main mx-auto w-full max-w-[1440px] flex-1 p-3 pb-24 md:p-5 md:pb-6">
-          <Suspense
-            fallback={
-              <div className="flex items-center justify-center py-16 text-xs text-muted-foreground">
-                {tr("common.loadingView")}
+          {visitedTabs.map((tab) => {
+            const isActive = tab === activeTab;
+            return (
+              <div
+                key={tab}
+                data-tab-active={isActive ? "true" : "false"}
+                aria-hidden={!isActive || undefined}
+                inert={!isActive ? true : undefined}
+                className={isActive ? "tab-pane tab-pane-active view-stage" : "tab-pane tab-pane-hidden"}
+              >
+                <Suspense
+                  fallback={
+                    <div className="flex items-center justify-center py-16 text-xs text-muted-foreground">
+                      {tr("common.loadingView")}
+                    </div>
+                  }
+                >
+                  {renderTabComponent(tab)}
+                </Suspense>
               </div>
-            }
-          >
-            <div key={activeTab} className="view-stage">
-              {renderView()}
-            </div>
-          </Suspense>
+            );
+          })}
         </main>
 
         {/* Mobile Bottom Navigation (4 Core Tabs + Center + Quick Create) */}

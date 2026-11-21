@@ -9,6 +9,7 @@ import {
   Pencil,
   Plus,
   QrCode,
+  RefreshCw,
   RotateCcw,
   Route,
   Save,
@@ -22,7 +23,7 @@ import {
   api,
   formatApiError,
 } from "../lib/api.ts";
-import { isRoutingProfileEqual } from "../lib/helpers.ts";
+import { isRoutingProfileEqual, isRuleSetReady } from "../lib/helpers.ts";
 import { useAppStore } from "../store/appStore.ts";
 import { BottomSheetDialog, ContextInspector } from "../components/ContextInspector.tsx";
 import { HelpTip } from "../components/HelpTip.tsx";
@@ -45,7 +46,7 @@ const DEFAULT_PROFILE: RoutingProfile = {
   bypass_cn: true,
   webrtc_mode: "block",
   local_dns: "223.5.5.5",
-  remote_dns: "https://dns.google/dns-query",
+  remote_dns: "https://1.1.1.1/dns-query",
   domain_strategy: "prefer_ipv4",
   hijack_dns: true,
   fake_ip: false,
@@ -86,12 +87,52 @@ function summarizeRuleConditions(rule: RoutingRule): string[] {
 }
 
 export function RoutingView() {
-  const { tr, locale, routing, status, nodes, groups, listeners, refreshAll, notify, registerUnsavedGuard } =
+  const { activeTab, tr, locale, routing, ruleSets, status, nodes, groups, listeners, refreshAll, notify, registerUnsavedGuard } =
     useAppStore();
   const idPrefix = useId();
   const [draft, setDraft] = useState<RoutingProfile>(routing || DEFAULT_PROFILE);
   const [saving, setSaving] = useState(false);
+  const [syncingRuleSets, setSyncingRuleSets] = useState(false);
   const [qrModalOpen, setQrModalOpen] = useState(false);
+
+  const adsRuleReady = useMemo(() => isRuleSetReady(ruleSets, "geosite-category-ads-all"), [ruleSets]);
+  const cnRuleReady = useMemo(
+    () => isRuleSetReady(ruleSets, "geosite-cn") && isRuleSetReady(ruleSets, "geoip-cn"),
+    [ruleSets],
+  );
+
+  const needsRuleSetRefreshRef = useRef(false);
+  needsRuleSetRefreshRef.current = !adsRuleReady || !cnRuleReady;
+
+  // When visiting Routing tab while built-in .srs files are still marked unsynced (e.g. background
+  // auto-sync just finished after connecting), refresh once so switches unlock immediately.
+  useEffect(() => {
+    if (activeTab === "routing" && needsRuleSetRefreshRef.current) {
+      void refreshAll();
+    }
+  }, [activeTab, refreshAll]);
+
+  const handleQuickSyncRuleSets = async () => {
+    setSyncingRuleSets(true);
+    try {
+      const res = await api.syncRuleSets();
+      await refreshAll();
+      const errEntries = Object.entries(res.errors || {});
+      const syncedCount = res.synced_count ?? res.rule_sets.filter((r) => r.synced).length;
+      if (errEntries.length > 0) {
+        notify(
+          `${tr("settings.rulesetsSyncPartial", { count: syncedCount, failed: errEntries.length })} (${errEntries[0][0]}: ${errEntries[0][1]})`,
+          "warning",
+        );
+      } else {
+        notify(tr("settings.rulesetsSyncedReloaded", { count: syncedCount }));
+      }
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setSyncingRuleSets(false);
+    }
+  };
 
   const [ruleModalOpen, setRuleModalOpen] = useState(false);
   const [editingRuleIdx, setEditingRuleIdx] = useState<number | null>(null);
@@ -531,11 +572,37 @@ export function RoutingView() {
               </div>
 
               <div className="space-y-3 border-t pt-3">
+                {!adsRuleReady || !cnRuleReady ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs">
+                    <span className="min-w-0 flex-1 leading-snug text-amber-700 dark:text-amber-300">
+                      {tr("routing.srsSyncNeededDesc")}
+                    </span>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={syncingRuleSets}
+                      onClick={() => void handleQuickSyncRuleSets()}
+                      className="h-7 shrink-0 border-amber-500/40 bg-background/80 px-2.5 text-[11px]"
+                    >
+                      <RefreshCw className={`mr-1.5 h-3 w-3 ${syncingRuleSets ? "animate-spin" : ""}`} aria-hidden="true" />
+                      {syncingRuleSets ? tr("routing.syncingSrs") : tr("routing.syncSrsNow")}
+                    </Button>
+                  </div>
+                ) : null}
                 <div className="flex items-center justify-between gap-2 text-sm">
-                  <span>{tr("routing.blockAds")}</span>
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <span className={!adsRuleReady ? "text-muted-foreground" : ""}>{tr("routing.blockAds")}</span>
+                    {!adsRuleReady ? (
+                      <span className="shrink-0 whitespace-nowrap badge-radius border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
+                        {tr("routing.srsRequiredBadge")}
+                      </span>
+                    ) : null}
+                  </div>
                   <Switch
                     aria-label={tr("routing.blockAds")}
-                    checked={draft.block_ads}
+                    disabled={!adsRuleReady}
+                    checked={adsRuleReady && draft.block_ads}
                     onCheckedChange={(checked) => setDraft((prev) => ({ ...prev, block_ads: checked }))}
                   />
                 </div>
@@ -580,10 +647,18 @@ export function RoutingView() {
                   />
                 </div>
                 <div className="flex items-center justify-between gap-2 text-sm">
-                  <span>{tr("routing.bypassCn")}</span>
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <span className={!cnRuleReady ? "text-muted-foreground" : ""}>{tr("routing.bypassCn")}</span>
+                    {!cnRuleReady ? (
+                      <span className="shrink-0 whitespace-nowrap badge-radius border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
+                        {tr("routing.srsRequiredBadge")}
+                      </span>
+                    ) : null}
+                  </div>
                   <Switch
                     aria-label={tr("routing.bypassCn")}
-                    checked={draft.bypass_cn}
+                    disabled={!cnRuleReady}
+                    checked={cnRuleReady && draft.bypass_cn}
                     onCheckedChange={(checked) => setDraft((prev) => ({ ...prev, bypass_cn: checked }))}
                   />
                 </div>

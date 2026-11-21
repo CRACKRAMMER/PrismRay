@@ -60,7 +60,7 @@ import {
 } from "../lib/duration.ts";
 import { formatBytes } from "../lib/helpers.ts";
 import { type TranslationKey } from "../lib/i18n.ts";
-import { ALL_CONNECTION_COLUMNS, type ConnectionColumnId, useAppStore, useTelemetry } from "../store/appStore.ts";
+import { ALL_CONNECTION_COLUMNS, type ConnectionColumnId, useAppStore, useLogsTelemetry } from "../store/appStore.ts";
 import { ColorWheelPicker } from "../components/ColorWheelPicker.tsx";
 import { DurationInput } from "../components/DurationInput.tsx";
 import { AppUpdateCard } from "../components/AppUpdateCard.tsx";
@@ -101,7 +101,7 @@ export function SettingsLogsView() {
     refreshAll,
     notify,
   } = useAppStore();
-  const { logs } = useTelemetry();
+  const { logs } = useLogsTelemetry();
   const idPrefix = useId();
 
   const [lisName, setLisName] = useState("Local Mixed");
@@ -132,6 +132,7 @@ export function SettingsLogsView() {
     speed_up_url: "https://speed.cloudflare.com/__up",
     interval_seconds: 60,
     tolerance_ms: 80,
+    high_latency_ms: 800,
     priority_rule: "latency_first",
     failover: true,
     recover: true,
@@ -392,6 +393,7 @@ export function SettingsLogsView() {
       const saved = await api.saveHealthSettings(healthDraft);
       setHealthDraft(saved);
       setHealthBaseline(saved);
+      await refreshAll();
       notify(tr("settings.healthSaved"));
       return true;
     } catch (err) {
@@ -455,9 +457,28 @@ export function SettingsLogsView() {
   const handleSyncRuleSets = async () => {
     setSyncingRulesets(true);
     try {
-      await api.syncRuleSets();
+      const res = await api.syncRuleSets();
       await refreshAll();
-      notify(locale === "zh-CN" ? ".srs 规则集已同步" : "Rule sets synced");
+      const errEntries = Object.entries(res.errors || {});
+      const syncedCount = res.synced_count ?? res.rule_sets.filter((r) => r.synced).length;
+      if (errEntries.length > 0 && syncedCount === 0) {
+        const firstErr = `${errEntries[0][0]}: ${errEntries[0][1]}`;
+        notify(
+          locale === "zh-CN"
+            ? `.srs 规则集同步失败 (${errEntries.length} 项): ${firstErr}`
+            : `Rule set sync failed (${errEntries.length}): ${firstErr}`,
+          "error",
+        );
+      } else if (errEntries.length > 0) {
+        notify(
+          tr("settings.rulesetsSyncPartial", { count: syncedCount, failed: errEntries.length }),
+          "warning",
+        );
+      } else if (res.reloaded) {
+        notify(tr("settings.rulesetsSyncedReloaded", { count: syncedCount }));
+      } else {
+        notify(locale === "zh-CN" ? `已同步 ${syncedCount} 个 .srs 规则集` : `Synced ${syncedCount} rule sets`);
+      }
     } catch (err) {
       notify(formatApiError(err), "error");
     } finally {
@@ -1395,7 +1416,7 @@ export function SettingsLogsView() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <div className="space-y-1">
                   <label className="block font-medium text-muted-foreground">{tr("settings.probeIntervalClean")}</label>
                   <DurationInput
@@ -1430,6 +1451,36 @@ export function SettingsLogsView() {
                       setHealthDraft((h) => ({
                         ...h,
                         tolerance_ms: Math.max(0, joinToMilliseconds(v, u)),
+                      }));
+                    }}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <div className="flex items-center gap-1">
+                    <label
+                      htmlFor={`${idPrefix}-high-latency-ms`}
+                      className="block font-medium text-muted-foreground"
+                    >
+                      {tr("settings.highLatencyThreshold")}
+                    </label>
+                    <HelpTip
+                      ariaLabel={tr("settings.highLatencyThreshold")}
+                      text={tr("settings.highLatencyThresholdHint")}
+                    />
+                  </div>
+                  <Input
+                    id={`${idPrefix}-high-latency-ms`}
+                    type="number"
+                    min={100}
+                    max={10000}
+                    step={50}
+                    className="font-mono text-xs tabular-nums"
+                    value={healthDraft.high_latency_ms ?? 800}
+                    onChange={(e) => {
+                      const raw = Number(e.target.value);
+                      setHealthDraft((h) => ({
+                        ...h,
+                        high_latency_ms: Number.isFinite(raw) ? raw : 800,
                       }));
                     }}
                   />
@@ -2059,7 +2110,7 @@ export function SettingsLogsView() {
             allow_lan_broadcast: false,
             bypass_cn: true,
             local_dns: "223.5.5.5",
-            remote_dns: "https://dns.google/dns-query",
+            remote_dns: "https://1.1.1.1/dns-query",
             custom_rules: [],
           }
         }

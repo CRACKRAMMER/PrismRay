@@ -227,6 +227,46 @@
   backdrop-filter: blur(var(--glass-blur, 18px)) saturate(155%);
 }
 
+/* Avoid expensive per-card GPU backdrop-filter compositing across 50+ node cards */
+[data-custom-bg="true"] .node-card-container,
+[data-custom-bg="true"] .node-card-container.prism-card {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  background-color: color-mix(in oklab, var(--card) 86%, transparent);
+}
+
+/* Cached tab panes (instant switch via content-visibility: hidden + inert) */
+.tab-pane-hidden {
+  content-visibility: hidden;
+  block-size: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+@supports not (content-visibility: hidden) {
+  .tab-pane-hidden {
+    display: none;
+  }
+}
+
+/* Defer off-screen rendering for dense node cards */
+.node-card-deferred {
+  content-visibility: auto;
+  contain-intrinsic-size: auto none auto 108px;
+}
+
+.node-multiselect-popover[popover],
+.node-context-popover[popover] {
+  margin: 0;
+  overflow: visible;
+}
+
+[data-custom-bg="true"] .node-multiselect-popover,
+[data-custom-bg="true"] .node-context-popover {
+  -webkit-backdrop-filter: blur(calc(var(--glass-blur, 18px) + 4px)) saturate(160%);
+  backdrop-filter: blur(calc(var(--glass-blur, 18px) + 4px)) saturate(160%);
+}
+
 [data-custom-bg="true"] .prism-glass-bar {
   background-color: var(--sidebar-surface) !important;
   border-color: var(--glass-border, var(--border));

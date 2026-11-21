@@ -16,6 +16,8 @@ func (b *TunBridge) Listen(_ string, _ int, _ int) (string, error) {
 	return "", fmt.Errorf("android tun bridge is only supported on Android")
 }
 
+func (b *TunBridge) ConfigureAppRouting(_ AppRoutingConfig) {}
+
 func (b *TunBridge) Active() bool { return false }
 
 func (b *TunBridge) SocketPath() string { return "" }

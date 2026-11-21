@@ -11,6 +11,7 @@ from unittest import mock
 from build_appimage import (
     build_appimage,
     detect_linux_target,
+    ensure_appimage_runtime,
     verify_appimage_excludes_wayland,
 )
 
@@ -110,10 +111,13 @@ class BuildAppImageTests(unittest.TestCase):
                     "NO_STRIP",
                 )
             }
+            fake_runtime = root / "runtime-x86_64"
+            fake_runtime.write_bytes(b"\x7fELF" + b"\x00" * 120_000)
             with (
                 mock.patch("build_appimage.sys.platform", "linux"),
                 mock.patch("build_appimage.shutil.which", return_value="/usr/bin/tool"),
                 mock.patch("build_appimage.subprocess.run", side_effect=fake_run),
+                mock.patch("build_appimage.ensure_appimage_runtime", return_value=fake_runtime),
                 mock.patch.dict(os.environ, clean_env, clear=True),
             ):
                 output = build_appimage(root, target="x86_64-unknown-linux-gnu")
@@ -135,12 +139,26 @@ class BuildAppImageTests(unittest.TestCase):
             self.assertEqual(tauri_cwd, root / "frontend")
             self.assertEqual(tauri_env["APPIMAGE_EXTRACT_AND_RUN"], "1")
             self.assertEqual(tauri_env["NO_STRIP"], "true")
+            self.assertEqual(tauri_env["LDAI_RUNTIME_FILE"], str(fake_runtime))
             self.assertIn("--ignore-version-mismatches", tauri_cmd)
             self.assertIn("appimage", tauri_cmd)
             self.assertEqual(tauri_cmd[-2:], ["--", "--locked"])
 
             extract_cmd, _, _ = calls[2]
             self.assertEqual(extract_cmd[1], "--appimage-extract")
+
+    def test_ensure_appimage_runtime_reuses_cached_elf(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_dir = Path(temporary)
+            cached = cache_dir / "runtime-x86_64"
+            cached.write_bytes(b"\x7fELF" + b"\x00" * 120_000)
+            with (
+                mock.patch.dict(os.environ, {"LDAI_RUNTIME_FILE": ""}, clear=False),
+                mock.patch("build_appimage.urllib.request.urlopen") as mock_open,
+            ):
+                resolved = ensure_appimage_runtime("x86_64-unknown-linux-gnu", cache_dir=cache_dir)
+            self.assertEqual(resolved, cached)
+            mock_open.assert_not_called()
 
 
 if __name__ == "__main__":

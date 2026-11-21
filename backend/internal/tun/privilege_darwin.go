@@ -60,16 +60,16 @@ func CheckPrivilege(singBoxBinary string) PrivilegeInfo {
 	if info.IsRoot {
 		info.HasCapAdmin = true
 		info.ReadyWithoutPassword = true
-		info.Detail = "running as root on macOS"
+		info.Detail = "macOS kernel utun transparent proxy ready (running as root; intentionally does not register a System Settings VPN profile)"
 		return info
 	}
 	if hasSetuidRoot(singBoxBinary) {
 		info.HasCapAdmin = true
 		info.ReadyWithoutPassword = true
-		info.Detail = "sing-box has setuid root permission for macOS utun"
+		info.Detail = "macOS kernel utun transparent proxy ready via setuid-root sing-box (intentionally does not appear under System Settings → VPN)"
 		return info
 	}
-	info.Detail = "macOS TUN requires one-time administrator authorization (setuid root) or cached sudo password"
+	info.Detail = "macOS kernel utun transparent proxy requires one-time administrator authorization (setuid root) or cached sudo password"
 	return info
 }
 

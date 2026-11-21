@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { CheckSquare, Gauge, Pencil, Play, QrCode, Square, Star, Trash2 } from "lucide-react";
 import { type NodeConfig } from "../lib/api.ts";
 import { useAppStore } from "../store/appStore.ts";
+import { BottomSheetDialog, useIsMobile } from "./ContextInspector.tsx";
 
 export interface NodeContextMenuState {
   x: number;
@@ -45,13 +47,14 @@ export function NodeContextMenu({
   onDeleteNode,
 }: NodeContextMenuProps) {
   const { tr } = useAppStore();
+  const isMobile = useIsMobile();
   const menuRef = useRef<HTMLDivElement>(null);
   const [coords, setCoords] = useState<{ left: number; top: number }>({ left: 0, top: 0 });
   const supportsFocusgroup =
     typeof HTMLElement !== "undefined" && "focusGroup" in HTMLElement.prototype;
 
   useLayoutEffect(() => {
-    if (!state) return;
+    if (!state || isMobile) return;
     const el = menuRef.current;
     if (!el) {
       setCoords({ left: state.x, top: state.y });
@@ -61,18 +64,30 @@ export function NodeContextMenu({
     const pad = 8;
     const left =
       state.x + rect.width > window.innerWidth - pad
-        ? Math.max(pad, state.x - rect.width)
+        ? Math.max(pad, Math.min(state.x - rect.width, window.innerWidth - rect.width - pad))
         : Math.max(pad, state.x);
     const top =
       state.y + rect.height > window.innerHeight - pad
-        ? Math.max(pad, state.y - rect.height)
+        ? Math.max(pad, Math.min(state.y - rect.height, window.innerHeight - rect.height - pad))
         : Math.max(pad, state.y);
     setCoords({ left, top });
-  }, [state]);
+  }, [state, isMobile]);
 
   useEffect(() => {
-    if (!state) return;
+    if (!state || isMobile) return;
     const el = menuRef.current;
+    const canPopover =
+      el !== null &&
+      typeof HTMLElement !== "undefined" &&
+      "showPopover" in HTMLElement.prototype &&
+      typeof (el as HTMLElement & { showPopover?: () => void }).showPopover === "function";
+    if (canPopover && el) {
+      try {
+        (el as HTMLElement & { showPopover: () => void }).showPopover();
+      } catch {
+        // Ignore if already open or unsupported.
+      }
+    }
     const firstItem = el?.querySelector<HTMLButtonElement>("button:not(:disabled)");
     firstItem?.focus({ preventScroll: true });
 
@@ -101,14 +116,21 @@ export function NodeContextMenu({
       window.removeEventListener("resize", onScrollOrResize);
       window.removeEventListener("blur", onScrollOrResize);
       scrollRoot?.removeEventListener("scroll", onScrollOrResize);
+      if (canPopover && el) {
+        try {
+          (el as HTMLElement & { hidePopover?: () => void }).hidePopover?.();
+        } catch {
+          // Ignore close races.
+        }
+      }
     };
-  }, [state, onClose]);
+  }, [state, isMobile, onClose]);
 
   if (!state) return null;
 
   const { node } = state;
   const displayName = node.user_alias || node.name;
-  const itemRoleProps = supportsFocusgroup ? {} : { role: "menuitem" as const };
+  const itemRoleProps = supportsFocusgroup || isMobile ? {} : { role: "menuitem" as const };
 
   const handleMenuKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     const keys = supportsFocusgroup ? ["Home", "End"] : ["ArrowDown", "ArrowUp", "Home", "End"];
@@ -132,27 +154,20 @@ export function NodeContextMenu({
   };
 
   const focusHoverItem = (el: HTMLButtonElement) => {
+    if (isMobile) return;
     el.focus({ preventScroll: true, focusVisible: false } as FocusOptions);
   };
 
-  const itemClass =
-    "flex w-full items-center gap-2.5 rounded-[6px] px-2.5 py-1.5 text-left text-xs text-popover-foreground transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none disabled:opacity-45 max-md:min-h-11";
+  const itemClass = isMobile
+    ? "flex w-full min-h-12 items-center gap-3 rounded-[8px] px-3 py-2.5 text-left text-[14px] font-medium text-popover-foreground transition-colors active:bg-muted disabled:opacity-45"
+    : "flex w-full items-center gap-2.5 rounded-[6px] px-2.5 py-1.5 text-left text-xs text-popover-foreground transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none disabled:opacity-45";
 
-  return (
-    <div
-      ref={menuRef}
-      {...({ focusgroup: "menu nomemory" } as Record<string, string>)}
-      role={supportsFocusgroup ? undefined : "menu"}
-      aria-label={`${tr("ctx.nodeMenu")}: ${displayName}`}
-      onKeyDown={handleMenuKeyDown}
-      style={{ position: "fixed", left: coords.left, top: coords.top, inset: `${coords.top}px auto auto ${coords.left}px`, margin: 0 }}
-      className="z-50 w-56 rounded-[10px] border border-border bg-popover p-1.5 text-popover-foreground shadow-sm"
-    >
-      <div className="px-2.5 py-1 text-[11px] font-medium text-muted-foreground truncate" aria-hidden="true">
-        {displayName}
-      </div>
-      <hr className="my-1 border-border" />
+  const deleteClass = isMobile
+    ? "flex w-full min-h-12 items-center gap-3 rounded-[8px] px-3 py-2.5 text-left text-[14px] font-medium text-destructive transition-colors active:bg-destructive/15"
+    : "flex w-full items-center gap-2.5 rounded-[6px] px-2.5 py-1.5 text-left text-xs text-destructive transition-colors hover:bg-destructive/15 focus-visible:bg-destructive/15 focus-visible:outline-none";
 
+  const menuActions = (
+    <>
       <button
         type="button"
         {...itemRoleProps}
@@ -160,7 +175,7 @@ export function NodeContextMenu({
         onClick={() => runAction(() => onToggleConnect(node.id))}
         className={itemClass}
       >
-        <Play className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
+        <Play className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-primary" aria-hidden="true" />
         <span className="flex-1 truncate">{isActive ? tr("ctx.disconnect") : tr("action.connect")}</span>
       </button>
 
@@ -172,7 +187,7 @@ export function NodeContextMenu({
         onClick={() => runAction(() => onProbeSingle(node.id))}
         className={itemClass}
       >
-        <Gauge className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+        <Gauge className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
         <span className="flex-1 truncate">{tr("ctx.probeSingle")}</span>
       </button>
 
@@ -184,7 +199,7 @@ export function NodeContextMenu({
           onClick={() => runAction(() => onProbeSelected())}
           className={itemClass}
         >
-          <Gauge className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
+          <Gauge className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-primary" aria-hidden="true" />
           <span className="flex-1 truncate">{tr("proxies.probeSelected", { count: selectedCount })}</span>
         </button>
       ) : null}
@@ -199,9 +214,9 @@ export function NodeContextMenu({
         className={itemClass}
       >
         {isSelected ? (
-          <CheckSquare className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
+          <CheckSquare className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-primary" aria-hidden="true" />
         ) : (
-          <Square className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+          <Square className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
         )}
         <span className="flex-1 truncate">{isSelected ? tr("ctx.deselectNode") : tr("ctx.selectNode")}</span>
       </button>
@@ -214,7 +229,7 @@ export function NodeContextMenu({
         className={itemClass}
       >
         <Star
-          className={`h-3.5 w-3.5 shrink-0 ${node.favorite ? "text-amber-500" : "text-muted-foreground"}`}
+          className={`h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 ${node.favorite ? "text-amber-500" : "text-muted-foreground"}`}
           fill={node.favorite ? "currentColor" : "none"}
           aria-hidden="true"
         />
@@ -228,7 +243,7 @@ export function NodeContextMenu({
         onClick={() => runAction(() => onEditNode(node))}
         className={itemClass}
       >
-        <Pencil className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+        <Pencil className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
         <span className="flex-1 truncate">{tr("ctx.editNode")}</span>
       </button>
 
@@ -239,7 +254,7 @@ export function NodeContextMenu({
         onClick={() => runAction(() => onShareQr(node))}
         className={itemClass}
       >
-        <QrCode className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+        <QrCode className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
         <span className="flex-1 truncate">{tr("ctx.shareQr")}</span>
       </button>
 
@@ -250,11 +265,47 @@ export function NodeContextMenu({
         {...itemRoleProps}
         onPointerMove={(e) => focusHoverItem(e.currentTarget)}
         onClick={() => runAction(() => onDeleteNode(node.id))}
-        className="flex w-full items-center gap-2.5 rounded-[6px] px-2.5 py-1.5 text-left text-xs text-destructive transition-colors hover:bg-destructive/15 focus-visible:bg-destructive/15 focus-visible:outline-none max-md:min-h-11"
+        className={deleteClass}
       >
-        <Trash2 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <Trash2 className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0" aria-hidden="true" />
         <span className="flex-1 truncate">{tr("action.delete")}</span>
       </button>
-    </div>
+    </>
+  );
+
+  if (isMobile) {
+    return (
+      <BottomSheetDialog open={Boolean(state)} title={displayName} onClose={onClose}>
+        <div className="space-y-0.5 pb-1">{menuActions}</div>
+      </BottomSheetDialog>
+    );
+  }
+
+  if (typeof document === "undefined") return null;
+
+  return createPortal(
+    <div
+      ref={menuRef}
+      {...({ popover: "manual", focusgroup: "menu nomemory" } as Record<string, string>)}
+      role={supportsFocusgroup ? undefined : "menu"}
+      aria-label={`${tr("ctx.nodeMenu")}: ${displayName}`}
+      onKeyDown={handleMenuKeyDown}
+      style={{
+        position: "fixed",
+        left: `${coords.left}px`,
+        top: `${coords.top}px`,
+        inset: `${coords.top}px auto auto ${coords.left}px`,
+        margin: 0,
+        zIndex: 100,
+      }}
+      className="node-context-popover w-56 rounded-[10px] border border-border bg-popover/95 p-1.5 text-popover-foreground shadow-xl backdrop-blur-md"
+    >
+      <div className="px-2.5 py-1 text-[11px] font-medium text-muted-foreground truncate" aria-hidden="true">
+        {displayName}
+      </div>
+      <hr className="my-1 border-border" />
+      {menuActions}
+    </div>,
+    document.body,
   );
 }

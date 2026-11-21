@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -156,8 +157,8 @@ func (s *Server) handleRoutingSimulate(w http.ResponseWriter, r *http.Request) {
 					if len(healthyIDs) == 0 {
 						healthyIDs = append(healthyIDs, g.NodeIDs...)
 					}
-					if len(healthyIDs) > 8 {
-						healthyIDs = healthyIDs[:8]
+					if len(healthyIDs) > sbcfg.MaxLoadBalanceShards {
+						healthyIDs = healthyIDs[:sbcfg.MaxLoadBalanceShards]
 					}
 					if idx := sbcfg.DomainHashShardIndex(in.Domain, len(healthyIDs)); idx >= 0 && idx < len(healthyIDs) {
 						label := healthyIDs[idx]
@@ -262,31 +263,74 @@ func (s *Server) handleRuleSets(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handleSyncRuleSets(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+func safeProxyHTTPClient(timeout time.Duration, proxyPort int) *http.Client {
+	client := safeHTTPClient(timeout)
+	if proxyPort > 0 {
+		if proxyURL, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort)); err == nil {
+			tr := http.DefaultTransport.(*http.Transport).Clone()
+			tr.Proxy = http.ProxyURL(proxyURL)
+			client.Transport = tr
+		}
 	}
-	var req struct {
-		IDs []string `json:"ids,omitempty"`
-	}
-	if r.Body != nil && r.ContentLength != 0 {
-		_ = json.NewDecoder(r.Body).Decode(&req)
-	}
-	wantIDs := map[string]bool{}
-	for _, id := range req.IDs {
-		wantIDs[id] = true
-	}
+	return client
+}
+
+func (s *Server) syncRuleSetsInternal(ctx context.Context, wantIDs map[string]bool) ([]ruleset.RuleSetSpec, map[string]string, int, bool, error) {
+	s.ruleSetSyncMu.Lock()
+	defer s.ruleSetSyncMu.Unlock()
 
 	specs, err := s.effectiveRuleSets()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return nil, nil, 0, false, err
 	}
 
-	client := safeHTTPClient(30 * time.Second)
+	// Build resilient sync pipeline:
+	// 1. Local proxy (if core is currently running) — bypasses GitHub Raw throttling/blocking on mobile/CN networks.
+	// 2. Direct connection — works when proxy is stopped or local network reaches GitHub directly.
+	// 3. Built-in CDN mirrors (e.g. jsDelivr for raw.githubusercontent.com) via direct/proxy.
+	orchStatus := s.ensureOrchestrator().Status()
+	var proxyClient *http.Client
+	if orchStatus.Running && orchStatus.MixedPort > 0 {
+		proxyClient = safeProxyHTTPClient(15*time.Second, orchStatus.MixedPort)
+	}
+	directClient := safeHTTPClient(15 * time.Second)
+
+	syncWithFallback := func(spec ruleset.RuleSetSpec) (ruleset.RuleSetSpec, error) {
+		canonicalURL := spec.URL
+		type attempt struct {
+			client *http.Client
+			url    string
+		}
+		var attempts []attempt
+		if proxyClient != nil {
+			attempts = append(attempts, attempt{client: proxyClient, url: canonicalURL})
+		}
+		attempts = append(attempts, attempt{client: directClient, url: canonicalURL})
+		for _, mirror := range ruleset.MirrorURLs(canonicalURL) {
+			attempts = append(attempts, attempt{client: directClient, url: mirror})
+			if proxyClient != nil {
+				attempts = append(attempts, attempt{client: proxyClient, url: mirror})
+			}
+		}
+
+		var lastErr error
+		for _, a := range attempts {
+			trySpec := spec
+			trySpec.URL = a.url
+			synced, syncErr := ruleset.SyncRuleSet(ctx, a.client, trySpec)
+			if syncErr == nil {
+				// Preserve canonical source URL in persisted metadata.
+				synced.URL = canonicalURL
+				return synced, nil
+			}
+			lastErr = syncErr
+		}
+		return spec, lastErr
+	}
+
 	results := make([]ruleset.RuleSetSpec, 0, len(specs))
 	errs := map[string]string{}
+	syncedCount := 0
 	for _, spec := range specs {
 		if !spec.Enabled && !wantIDs[spec.ID] {
 			results = append(results, spec)
@@ -314,29 +358,114 @@ func (s *Server) handleSyncRuleSets(w http.ResponseWriter, r *http.Request) {
 		}
 		spec.URL = cleanURL
 		spec.LocalPath = cleanPath
-		synced, syncErr := ruleset.SyncRuleSet(r.Context(), client, spec)
+		synced, syncErr := syncWithFallback(spec)
 		if syncErr != nil {
 			errs[spec.ID] = syncErr.Error()
 			results = append(results, spec)
 			continue
 		}
-		_ = s.store.SaveRuleSet(storage.RuleSetRecord{
-			ID:             synced.ID,
-			Tag:            synced.Tag,
-			Format:         synced.Format,
-			SourceType:     synced.SourceType,
-			URL:            synced.URL,
-			LocalPath:      synced.LocalPath,
-			UpdateInterval: synced.UpdateInterval,
-			Enabled:        synced.Enabled,
-			LastSyncedAt:   synced.LastSyncedAt,
-			SizeBytes:      synced.SizeBytes,
-		})
+		syncedCount++
+		if s.store != nil {
+			_ = s.store.SaveRuleSet(storage.RuleSetRecord{
+				ID:             synced.ID,
+				Tag:            synced.Tag,
+				Format:         synced.Format,
+				SourceType:     synced.SourceType,
+				URL:            synced.URL,
+				LocalPath:      synced.LocalPath,
+				UpdateInterval: synced.UpdateInterval,
+				Enabled:        synced.Enabled,
+				LastSyncedAt:   synced.LastSyncedAt,
+				SizeBytes:      synced.SizeBytes,
+			})
+		}
 		results = append(results, synced)
 	}
 
+	// Automatically hot-reload sing-box when any .srs rule set was synced while running,
+	// so newly downloaded local .srs binaries take effect immediately without manual restart.
+	reloaded := false
+	if syncedCount > 0 {
+		s.opMu.Lock()
+		if s.ensureOrchestrator().Status().Running {
+			if _, recErr := s.reconcileRuntime(ctx, s.activeNodeID, s.activeGroupID, s.tunEnabled); recErr == nil {
+				reloaded = true
+			} else {
+				s.ensureOrchestrator().AppendLog("system", "warn", "规则集同步后热重载失败: "+recErr.Error())
+			}
+		}
+		s.opMu.Unlock()
+	}
+	return results, errs, syncedCount, reloaded, nil
+}
+
+// maybeAutoSyncRuleSetsAsync silently downloads missing built-in .srs files once after the first
+// successful proxy connection so BlockAds / BypassCN switches unlock automatically without blocking connect.
+func (s *Server) maybeAutoSyncRuleSetsAsync() {
+	if s.store == nil || !s.autoSyncedRuleSets.CompareAndSwap(false, true) {
+		return
+	}
+	specs, err := s.effectiveRuleSets()
+	if err != nil {
+		return
+	}
+	missing := map[string]bool{}
+	for _, spec := range specs {
+		if spec.Enabled && spec.SourceType == "remote" && !spec.Synced {
+			missing[spec.ID] = true
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		// Brief delay so newly started sing-box finishes settling before fetching via local mixed port.
+		select {
+		case <-time.After(1500 * time.Millisecond):
+		case <-bgCtx.Done():
+			return
+		}
+		_, errs, syncedCount, reloaded, syncErr := s.syncRuleSetsInternal(bgCtx, missing)
+		if syncErr != nil {
+			s.ensureOrchestrator().AppendLog("system", "warn", "首次连接后台自动同步 .srs 规则集失败: "+syncErr.Error())
+			return
+		}
+		if syncedCount > 0 {
+			s.ensureOrchestrator().AppendLog("system", "info", fmt.Sprintf("首次连接已自动同步 %d 个 .srs 规则集 (热重载=%v)", syncedCount, reloaded))
+		} else if len(errs) > 0 {
+			s.ensureOrchestrator().AppendLog("system", "warn", fmt.Sprintf("后台自动同步 .srs 未完成 (%d 项失败)，可在路由页手动同步", len(errs)))
+		}
+	}()
+}
+
+func (s *Server) handleSyncRuleSets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		IDs []string `json:"ids,omitempty"`
+	}
+	if r.Body != nil && r.ContentLength != 0 {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	wantIDs := map[string]bool{}
+	for _, id := range req.IDs {
+		wantIDs[id] = true
+	}
+
+	results, errs, syncedCount, reloaded, err := s.syncRuleSetsInternal(r.Context(), wantIDs)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"rule_sets": results,
-		"errors":    errs,
+		"rule_sets":    results,
+		"errors":       errs,
+		"synced_count": syncedCount,
+		"reloaded":     reloaded,
 	})
 }

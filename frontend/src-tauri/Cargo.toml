@@ -1,6 +1,6 @@
 [package]
 name = "prismray"
-version = "1.0.0"
+version = "1.0.1"
 description = "PrismRay dual-core proxy client"
 authors = ["CRACKRAMMER"]
 edition = "2021"

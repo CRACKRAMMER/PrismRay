@@ -12,6 +12,7 @@ import (
 // Config holds parameters supplied by Kotlin ProxyVpnService / JS bridge when starting Android VPN.
 type Config struct {
 	ProtectPath    string   `json:"protect_path"`
+	OwnerPath      string   `json:"owner_path,omitempty"`
 	TunFD          int      `json:"tun_fd,omitempty"`
 	MixedPort      int      `json:"mixed_port,omitempty"`
 	PerAppMode     string   `json:"per_app_mode,omitempty"` // all | whitelist | blacklist
@@ -24,6 +25,7 @@ type Config struct {
 type Status struct {
 	Active         bool     `json:"active"`
 	ProtectPath    string   `json:"protect_path,omitempty"`
+	OwnerPath      string   `json:"owner_path,omitempty"`
 	TunFD          int      `json:"tun_fd,omitempty"`
 	MixedPort      int      `json:"mixed_port,omitempty"`
 	PerAppMode     string   `json:"per_app_mode,omitempty"`
@@ -69,6 +71,7 @@ func (m *Manager) Start(cfg Config) (Status, error) {
 	m.status = Status{
 		Active:         true,
 		ProtectPath:    strings.TrimSpace(cfg.ProtectPath),
+		OwnerPath:      strings.TrimSpace(cfg.OwnerPath),
 		TunFD:          cfg.TunFD,
 		MixedPort:      cfg.MixedPort,
 		PerAppMode:     mode,

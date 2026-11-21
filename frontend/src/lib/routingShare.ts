@@ -106,7 +106,7 @@ function extractRoutingProfile(parsed: unknown): RoutingProfile {
     remote_dns:
       typeof candidate.remote_dns === "string" && candidate.remote_dns.trim()
         ? candidate.remote_dns.trim()
-        : "https://dns.google/dns-query",
+        : "https://1.1.1.1/dns-query",
     custom_rules: customRules as RoutingProfile["custom_rules"],
   };
 }

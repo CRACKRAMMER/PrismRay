@@ -737,38 +737,57 @@ func TestCompileIPv4PreResolveForProxyOutbounds(t *testing.T) {
 		ClashAPIPort: 9090,
 	}
 
-	out, err := Compile(in)
+	// Both prefer_ipv4 and ipv4_only must emit the 4 ipv4_only resolve rules (listener, global,
+	// custom proxy, final) so domain-targeted proxy flows (e.g. Chrome HTTP CONNECT via mixed-in)
+	// resolve to IPv4 via remote-dns and never hit broken remote IPv6 / domain filters on ippure.com.
+	assertResolveRules := func(label string, raw []byte) {
+		t.Helper()
+		var doc struct {
+			Route struct {
+				Rules []map[string]any `json:"rules"`
+			} `json:"route"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatal(err)
+		}
+		var resolveCount, directResolveCount int
+		for _, r := range doc.Route.Rules {
+			if r["action"] == "resolve" && r["server"] == "remote-dns" && r["strategy"] == "ipv4_only" {
+				resolveCount++
+				if ds, ok := r["domain_suffix"].([]any); ok && len(ds) == 1 && ds[0] == "example.cn" {
+					directResolveCount++
+				}
+			}
+		}
+		if resolveCount != 4 {
+			t.Fatalf("[%s] expected 4 ipv4_only resolve rules (listener, global, custom proxy, final), got %d in %+v", label, resolveCount, doc.Route.Rules)
+		}
+		if directResolveCount != 0 {
+			t.Fatalf("[%s] did not expect direct custom rule to pre-resolve via remote-dns", label)
+		}
+		last := doc.Route.Rules[len(doc.Route.Rules)-1]
+		if last["action"] != "resolve" || last["strategy"] != "ipv4_only" || len(last) != 3 {
+			t.Fatalf("[%s] expected final catch-all ipv4_only resolve rule at tail of route.rules, got %+v", label, last)
+		}
+	}
+
+	prefOut, err := Compile(in)
 	if err != nil {
 		t.Fatalf("Compile prefer_ipv4 failed: %v", err)
 	}
-	var doc struct {
-		Route struct {
-			Rules []map[string]any `json:"rules"`
-		} `json:"route"`
-	}
-	if err := json.Unmarshal(out.Raw, &doc); err != nil {
-		t.Fatal(err)
+	assertResolveRules("prefer_ipv4", prefOut.Raw)
+	// Legacy domain-based DoH ("https://dns.google/dns-query") must bootstrap via doh-bootstrap-dns hosts.
+	if !strings.Contains(string(prefOut.Raw), `"tag": "doh-bootstrap-dns"`) || !strings.Contains(string(prefOut.Raw), `"domain_resolver": "doh-bootstrap-dns"`) {
+		t.Fatalf("expected doh-bootstrap-dns hosts resolver for domain-based DoH, got:\n%s", string(prefOut.Raw))
 	}
 
-	var resolveCount, directResolveCount int
-	for _, r := range doc.Route.Rules {
-		if r["action"] == "resolve" && r["server"] == "remote-dns" && r["strategy"] == "ipv4_only" {
-			resolveCount++
-			if ds, ok := r["domain_suffix"].([]any); ok && len(ds) == 1 && ds[0] == "example.cn" {
-				directResolveCount++
-			}
-		}
+	v4In := in
+	v4In.Routing.DomainStrategy = "ipv4_only"
+	out, err := Compile(v4In)
+	if err != nil {
+		t.Fatalf("Compile ipv4_only failed: %v", err)
 	}
-	if resolveCount != 4 {
-		t.Fatalf("expected 4 ipv4_only resolve rules (listener, global, custom proxy, final), got %d in %+v", resolveCount, doc.Route.Rules)
-	}
-	if directResolveCount != 0 {
-		t.Fatalf("did not expect direct custom rule to pre-resolve via remote-dns")
-	}
-	last := doc.Route.Rules[len(doc.Route.Rules)-1]
-	if last["action"] != "resolve" || last["strategy"] != "ipv4_only" || len(last) != 3 {
-		t.Fatalf("expected final catch-all ipv4_only resolve rule at tail of route.rules, got %+v", last)
-	}
+	assertResolveRules("ipv4_only", out.Raw)
 
 	v6In := in
 	v6In.Routing.DomainStrategy = "prefer_ipv6"
@@ -781,12 +800,14 @@ func TestCompileIPv4PreResolveForProxyOutbounds(t *testing.T) {
 	}
 
 	if binary := os.Getenv("SINGBOX_TEST_BINARY"); binary != "" {
-		cfgPath := filepath.Join(t.TempDir(), "sing-box-resolve.json")
-		if err := os.WriteFile(cfgPath, out.Raw, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
-			t.Fatalf("sing-box check failed with action=resolve rules: %v\n%s\n%s", err, output, string(out.Raw))
+		for name, raw := range map[string][]byte{"prefer_ipv4": prefOut.Raw, "ipv4_only": out.Raw} {
+			cfgPath := filepath.Join(t.TempDir(), "sing-box-"+name+".json")
+			if err := os.WriteFile(cfgPath, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
+				t.Fatalf("sing-box check failed (%s): %v\n%s\n%s", name, err, output, string(raw))
+			}
 		}
 	}
 }
@@ -987,10 +1008,14 @@ func TestCompileGroupDetourThreeHopAndCycleDetection(t *testing.T) {
 		}
 	}
 
-	// Verify idle_timeout emitted for 1h urltest group so sing-box won't exit on startup.
+	// Verify two-layer urltest wrapper: group-grp-entry (selector) -> group-grp-entry-auto (urltest with idle_timeout=2h0m0s).
 	entryOb := byTag[GroupTag("grp-entry")]
-	if entryOb == nil || entryOb["idle_timeout"] != "2h0m0s" {
-		t.Fatalf("expected grp-entry idle_timeout=2h0m0s for 1h interval, got %+v", entryOb)
+	if entryOb == nil || entryOb["type"] != "selector" || entryOb["default"] != GroupAutoTag("grp-entry") {
+		t.Fatalf("expected grp-entry selector wrapper defaulting to %q, got %+v", GroupAutoTag("grp-entry"), entryOb)
+	}
+	entryAutoOb := byTag[GroupAutoTag("grp-entry")]
+	if entryAutoOb == nil || entryAutoOb["type"] != "urltest" || entryAutoOb["idle_timeout"] != "2h0m0s" {
+		t.Fatalf("expected grp-entry auto urltest with idle_timeout=2h0m0s for 1h interval, got %+v", entryAutoOb)
 	}
 	// Verify standalone landingDirect remains direct (no detour), while scoped clone detours via grp-entry.
 	if _, hasStandaloneDetour := byTag[NodeTag("land-us-a")]["detour"]; hasStandaloneDetour {
@@ -1052,14 +1077,39 @@ func TestCompileDesktopTUNLanBroadcastExclude(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Compile with AllowLANBroadcast failed: %v", err)
 	}
-	raw := string(out.Raw)
-	for _, want := range []string{`"224.0.0.0/4"`, `"240.0.0.0/4"`, `"192.168.0.0/16"`, `"10.0.0.0/8"`, `"172.19.0.4/30"`} {
-		if !strings.Contains(raw, want) {
-			t.Fatalf("expected desktop TUN route_exclude_address to include %s, got:\n%s", want, raw)
+	var parsed struct {
+		Inbounds []struct {
+			Tag                 string   `json:"tag"`
+			RouteExcludeAddress []string `json:"route_exclude_address"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(out.Raw, &parsed); err != nil {
+		t.Fatalf("unmarshal compiled config: %v", err)
+	}
+	var excludeSet map[string]bool
+	for _, ib := range parsed.Inbounds {
+		if ib.Tag == "tun-in" {
+			excludeSet = make(map[string]bool, len(ib.RouteExcludeAddress))
+			for _, cidr := range ib.RouteExcludeAddress {
+				excludeSet[cidr] = true
+			}
+			break
 		}
 	}
-	if strings.Contains(raw, `"172.16.0.0/12"`) && strings.Contains(raw, `"route_exclude_address":["127.0.0.0/8","10.0.0.0/8","100.64.0.0/10","169.254.0.0/16","172.16.0.0/12"`) {
-		t.Fatal("route_exclude_address must not blindly exclude 172.19.0.0/30 TUN DNS subnet")
+	if excludeSet == nil {
+		t.Fatal("missing tun-in inbound in desktop TUN config")
+	}
+	for _, want := range []string{"127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4"} {
+		if !excludeSet[want] {
+			t.Fatalf("expected desktop TUN route_exclude_address to include %s, got %v", want, excludeSet)
+		}
+	}
+	// Private unicast ranges must stay inside Desktop TUN so router/Tailscale DNS (192.168.x.1,
+	// 10.x.x.1, 100.100.100.100:53) reaches hijack-dns instead of leaking/poisoning OS DNS.
+	for _, forbidden := range []string{"10.0.0.0/8", "100.64.0.0/10", "172.16.0.0/12", "192.168.0.0/16"} {
+		if excludeSet[forbidden] {
+			t.Fatalf("desktop TUN route_exclude_address must not exclude %s (breaks hijack-dns for LAN/Tailscale DNS)", forbidden)
+		}
 	}
 
 	if binary := os.Getenv("SINGBOX_TEST_BINARY"); binary != "" {
@@ -1068,7 +1118,198 @@ func TestCompileDesktopTUNLanBroadcastExclude(t *testing.T) {
 			t.Fatal(err)
 		}
 		if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
-			t.Fatalf("sing-box check failed with desktop TUN LAN broadcast exclusions: %v\n%s\n%s", err, output, raw)
+			t.Fatalf("sing-box check failed with desktop TUN LAN broadcast exclusions: %v\n%s\n%s", err, output, string(out.Raw))
+		}
+	}
+}
+
+func TestCompileGooglePlayAllowlistIPv6RejectAndAndroidAppRules(t *testing.T) {
+	nodes := []*config.Node{
+		{ID: "n1", Name: "Node 1", Protocol: config.ProtocolSocks, Address: "198.51.100.1", Port: 1080, Security: "none"},
+		{ID: "n2", Name: "Node 2", Protocol: config.ProtocolSocks, Address: "198.51.100.2", Port: 1080, Security: "none"},
+		{ID: "n3", Name: "Node 3", Protocol: config.ProtocolSocks, Address: "198.51.100.3", Port: 1080, Security: "none"},
+		{ID: "n4", Name: "Node 4", Protocol: config.ProtocolSocks, Address: "198.51.100.4", Port: 1080, Security: "none"},
+		{ID: "n5", Name: "Node 5", Protocol: config.ProtocolSocks, Address: "198.51.100.5", Port: 1080, Security: "none"},
+	}
+	groups := []storage.Group{
+		{ID: "g-lb", Name: "LB Pool", Strategy: "loadbalance", NodeIDs: []string{"n1", "n2", "n3", "n4", "n5"}},
+	}
+	profile := ruleset.DefaultRoutingProfile()
+	profile.BlockAds = true
+	profile.CustomRules = []ruleset.RoutingRule{
+		{
+			ID:          "app-play",
+			Name:        "Play Store Direct",
+			Enabled:     true,
+			PackageName: []string{"com.android.vending"},
+			Outbound:    "proxy",
+		},
+	}
+
+	out, err := Compile(CompileInput{
+		Nodes:                 nodes,
+		Groups:                groups,
+		Routing:               profile,
+		RuleSets:              ruleset.BuiltinRuleSets(""),
+		ForceRemoteRules:      true,
+		ActiveGroupID:         "g-lb",
+		MixedPort:             10808,
+		ClashAPIPort:          9090,
+		AndroidMode:           true,
+		AndroidAppSocksPort:   10899,
+		AndroidAppSocksSecret: "testsecret",
+		AndroidAppPackages:    []string{"com.android.vending"},
+	})
+	if err != nil {
+		t.Fatalf("Compile Android comprehensive test failed: %v", err)
+	}
+	raw := string(out.Raw)
+
+	// 1. Default RemoteDNS is literal IP DoH (1.1.1.1), so doh-bootstrap-dns is NOT needed.
+	if strings.Contains(raw, `"tag": "doh-bootstrap-dns"`) {
+		t.Fatalf("did not expect doh-bootstrap-dns when RemoteDNS is literal IP 1.1.1.1")
+	}
+	// 2. BlockAds rule must allowlist Google Play / Play Points domains via logical and + invert.
+	if !strings.Contains(raw, `"play.googleapis.com"`) || !strings.Contains(raw, `"invert": true`) {
+		t.Fatalf("expected BlockAds logical allowlist for Google Play domains, got:\n%s", raw)
+	}
+	// 3. Load-balance must cap shards at MaxLoadBalanceShards (4), default interval 10m, and pin Google/ippure.com to shard 0 (node-n1).
+	if strings.Contains(raw, `"outbound": "node-n5"`) {
+		t.Fatalf("expected loadbalance shard count capped at %d, found node-n5 route", MaxLoadBalanceShards)
+	}
+	if !strings.Contains(raw, `"interval": "10m"`) {
+		t.Fatalf("expected loadbalance default interval 10m, got:\n%s", raw)
+	}
+	if !strings.Contains(raw, `"ippure.com"`) || !strings.Contains(raw, `"outbound": "node-n1"`) {
+		t.Fatalf("expected loadbalance session affinity pinning ippure.com/Google to shard 0 (node-n1), got:\n%s", raw)
+	}
+	// 4. Android non-IPv6 mode must reject global IPv6 (2000::/3) inside sing-box so carrier IPv6 cannot leak.
+	if !strings.Contains(raw, `"2000::/3"`) {
+		t.Fatalf("expected Android IPv6 anti-leak reject rule for 2000::/3 when IPv6 disabled, got:\n%s", raw)
+	}
+	// 5. Android package_name rule must compile to auth_user + android-app-in SOCKS5 inbound.
+	if !strings.Contains(raw, `"tag": "android-app-in"`) || !strings.Contains(raw, `"auth_user":`) || !strings.Contains(raw, `"com.android.vending"`) {
+		t.Fatalf("expected android-app-in SOCKS5 inbound and auth_user rule for package_name, got:\n%s", raw)
+	}
+
+	if binary := os.Getenv("SINGBOX_TEST_BINARY"); binary != "" {
+		cfgPath := filepath.Join(t.TempDir(), "sing-box-android-full.json")
+		if err := os.WriteFile(cfgPath, out.Raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
+			t.Fatalf("sing-box check failed with Android app rules + LB affinity + BlockAds allowlist: %v\n%s\n%s", err, output, raw)
+		}
+	}
+}
+
+func TestCompileRuleSetsGatedOnLocalSRS(t *testing.T) {
+	node := &config.Node{
+		ID:       "n1",
+		Name:     "Node 1",
+		Protocol: config.ProtocolSocks,
+		Address:  "198.51.100.1",
+		Port:     1080,
+		Security: "none",
+	}
+	profile := ruleset.DefaultRoutingProfile()
+	profile.BlockAds = true
+	profile.BypassCN = true
+
+	// Without local .srs files on disk and ForceRemoteRules=false, neither BlockAds nor BypassCN rules may be emitted.
+	emptyDir := t.TempDir()
+	out, err := Compile(CompileInput{
+		Nodes:            []*config.Node{node},
+		Routing:          profile,
+		RuleSets:         ruleset.BuiltinRuleSets(emptyDir),
+		ForceRemoteRules: false,
+		ActiveNodeID:     node.ID,
+		MixedPort:        10808,
+		ClashAPIPort:     9090,
+	})
+	if err != nil {
+		t.Fatalf("Compile with missing local .srs failed: %v", err)
+	}
+	raw := string(out.Raw)
+	for _, forbidden := range []string{`"geosite-category-ads-all"`, `"geosite-cn"`, `"geoip-cn"`, `"play.googleapis.com"`, `"rule_set"`} {
+		if strings.Contains(raw, forbidden) {
+			t.Fatalf("did not expect %s when local .srs files are missing, got:\n%s", forbidden, raw)
+		}
+	}
+
+	if binary := os.Getenv("SINGBOX_TEST_BINARY"); binary != "" {
+		cfgPath := filepath.Join(t.TempDir(), "sing-box-missing-srs.json")
+		if err := os.WriteFile(cfgPath, out.Raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
+			t.Fatalf("sing-box check failed with missing .srs gated out: %v\n%s\n%s", err, output, raw)
+		}
+	}
+}
+
+func TestCompileHybridURLTestAndFailoverManualPin(t *testing.T) {
+	nodes := []*config.Node{
+		{ID: "n1", Name: "Node 1", Protocol: config.ProtocolSocks, Address: "198.51.100.1", Port: 1080, Security: "none"},
+		{ID: "n2", Name: "Node 2", Protocol: config.ProtocolSocks, Address: "198.51.100.2", Port: 1080, Security: "none"},
+	}
+	groups := []storage.Group{
+		{ID: "g-url-auto", Name: "URL Auto", Strategy: "urltest", SelectedNodeID: "n1", ManualPin: false, NodeIDs: []string{"n1", "n2"}},
+		{ID: "g-fail-pin", Name: "Failover Pinned", Strategy: "failover", SelectedNodeID: "n2", ManualPin: true, NodeIDs: []string{"n1", "n2"}},
+	}
+
+	out, err := Compile(CompileInput{
+		Nodes:         nodes,
+		Groups:        groups,
+		Routing:       ruleset.DefaultRoutingProfile(),
+		ActiveGroupID: "g-fail-pin",
+		MixedPort:     10808,
+		ClashAPIPort:  9090,
+	})
+	if err != nil {
+		t.Fatalf("Compile hybrid urltest/failover failed: %v", err)
+	}
+
+	var doc struct {
+		Outbounds []map[string]any `json:"outbounds"`
+	}
+	if err := json.Unmarshal(out.Raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	byTag := map[string]map[string]any{}
+	for _, ob := range doc.Outbounds {
+		if tag, ok := ob["tag"].(string); ok {
+			byTag[tag] = ob
+		}
+	}
+
+	// Unpinned urltest defaults to group-g-url-auto-auto despite legacy SelectedNodeID="n1".
+	urlWrap := byTag[GroupTag("g-url-auto")]
+	urlAuto := byTag[GroupAutoTag("g-url-auto")]
+	if urlWrap == nil || urlWrap["type"] != "selector" || urlWrap["default"] != GroupAutoTag("g-url-auto") {
+		t.Fatalf("expected unpinned urltest wrapper defaulting to auto, got %+v", urlWrap)
+	}
+	if urlAuto == nil || urlAuto["type"] != "urltest" {
+		t.Fatalf("expected internal urltest outbound for g-url-auto, got %+v", urlAuto)
+	}
+
+	// Manually pinned failover defaults to pinned node-n2 while still including group-g-fail-pin-auto for fast revert.
+	failWrap := byTag[GroupTag("g-fail-pin")]
+	failAuto := byTag[GroupAutoTag("g-fail-pin")]
+	if failWrap == nil || failWrap["type"] != "selector" || failWrap["default"] != NodeTag("n2") {
+		t.Fatalf("expected pinned failover wrapper defaulting to node-n2, got %+v", failWrap)
+	}
+	if failAuto == nil || failAuto["type"] != "urltest" {
+		t.Fatalf("expected internal urltest outbound for g-fail-pin, got %+v", failAuto)
+	}
+
+	if binary := os.Getenv("SINGBOX_TEST_BINARY"); binary != "" {
+		cfgPath := filepath.Join(t.TempDir(), "sing-box-hybrid-groups.json")
+		if err := os.WriteFile(cfgPath, out.Raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
+			t.Fatalf("sing-box check failed with hybrid urltest/failover groups: %v\n%s\n%s", err, output, string(out.Raw))
 		}
 	}
 }

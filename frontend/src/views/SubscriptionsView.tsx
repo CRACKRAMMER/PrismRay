@@ -20,6 +20,7 @@ import { useAppStore } from "../store/appStore.ts";
 import { ContextInspector } from "../components/ContextInspector.tsx";
 import { DurationInput } from "../components/DurationInput.tsx";
 import { HelpTip } from "../components/HelpTip.tsx";
+import { QRSharePanel } from "../components/NodeFormModal.tsx";
 import { QrLinkImportModal } from "../components/QrLinkImportModal.tsx";
 import { SwipeActionRow } from "../components/SwipeActionRow.tsx";
 import { Button } from "../components/ui/button.tsx";
@@ -58,6 +59,7 @@ export function SubscriptionsView() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerTitle, setDrawerTitle] = useState("");
   const [drawerWarnings, setDrawerWarnings] = useState<string[]>([]);
+  const [qrSub, setQrSub] = useState<SubscriptionRecord | null>(null);
   const [qrImportOpen, setQrImportOpen] = useState(false);
   const addUrlInputRef = useRef<HTMLInputElement>(null);
 
@@ -74,6 +76,7 @@ export function SubscriptionsView() {
 
   const openEditDialog = (sub: SubscriptionRecord) => {
     setDrawerOpen(false);
+    setQrSub(null);
     setEditingSub(sub);
     setEditName(sub.name);
     setEditUrl(sub.url);
@@ -82,8 +85,15 @@ export function SubscriptionsView() {
     setEditIntervalUnit(parts.unit);
   };
 
+  const openQrShare = (sub: SubscriptionRecord) => {
+    setEditingSub(null);
+    setDrawerOpen(false);
+    setQrSub(sub);
+  };
+
   const closeInspector = () => {
     setEditingSub(null);
+    setQrSub(null);
     setDrawerOpen(false);
   };
 
@@ -287,6 +297,7 @@ export function SubscriptionsView() {
                     size="sm"
                     onClick={() => {
                       setEditingSub(null);
+                      setQrSub(null);
                       setDrawerTitle(tr("subs.diagnosticDrawer"));
                       setDrawerWarnings(lastImportDiagnostic.warnings || []);
                       setDrawerOpen(true);
@@ -317,7 +328,7 @@ export function SubscriptionsView() {
               const used = (sub.upload_bytes || 0) + (sub.download_bytes || 0);
               const total = sub.total_bytes || 0;
               const pct = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
-              const isSelected = editingSub?.id === sub.id;
+              const isSelected = editingSub?.id === sub.id || qrSub?.id === sub.id;
 
               return (
                 <SwipeActionRow
@@ -332,6 +343,12 @@ export function SubscriptionsView() {
                       icon: <RefreshCw className="h-4 w-4" />,
                       tone: "primary",
                       onClick: () => void handleRefresh(sub.id),
+                    },
+                    {
+                      key: "qr",
+                      label: tr("subs.shareQr"),
+                      icon: <QrCode className="h-4 w-4" />,
+                      onClick: () => openQrShare(sub),
                     },
                     {
                       key: "edit",
@@ -357,6 +374,15 @@ export function SubscriptionsView() {
                         </div>
                       </div>
                       <div className="hidden md:flex shrink-0 items-center gap-1" onClick={(e) => e.stopPropagation()}>
+                        <button
+                          type="button"
+                          onClick={() => openQrShare(sub)}
+                          title={tr("subs.shareQr")}
+                          aria-label={`${tr("subs.shareQr")} ${sub.name}`}
+                          className="inline-flex h-7 w-7 items-center justify-center rounded-[6px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                        >
+                          <QrCode className="h-3.5 w-3.5" aria-hidden="true" />
+                        </button>
                         <button
                           type="button"
                           onClick={() => openEditDialog(sub)}
@@ -427,6 +453,7 @@ export function SubscriptionsView() {
                         onClick={(e) => {
                           e.stopPropagation();
                           setEditingSub(null);
+                          setQrSub(null);
                           setDrawerTitle(`${sub.name} — ${tr("subs.diagnosticDrawer")}`);
                           setDrawerWarnings(sub.warnings);
                           setDrawerOpen(true);
@@ -446,17 +473,24 @@ export function SubscriptionsView() {
       </div>
       </div>
 
-      {/* Right Context Inspector for Subscription Editing & Diagnostics */}
+      {/* Right Context Inspector for Subscription Editing, QR Sharing & Diagnostics */}
       <ContextInspector
-        open={Boolean(editingSub || drawerOpen)}
+        open={Boolean(editingSub || qrSub || drawerOpen)}
         title={
-          editingSub
-            ? `${tr("subs.editTitle")} — ${editingSub.name}`
-            : drawerTitle || tr("subs.diagnosticDrawer")
+          qrSub
+            ? `${tr("subs.shareQrTitle")} — ${qrSub.name}`
+            : editingSub
+              ? `${tr("subs.editTitle")} — ${editingSub.name}`
+              : drawerTitle || tr("subs.diagnosticDrawer")
         }
         onClose={closeInspector}
       >
-        {editingSub ? (
+        {qrSub ? (
+          <div className="space-y-3 text-xs">
+            <p className="leading-relaxed text-muted-foreground">{tr("subs.shareQrDesc")}</p>
+            <QRSharePanel nodeName={qrSub.name} uri={qrSub.url} onClose={closeInspector} />
+          </div>
+        ) : editingSub ? (
           <form onSubmit={(e) => void handleSaveEdit(e)} className="space-y-3 text-xs">
             <div className="space-y-1">
               <label className="block font-medium text-muted-foreground">{tr("subs.name")}</label>
@@ -484,14 +518,20 @@ export function SubscriptionsView() {
                 }}
               />
             </div>
-            <div className="flex justify-end gap-2 border-t border-border pt-3">
-              <Button type="button" variant="outline" onClick={closeInspector}>
-                {tr("action.cancel")}
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
+              <Button type="button" variant="outline" size="sm" onClick={() => openQrShare(editingSub)}>
+                <QrCode className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+                {tr("subs.shareQr")}
               </Button>
-              <Button type="submit" disabled={savingEdit}>
-                {savingEdit ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : null}
-                {tr("action.save")}
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button type="button" variant="outline" onClick={closeInspector}>
+                  {tr("action.cancel")}
+                </Button>
+                <Button type="submit" disabled={savingEdit}>
+                  {savingEdit ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : null}
+                  {tr("action.save")}
+                </Button>
+              </div>
             </div>
           </form>
         ) : (

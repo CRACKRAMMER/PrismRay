@@ -26,9 +26,10 @@ func (e *tun2socksEngine) Start(tunFD int, mixedPort int, mtu int) error {
 	if mtu <= 0 {
 		mtu = 1500
 	}
+	DefaultAppRoutingProxy.SetMixedPort(mixedPort)
 	engine.Insert(&engine.Key{
 		Device:     fmt.Sprintf("fd://%d", tunFD),
-		Proxy:      fmt.Sprintf("socks5://127.0.0.1:%d", mixedPort),
+		Proxy:      "prismray://local",
 		MTU:        mtu,
 		LogLevel:   "warning",
 		UDPTimeout: 60 * time.Second,

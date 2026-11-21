@@ -27,7 +27,7 @@ import {
   type ConnectionColumnId,
   DEFAULT_CONNECTION_COLUMNS,
   useAppStore,
-  useTelemetry,
+  useConnectionsTelemetry,
 } from "../store/appStore.ts";
 import { BottomSheetDialog, ContextInspector, useIsMobile } from "../components/ContextInspector.tsx";
 import { TruncateTip } from "../components/HoverPopover.tsx";
@@ -101,7 +101,7 @@ export function ConnectionsView() {
     refreshAll,
     notify,
   } = useAppStore();
-  const { connections } = useTelemetry();
+  const { connections } = useConnectionsTelemetry();
 
   const headingId = useId();
   const isMobile = useIsMobile();

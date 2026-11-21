@@ -86,6 +86,9 @@ type Status struct {
 	TUNEnabled      bool     `json:"tun_enabled"`
 	AndroidMode     bool     `json:"android_mode"`
 	MixedPort       int      `json:"mixed_port,omitempty"`
+	AppSocksPort    int      `json:"-"`
+	AppSocksSecret  string   `json:"-"`
+	AppPackages     []string `json:"-"`
 	ClashAPIPort    int      `json:"clash_api_port,omitempty"`
 	UptimeSeconds   int64    `json:"uptime_seconds,omitempty"`
 	LastError       string   `json:"last_error,omitempty"`
@@ -270,6 +273,9 @@ type Orchestrator struct {
 	tunEnabled      bool
 	androidMode     bool
 	mixedPort       int
+	appSocksPort    int
+	appSocksSecret  string
+	appPackages     []string
 	clashAPIPort    int
 	clashAPISecret  string
 	clash           *clashapi.Client
@@ -279,15 +285,25 @@ type Orchestrator struct {
 	resolvedXray    string
 
 	// Redacted structured log ring buffer + pub/sub
-	logMu       sync.Mutex
-	logs        []LogEntry
-	logHead     int
-	logCount    int
-	logSeq      atomic.Uint64
-	subscribers map[uint64]chan LogEntry
-	subSeq      atomic.Uint64
-	secretsMu   sync.RWMutex
-	secrets     []string
+	logMu             sync.Mutex
+	logs              []LogEntry
+	logHead           int
+	logCount          int
+	logSeq            atomic.Uint64
+	subscribers       map[uint64]chan LogEntry
+	subSeq            atomic.Uint64
+	secretsMu         sync.RWMutex
+	secrets           []string
+	failHandlerMu     sync.RWMutex
+	onOutboundFailure func(outboundTag, errLine string)
+}
+
+// SetOutboundFailureHandler registers an asynchronous callback notified when sing-box logs
+// a connection/dial failure on a node outbound (used for zero-idle-cost reactive fast failover).
+func (o *Orchestrator) SetOutboundFailureHandler(fn func(outboundTag, errLine string)) {
+	o.failHandlerMu.Lock()
+	o.onOutboundFailure = fn
+	o.failHandlerMu.Unlock()
 }
 
 // New constructs a new Orchestrator.
@@ -534,24 +550,44 @@ func (o *Orchestrator) Apply(ctx context.Context, in ApplyInput) (Status, error)
 		}
 	}
 
+	var appPackages []string
+	var appSocksPort int
+	var appSocksSecret string
+	if in.AndroidMode {
+		appPackages = collectAndroidRulePackages(in.Routing)
+		if len(appPackages) > 0 {
+			p, portErr := freePort()
+			if portErr != nil {
+				o.setLastError(portErr.Error())
+				return o.Status(), portErr
+			}
+			appSocksPort = p
+			appSocksSecret = randomHexSecret(16)
+			o.registerLiteralSecret(appSocksSecret)
+		}
+	}
+
 	compiled, err := sbcfg.Compile(sbcfg.CompileInput{
-		Nodes:           in.Nodes,
-		Groups:          in.Groups,
-		Listeners:       in.Listeners,
-		Routing:         in.Routing,
-		RuleSets:        in.RuleSets,
-		ActiveNodeID:    in.ActiveNodeID,
-		ActiveGroupID:   in.ActiveGroupID,
-		MixedPort:       in.MixedPort,
-		ClashAPIPort:    in.ClashAPIPort,
-		ClashAPISecret:  in.ClashAPISecret,
-		EnableTUN:       in.EnableTUN,
-		TUNStack:        in.TUNStack,
-		AndroidMode:     in.AndroidMode,
-		ProtectPath:     in.ProtectPath,
-		XrayBridgePorts: bridgePorts,
-		IncludeNaive:    includeNaive,
-		CacheFilePath:   filepath.Join(o.workDir, "cache.db"),
+		Nodes:                 in.Nodes,
+		Groups:                in.Groups,
+		Listeners:             in.Listeners,
+		Routing:               in.Routing,
+		RuleSets:              in.RuleSets,
+		ActiveNodeID:          in.ActiveNodeID,
+		ActiveGroupID:         in.ActiveGroupID,
+		MixedPort:             in.MixedPort,
+		ClashAPIPort:          in.ClashAPIPort,
+		ClashAPISecret:        in.ClashAPISecret,
+		EnableTUN:             in.EnableTUN,
+		TUNStack:              in.TUNStack,
+		AndroidMode:           in.AndroidMode,
+		ProtectPath:           in.ProtectPath,
+		AndroidAppSocksPort:   appSocksPort,
+		AndroidAppSocksSecret: appSocksSecret,
+		AndroidAppPackages:    appPackages,
+		XrayBridgePorts:       bridgePorts,
+		IncludeNaive:          includeNaive,
+		CacheFilePath:         filepath.Join(o.workDir, "cache.db"),
 	})
 	if err != nil {
 		msg := o.redactString(err.Error())
@@ -625,8 +661,8 @@ func (o *Orchestrator) Apply(ctx context.Context, in ApplyInput) (Status, error)
 
 	selMap := make(map[string]string, len(in.Groups))
 	for _, g := range in.Groups {
-		if g.SelectedNodeID != "" {
-			selMap[g.ID] = g.SelectedNodeID
+		if target := desiredGroupTargetTag(g, compiled.IncludedTags); target != "" {
+			selMap[g.ID] = target
 		}
 	}
 
@@ -645,6 +681,9 @@ func (o *Orchestrator) Apply(ctx context.Context, in ApplyInput) (Status, error)
 	o.tunEnabled = in.EnableTUN
 	o.androidMode = in.AndroidMode
 	o.mixedPort = in.MixedPort
+	o.appSocksPort = appSocksPort
+	o.appSocksSecret = appSocksSecret
+	o.appPackages = append([]string(nil), appPackages...)
 	o.clashAPIPort = in.ClashAPIPort
 	o.clashAPISecret = in.ClashAPISecret
 	o.clash = clashClient
@@ -661,6 +700,42 @@ func (o *Orchestrator) Apply(ctx context.Context, in ApplyInput) (Status, error)
 
 	o.AppendLog("system", "info", fmt.Sprintf("sing-box active (tag=%s, tun=%v, mixed=%d)", compiled.ActiveTag, in.EnableTUN, in.MixedPort))
 	return o.Status(), nil
+}
+
+func desiredGroupTargetTag(g storage.Group, included map[string]bool) string {
+	strat := storage.CanonicalGroupStrategy(g.Strategy)
+	switch strat {
+	case "selector":
+		if g.SelectedNodeID == "" {
+			return ""
+		}
+		if strings.TrimSpace(g.DetourID) != "" {
+			if scoped := sbcfg.GroupScopedNodeTag(g.SelectedNodeID, g.ID); included[scoped] {
+				return scoped
+			}
+		}
+		if ntag := sbcfg.NodeTag(g.SelectedNodeID); included[ntag] {
+			return ntag
+		}
+		return ""
+	case "urltest", "failover":
+		if g.ManualPin && g.SelectedNodeID != "" {
+			if strings.TrimSpace(g.DetourID) != "" {
+				if scoped := sbcfg.GroupScopedNodeTag(g.SelectedNodeID, g.ID); included[scoped] {
+					return scoped
+				}
+			}
+			if ntag := sbcfg.NodeTag(g.SelectedNodeID); included[ntag] {
+				return ntag
+			}
+		}
+		if autoTag := sbcfg.GroupAutoTag(g.ID); included[autoTag] {
+			return autoTag
+		}
+		return ""
+	default:
+		return ""
+	}
 }
 
 func (o *Orchestrator) tryHotSwitch(ctx context.Context, in ApplyInput, newTopoHash string) bool {
@@ -695,19 +770,19 @@ func (o *Orchestrator) tryHotSwitch(ctx context.Context, in ApplyInput, newTopoH
 
 	nextSelections := make(map[string]string, len(in.Groups))
 	for _, g := range in.Groups {
-		nextSelections[g.ID] = g.SelectedNodeID
-		if g.SelectedNodeID == "" || g.SelectedNodeID == prevSelections[g.ID] {
+		desired := desiredGroupTargetTag(g, included)
+		if desired == "" {
 			continue
 		}
-		if storage.CanonicalGroupStrategy(g.Strategy) != "selector" {
+		nextSelections[g.ID] = desired
+		if desired == prevSelections[g.ID] {
 			continue
 		}
 		gtag := sbcfg.GroupTag(g.ID)
-		ntag := sbcfg.NodeTag(g.SelectedNodeID)
-		if !included[gtag] || !included[ntag] {
+		if !included[gtag] || !included[desired] {
 			continue
 		}
-		if err := clash.SelectProxy(ctx, gtag, ntag); err != nil {
+		if err := clash.SelectProxy(ctx, gtag, desired); err != nil {
 			return false
 		}
 	}
@@ -758,10 +833,9 @@ func (o *Orchestrator) HotSwitch(ctx context.Context, selectorTag, targetTag str
 		} else if strings.HasPrefix(targetTag, "group-") {
 			o.activeGroupID = strings.TrimPrefix(targetTag, "group-")
 		}
-	} else if strings.HasPrefix(selectorTag, "group-") && strings.HasPrefix(targetTag, "node-") {
+	} else if strings.HasPrefix(selectorTag, "group-") && !strings.HasSuffix(selectorTag, "-auto") {
 		gid := strings.TrimPrefix(selectorTag, "group-")
-		nid := strings.TrimPrefix(targetTag, "node-")
-		o.groupSelections[gid] = nid
+		o.groupSelections[gid] = targetTag
 	}
 	o.mu.Unlock()
 	return nil
@@ -794,6 +868,9 @@ func (o *Orchestrator) stopLocked() {
 	o.includedTags = map[string]bool{}
 	o.tunEnabled = false
 	o.activeTag = ""
+	o.appSocksPort = 0
+	o.appSocksSecret = ""
+	o.appPackages = nil
 	o.mu.Unlock()
 
 	_ = terminateAndWait(sbProc, 2*time.Second)
@@ -820,10 +897,15 @@ func (o *Orchestrator) Status() Status {
 		TUNEnabled:      o.tunEnabled && sbUp,
 		AndroidMode:     o.androidMode,
 		MixedPort:       o.mixedPort,
+		AppSocksPort:    o.appSocksPort,
+		AppSocksSecret:  o.appSocksSecret,
 		ClashAPIPort:    o.clashAPIPort,
 		LastError:       o.lastError,
 		ResolvedSingBox: o.resolvedSB,
 		ResolvedXray:    o.resolvedXray,
+	}
+	if len(o.appPackages) > 0 {
+		st.AppPackages = append([]string(nil), o.appPackages...)
 	}
 	if len(o.skippedNaive) > 0 {
 		st.SkippedNaive = append([]string(nil), o.skippedNaive...)
@@ -848,6 +930,99 @@ func (o *Orchestrator) ClashClient() *clashapi.Client {
 		return nil
 	}
 	return o.clash
+}
+
+// ResolveLiveGroupSelection queries the live Clash API to resolve a selector/urltest/loadbalance
+// group tag to its currently active leaf outbound tag (e.g. "node-<id>").
+func (o *Orchestrator) ResolveLiveGroupSelection(ctx context.Context, groupTag string) string {
+	client := o.ClashClient()
+	if client == nil || strings.TrimSpace(groupTag) == "" {
+		return ""
+	}
+	qctx, cancel := context.WithTimeout(ctx, 400*time.Millisecond)
+	defer cancel()
+	res, err := client.GetProxies(qctx)
+	if err != nil || res == nil || len(res.Proxies) == 0 {
+		return ""
+	}
+	curr := strings.TrimSpace(groupTag)
+	seen := map[string]bool{}
+	for depth := 0; depth < 6; depth++ {
+		if seen[curr] {
+			break
+		}
+		seen[curr] = true
+		info, ok := res.Proxies[curr]
+		if !ok || strings.TrimSpace(info.Now) == "" {
+			break
+		}
+		curr = strings.TrimSpace(info.Now)
+	}
+	if curr == strings.TrimSpace(groupTag) {
+		return ""
+	}
+	return curr
+}
+
+// ResolveAllGroupSelections queries Clash API once and resolves every top-level policy group
+// ("group-<id>") to its currently active leaf node ID (stripping "node-" prefix and "--via-..." suffix).
+func (o *Orchestrator) ResolveAllGroupSelections(ctx context.Context) map[string]string {
+	client := o.ClashClient()
+	if client == nil {
+		return nil
+	}
+	qctx, cancel := context.WithTimeout(ctx, 450*time.Millisecond)
+	defer cancel()
+	res, err := client.GetProxies(qctx)
+	if err != nil || res == nil || len(res.Proxies) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for tag := range res.Proxies {
+		if !strings.HasPrefix(tag, "group-") || strings.HasSuffix(tag, "-auto") || strings.Contains(tag, "--via-") {
+			continue
+		}
+		curr := tag
+		seen := map[string]bool{}
+		for depth := 0; depth < 6; depth++ {
+			if seen[curr] {
+				break
+			}
+			seen[curr] = true
+			info, ok := res.Proxies[curr]
+			if !ok || strings.TrimSpace(info.Now) == "" {
+				break
+			}
+			curr = strings.TrimSpace(info.Now)
+		}
+		if strings.HasPrefix(curr, "node-") {
+			nid := strings.TrimPrefix(curr, "node-")
+			if idx := strings.Index(nid, "--via-"); idx > 0 {
+				nid = nid[:idx]
+			}
+			if nid != "" {
+				out[strings.TrimPrefix(tag, "group-")] = nid
+			}
+		}
+	}
+	return out
+}
+
+func collectAndroidRulePackages(routing ruleset.RoutingProfile) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, cr := range routing.CustomRules {
+		for _, pkg := range cr.PackageName {
+			clean := strings.TrimSpace(pkg)
+			if clean == "" || seen[clean] {
+				continue
+			}
+			seen[clean] = true
+			out = append(out, clean)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // LogHistory returns up to limit most recent redacted log entries (all if limit <= 0).
@@ -896,7 +1071,26 @@ var (
 	ansiEscapeRE = regexp.MustCompile(`\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))`)
 	// Matches orphaned SGR color sequences when ESC byte was stripped (e.g. "[36m", "[38;5;184m", "[0m").
 	bareSGRRE = regexp.MustCompile(`\[(?:\d{1,3}(?:;\d{1,3})*)m`)
+	// Matches sing-box outbound node tags in log lines (e.g. outbound/vless[node-xxx]: ...).
+	outboundNodeLogRE = regexp.MustCompile(`outbound/[a-zA-Z0-9_-]+\[(node-[^\]]+)\]`)
 )
+
+func isOutboundFailureLine(level, msg string) bool {
+	low := strings.ToLower(msg)
+	if strings.Contains(low, "i/o timeout") ||
+		strings.Contains(low, "context deadline exceeded") ||
+		strings.Contains(low, "connection refused") ||
+		strings.Contains(low, "connection reset by peer") ||
+		strings.Contains(low, "unexpected eof") ||
+		strings.Contains(low, "network is unreachable") ||
+		strings.Contains(low, "no route to host") ||
+		strings.Contains(low, "handshake failure") ||
+		strings.Contains(low, "broken pipe") ||
+		strings.Contains(low, "closed network connection") {
+		return true
+	}
+	return level == "error" && (strings.Contains(low, "dial ") || strings.Contains(low, "eof") || strings.Contains(low, "timeout"))
+}
 
 // StripANSI removes ANSI terminal escape codes and orphaned SGR color fragments from log lines.
 func StripANSI(s string) string {
@@ -944,6 +1138,17 @@ func (o *Orchestrator) AppendLog(core, level, msg string) {
 		}
 	}
 	o.logMu.Unlock()
+
+	if core == "sing-box" && isOutboundFailureLine(entry.Level, msg) {
+		if m := outboundNodeLogRE.FindStringSubmatch(msg); len(m) == 2 {
+			o.failHandlerMu.RLock()
+			fn := o.onOutboundFailure
+			o.failHandlerMu.RUnlock()
+			if fn != nil {
+				go fn(m[1], msg)
+			}
+		}
+	}
 }
 
 // ProbeNodes concurrently measures true proxy round-trip latencies across candidate nodes.
@@ -1319,7 +1524,7 @@ func (o *Orchestrator) probeSpeedBatch(
 			Mode:           "rule",
 			DomainStrategy: "prefer_ipv4",
 			LocalDNS:       localDNS,
-			RemoteDNS:      "https://dns.google/dns-query",
+			RemoteDNS:      "https://1.1.1.1/dns-query",
 			WebRTCMode:     "direct",
 			LogLevel:       "error",
 		},
@@ -1400,7 +1605,7 @@ func (o *Orchestrator) probeSpeedBatch(
 			dlCtx, dlCancel := context.WithTimeout(ctx, max(timeout, 6*time.Second))
 			dlReq, dlReqErr := http.NewRequestWithContext(dlCtx, http.MethodGet, downURL, nil)
 			if dlReqErr == nil {
-				dlReq.Header.Set("User-Agent", "PrismRay/1.0.0")
+				dlReq.Header.Set("User-Agent", "PrismRay/1.0.1")
 				resp, dlErr := client.Do(dlReq)
 				if dlErr == nil {
 					readStart := time.Now()
@@ -1451,7 +1656,7 @@ func (o *Orchestrator) probeSpeedBatch(
 			if ulReqErr == nil {
 				ulReq.ContentLength = upLimit
 				ulReq.Header.Set("Content-Type", "application/octet-stream")
-				ulReq.Header.Set("User-Agent", "PrismRay/1.0.0")
+				ulReq.Header.Set("User-Agent", "PrismRay/1.0.1")
 				ulStart := time.Now()
 				resp, ulErr := client.Do(ulReq)
 				ulElapsed := time.Since(ulStart)
@@ -1566,7 +1771,7 @@ func (o *Orchestrator) probeInSingleSandbox(
 			Mode:           "rule",
 			DomainStrategy: "prefer_ipv4",
 			LocalDNS:       localDNS,
-			RemoteDNS:      "https://dns.google/dns-query",
+			RemoteDNS:      "https://1.1.1.1/dns-query",
 			LogLevel:       "error",
 		},
 		XrayBridgePorts: bridgePorts,

@@ -7,7 +7,6 @@ import {
   ArrowUp,
   ArrowUpDown,
   CheckSquare,
-  FolderPlus,
   Gauge,
   GitBranch,
   GripVertical,
@@ -19,6 +18,7 @@ import {
   Play,
   Plus,
   QrCode,
+  RotateCcw,
   Search,
   ShieldCheck,
   SlidersHorizontal,
@@ -29,18 +29,21 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { type GroupConfig, type HealthSettings, type NodeConfig, type ProbeMode, api, formatApiError } from "../lib/api.ts";
+import { type GroupConfig, type NodeConfig, type ProbeMode, api, formatApiError } from "../lib/api.ts";
 import {
   ALL_PROTOCOLS,
   type NodeFilterTab,
+  type NodeHealthState,
   type NodeSortField,
   type SortDirection,
   buildNodeFilterTabs,
   formatLatency,
   formatSpeedMbps,
+  getNodeHealthState,
+  getNodeHealthStyles,
   nodeHasInsecureTLS,
   nodeHasTag,
-  nodeMatchesFilterTab,
+  nodeMatchesFilterTabs,
   sortNodesByMetric,
 } from "../lib/helpers.ts";
 import { useAppStore } from "../store/appStore.ts";
@@ -50,6 +53,7 @@ import { HoverPopover, TruncateTip } from "../components/HoverPopover.tsx";
 import { NodeContextMenu, type NodeContextMenuState } from "../components/NodeContextMenu.tsx";
 import { NodeEditorForm, QRSharePanel } from "../components/NodeFormModal.tsx";
 import { NodeMultiSelectDropdown } from "../components/NodeMultiSelectDropdown.tsx";
+import { NodeTabMultiSelect, type LockedSourceTab, type TagCheckState } from "../components/NodeTabMultiSelect.tsx";
 import { QrLinkImportModal } from "../components/QrLinkImportModal.tsx";
 import { SwipeActionRow } from "../components/SwipeActionRow.tsx";
 import { ColumnResizeHandle } from "../components/ColumnResizeHandle.tsx";
@@ -105,12 +109,15 @@ export function ProxiesView() {
     saveCustomNodeTabs,
     nodeViewMode,
     setNodeViewMode,
+    healthSettings,
+    highLatencyMs,
+    updateHighLatencyMs,
     refreshAll,
     toggleConnect,
     notify,
   } = useAppStore();
 
-  const [categoryTab, setCategoryTab] = useState<string>("all");
+  const [selectedTabIds, setSelectedTabIds] = useState<string[]>([]);
   const [search, setSearch] = useState("");
   const [protoFilter, setProtoFilter] = useState("all");
   const [probeMode, setProbeMode] = useState<ProbeMode>("urltest");
@@ -122,10 +129,6 @@ export function ProxiesView() {
   const [probingId, setProbingId] = useState<string | null>(null);
   const [probingGroupId, setProbingGroupId] = useState<string | null>(null);
 
-  const [manageTabsOpen, setManageTabsOpen] = useState(false);
-  const [newTabName, setNewTabName] = useState("");
-  const [renamingTag, setRenamingTag] = useState<string | null>(null);
-  const [renameDraft, setRenameDraft] = useState("");
   const [savingTabs, setSavingTabs] = useState(false);
 
   const isMobile = useIsMobile();
@@ -162,10 +165,12 @@ export function ProxiesView() {
   const [groupToleranceUnit, setGroupToleranceUnit] = useState<DurationUnit>("ms");
   const [groupSortOrder, setGroupSortOrder] = useState(0);
   const [groupSelectedNodeId, setGroupSelectedNodeId] = useState("");
+  const [groupManualPin, setGroupManualPin] = useState(false);
   const [groupNodeIds, setGroupNodeIds] = useState<string[]>([]);
   const [savingGroup, setSavingGroup] = useState(false);
 
-  const [healthSettings, setHealthSettings] = useState<HealthSettings | null>(null);
+  const [highLatInput, setHighLatInput] = useState(String(highLatencyMs));
+  const [savingHighLat, setSavingHighLat] = useState(false);
   const [groupSortBy, setGroupSortBy] = useState<GroupSortMode>("manual");
   const [groupOrderOverride, setGroupOrderOverride] = useState<string[] | null>(null);
   const [groupDragIndex, setGroupDragIndex] = useState<number | null>(null);
@@ -173,14 +178,31 @@ export function ProxiesView() {
   const activeGroupDragRef = useRef<number | null>(null);
   const groupOrderOverrideRef = useRef<string[] | null>(null);
 
-  const tabRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
-
   useEffect(() => {
-    void api
-      .getHealthSettings()
-      .then(setHealthSettings)
-      .catch(() => {});
-  }, []);
+    setHighLatInput(String(highLatencyMs));
+  }, [highLatencyMs]);
+
+  const commitHighLatencyThreshold = async () => {
+    const parsed = Number(highLatInput);
+    if (!Number.isFinite(parsed)) {
+      setHighLatInput(String(highLatencyMs));
+      return;
+    }
+    const clamped = Math.min(10000, Math.max(100, Math.round(parsed)));
+    if (clamped === highLatencyMs) {
+      setHighLatInput(String(clamped));
+      return;
+    }
+    setSavingHighLat(true);
+    try {
+      await updateHighLatencyMs(clamped);
+    } catch (err) {
+      notify(formatApiError(err), "error");
+      setHighLatInput(String(highLatencyMs));
+    } finally {
+      setSavingHighLat(false);
+    }
+  };
 
   useEffect(() => {
     if (activeGroupDragRef.current === null) {
@@ -226,17 +248,16 @@ export function ProxiesView() {
     [nodes, subscriptions, customNodeTabs, tr],
   );
 
-  const effectiveTab = nodeTabs.some((tab) => tab.id === categoryTab) ? categoryTab : "all";
-
-  useEffect(() => {
-    const btn = tabRefs.current.get(effectiveTab);
-    btn?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [effectiveTab]);
+  const validTabIdSet = useMemo(() => new Set(nodeTabs.map((t) => t.id)), [nodeTabs]);
+  const effectiveSelectedTabIds = useMemo(
+    () => selectedTabIds.filter((id) => id !== "all" && validTabIdSet.has(id)),
+    [selectedTabIds, validTabIdSet],
+  );
 
   const filteredNodes = useMemo(() => {
     const q = search.trim().toLowerCase();
     return nodes.filter((n) => {
-      if (!nodeMatchesFilterTab(n, effectiveTab)) return false;
+      if (!nodeMatchesFilterTabs(n, effectiveSelectedTabIds)) return false;
 
       if (protoFilter !== "all" && n.protocol !== protoFilter) return false;
       if (!q) return true;
@@ -249,7 +270,7 @@ export function ProxiesView() {
         n.protocol.toLowerCase().includes(q)
       );
     });
-  }, [nodes, effectiveTab, search, protoFilter]);
+  }, [nodes, effectiveSelectedTabIds, search, protoFilter]);
 
   const displayedNodes = useMemo(
     () => sortNodesByMetric(filteredNodes, sortField, sortDir),
@@ -359,16 +380,14 @@ export function ProxiesView() {
     }
   };
 
-  const handleCreateCustomTab = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const clean = newTabName.trim();
+  const handleCreateCustomTab = async (rawName: string) => {
+    const clean = rawName.trim();
     if (!clean) return;
     setSavingTabs(true);
     try {
       const next = Array.from(new Set([...customNodeTabs, clean]));
       await saveCustomNodeTabs(next);
-      setNewTabName("");
-      setCategoryTab(`utag:${clean}`);
+      setSelectedTabIds((prev) => Array.from(new Set([...prev, `utag:${clean}`])));
       notify(tr("proxies.tabCreated", { name: clean }));
     } catch (err) {
       notify(formatApiError(err), "error");
@@ -378,17 +397,23 @@ export function ProxiesView() {
   };
 
   const handleDeleteCustomTab = async (tagName: string) => {
+    const clean = tagName.trim();
+    if (!clean) return;
     setSavingTabs(true);
     try {
-      const nextTabs = customNodeTabs.filter((t) => t !== tagName);
+      const nextTabs = customNodeTabs.filter((t) => t !== clean);
       await saveCustomNodeTabs(nextTabs);
-      const affected = nodes.filter((n) => (n.tags || []).includes(tagName));
+      const affected = nodes.filter((n) => nodeHasTag(n, clean));
       await Promise.all(
         affected.map((n) =>
-          api.updateNode(n.id, { ...n, tags: (n.tags || []).filter((t) => t !== tagName) }),
+          api.updateNode(n.id, {
+            ...n,
+            group: (n.group || "").trim() === clean ? "" : n.group,
+            tags: (n.tags || []).filter((t) => t.trim() !== clean),
+          }),
         ),
       );
-      if (effectiveTab === `utag:${tagName}`) setCategoryTab("all");
+      setSelectedTabIds((prev) => prev.filter((id) => id !== `utag:${clean}`));
       await refreshAll();
     } catch (err) {
       notify(formatApiError(err), "error");
@@ -397,10 +422,9 @@ export function ProxiesView() {
     }
   };
 
-  const handleCommitRenameTab = async (oldName: string) => {
-    const clean = renameDraft.trim();
+  const handleCommitRenameTab = async (oldName: string, newName: string) => {
+    const clean = newName.trim();
     if (!clean || clean === oldName) {
-      setRenamingTag(null);
       return;
     }
     setSavingTabs(true);
@@ -415,7 +439,7 @@ export function ProxiesView() {
         affected.map((n) => {
           const nextNodeTags = Array.from(
             new Set([
-              ...(n.tags || []).filter((t) => t !== oldName),
+              ...(n.tags || []).filter((t) => t.trim() !== oldName),
               clean,
             ]),
           );
@@ -426,8 +450,7 @@ export function ProxiesView() {
           });
         }),
       );
-      if (effectiveTab === `utag:${oldName}`) setCategoryTab(`utag:${clean}`);
-      setRenamingTag(null);
+      setSelectedTabIds((prev) => prev.map((id) => (id === `utag:${oldName}` ? `utag:${clean}` : id)));
       await refreshAll();
     } catch (err) {
       notify(formatApiError(err), "error");
@@ -436,20 +459,86 @@ export function ProxiesView() {
     }
   };
 
-  const handleBatchAssignTag = async (tagName: string) => {
-    if (!tagName || selectedValidIds.length === 0) return;
+  const selectedNodesList = useMemo(
+    () => nodes.filter((n) => selectedSet.has(n.id)),
+    [nodes, selectedSet],
+  );
+
+  const batchLockedSources = useMemo<LockedSourceTab[]>(() => {
+    const seen = new Set<string>();
+    const out: LockedSourceTab[] = [];
+    for (const n of selectedNodesList) {
+      const sid = (n.sub_id || "").trim();
+      if (sid && !seen.has(sid)) {
+        seen.add(sid);
+        out.push({ id: sid, label: subNameMap.get(sid) || sid });
+      }
+    }
+    return out;
+  }, [selectedNodesList, subNameMap]);
+
+  const batchTagStates = useMemo<Record<string, TagCheckState>>(() => {
+    const map: Record<string, TagCheckState> = {};
+    if (selectedNodesList.length === 0) return map;
+    for (const tag of allUserTags) {
+      let hit = 0;
+      for (const n of selectedNodesList) {
+        if (nodeHasTag(n, tag)) hit += 1;
+      }
+      map[tag] = hit === 0 ? "none" : hit === selectedNodesList.length ? "all" : "some";
+    }
+    return map;
+  }, [selectedNodesList, allUserTags]);
+
+  const handleBatchToggleTag = async (tagName: string, nextChecked: boolean) => {
+    const clean = tagName.trim();
+    if (!clean || selectedNodesList.length === 0) return;
+    setSavingTabs(true);
     try {
-      const targets = nodes.filter((n) => selectedSet.has(n.id));
       await Promise.all(
-        targets.map((n) => {
-          const nextTags = Array.from(new Set([...(n.tags || []), tagName]));
+        selectedNodesList.map((n) => {
+          if (nextChecked) {
+            const nextTags = Array.from(new Set([...(n.tags || []), clean]));
+            return api.updateNode(n.id, { ...n, tags: nextTags });
+          }
+          const nextTags = (n.tags || []).filter((t) => t.trim() !== clean);
+          const nextGroup = (n.group || "").trim() === clean ? "" : n.group;
+          return api.updateNode(n.id, { ...n, group: nextGroup, tags: nextTags });
+        }),
+      );
+      await refreshAll();
+      notify(
+        nextChecked
+          ? tr("proxies.tabAdded", { count: selectedNodesList.length, name: clean })
+          : tr("proxies.tabRemoved", { count: selectedNodesList.length, name: clean }),
+      );
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setSavingTabs(false);
+    }
+  };
+
+  const handleBatchCreateAndAssignTag = async (rawName: string) => {
+    const clean = rawName.trim();
+    if (!clean || selectedNodesList.length === 0) return;
+    setSavingTabs(true);
+    try {
+      if (!customNodeTabs.includes(clean)) {
+        await saveCustomNodeTabs([...customNodeTabs, clean]);
+      }
+      await Promise.all(
+        selectedNodesList.map((n) => {
+          const nextTags = Array.from(new Set([...(n.tags || []), clean]));
           return api.updateNode(n.id, { ...n, tags: nextTags });
         }),
       );
       await refreshAll();
-      notify(`${tr("proxies.assignTab")}: #${tagName} (${targets.length})`);
+      notify(tr("proxies.tabAdded", { count: selectedNodesList.length, name: clean }));
     } catch (err) {
       notify(formatApiError(err), "error");
+    } finally {
+      setSavingTabs(false);
     }
   };
 
@@ -487,9 +576,9 @@ export function ProxiesView() {
     setInspectorMode("node");
   };
 
-  const handleSelectGroupNode = async (groupId: string, nodeId: string) => {
+  const handleSelectGroupNode = async (groupId: string, nodeId: string, auto = false) => {
     try {
-      await api.selectGroupNode(groupId, nodeId);
+      await api.selectGroupNode(groupId, nodeId, auto);
       await refreshAll();
     } catch (err) {
       notify(formatApiError(err), "error");
@@ -509,6 +598,7 @@ export function ProxiesView() {
     setGroupToleranceUnit("ms");
     setGroupSortOrder(groups.length);
     setGroupSelectedNodeId("");
+    setGroupManualPin(false);
     setGroupNodeIds([]);
     setInspectorMode("group");
   };
@@ -516,9 +606,9 @@ export function ProxiesView() {
   const openEditGroupForm = (g: GroupConfig) => {
     const strat = canonicalStrategy(g.strategy);
     const parsedInt = parseGoDuration(
-      g.interval || (strat === "failover" ? "1m" : strat === "loadbalance" ? "3m" : "5m"),
+      g.interval || (strat === "failover" ? "1m" : strat === "loadbalance" ? "10m" : "5m"),
       ["ms", "s", "m", "h", "d"],
-      { value: strat === "failover" ? 1 : strat === "loadbalance" ? 3 : 5, unit: "m" },
+      { value: strat === "failover" ? 1 : strat === "loadbalance" ? 10 : 5, unit: "m" },
     );
     const parsedTol = splitMilliseconds(
       g.tolerance_ms || (strat === "failover" ? 1000 : 50),
@@ -537,6 +627,7 @@ export function ProxiesView() {
     setGroupToleranceUnit(parsedTol.unit);
     setGroupSortOrder(g.sort_order || 0);
     setGroupSelectedNodeId(g.selected_node_id || "");
+    setGroupManualPin(Boolean(g.manual_pin));
     setGroupNodeIds(g.node_ids || []);
     setInspectorMode("group");
   };
@@ -551,22 +642,32 @@ export function ProxiesView() {
     if (!groupName.trim()) return;
     setSavingGroup(true);
     try {
-      const nextSelected =
-        groupSelectedNodeId && groupNodeIds.includes(groupSelectedNodeId)
-          ? groupSelectedNodeId
-          : groupNodeIds[0] || "";
+      let nextSelected = "";
+      let nextManualPin = false;
+      if (groupStrategy === "selector") {
+        nextSelected =
+          groupSelectedNodeId && groupNodeIds.includes(groupSelectedNodeId)
+            ? groupSelectedNodeId
+            : groupNodeIds[0] || "";
+      } else if (groupStrategy === "urltest" || groupStrategy === "failover") {
+        if (groupManualPin && groupSelectedNodeId && groupNodeIds.includes(groupSelectedNodeId)) {
+          nextSelected = groupSelectedNodeId;
+          nextManualPin = true;
+        }
+      }
       const needsHealthTiming = groupStrategy !== "selector" || groupAutoFailover === "on";
       const serializedInterval =
         groupIntervalVal > 0
           ? formatGoDuration(groupIntervalVal, groupIntervalUnit)
           : groupStrategy === "loadbalance"
-            ? "3m"
+            ? "10m"
             : "5m";
       const serializedToleranceMs = Math.max(0, joinToMilliseconds(groupToleranceVal, groupToleranceUnit));
       const payload = {
         name: groupName.trim(),
         strategy: groupStrategy,
         selected_node_id: nextSelected,
+        manual_pin: nextManualPin,
         priority_rule: groupPriorityRule,
         auto_failover: groupAutoFailover === "inherit" ? null : groupAutoFailover === "on",
         detour_id: groupDetourId.trim(),
@@ -771,13 +872,22 @@ export function ProxiesView() {
     );
   };
 
+  const nodeHealthLabel = (state: NodeHealthState) => {
+    switch (state) {
+      case "ok":
+        return tr("proxies.statusOk");
+      case "high":
+        return tr("proxies.statusHigh");
+      case "unavailable":
+        return tr("proxies.statusUnavailable");
+      default:
+        return tr("proxies.statusUntested");
+    }
+  };
+
   const renderNodeTelemetryBadge = (n: NodeConfig, showExtraWhenWide = false) => {
-    const latencyTone =
-      n.latency && n.latency > 0
-        ? "border-primary/40 bg-primary/8 text-primary"
-        : n.latency === -1
-          ? "border-destructive/40 bg-destructive/8 text-destructive"
-          : "border-border bg-muted/40 text-muted-foreground";
+    const healthState = getNodeHealthState(n.latency, highLatencyMs);
+    const health = getNodeHealthStyles(healthState);
 
     return (
       <HoverPopover
@@ -793,8 +903,16 @@ export function ProxiesView() {
                 {n.protocol}
               </span>
             </div>
-            <div className="break-all font-mono text-[11px] text-muted-foreground">
-              {n.address}:{n.port}
+            <div className="flex items-center justify-between gap-2">
+              <span className="break-all font-mono text-[11px] text-muted-foreground">
+                {n.address}:{n.port}
+              </span>
+              <span
+                className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium leading-none ${health.badgeClass}`}
+              >
+                <span className={`h-1.5 w-1.5 rounded-full ${health.dotClass}`} aria-hidden="true" />
+                {nodeHealthLabel(healthState)}
+              </span>
             </div>
             <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 pt-0.5 text-[11px]">
               <div className="flex items-center justify-between gap-2">
@@ -803,7 +921,7 @@ export function ProxiesView() {
               </div>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-muted-foreground">{tr("proxies.metricUrl")}</span>
-                <span className="font-medium text-primary">{formatLatency(n.latency)}</span>
+                <span className={`font-medium ${health.textClass}`}>{formatLatency(n.latency)}</span>
               </div>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-muted-foreground">{tr("proxies.metricDown")}</span>
@@ -820,8 +938,9 @@ export function ProxiesView() {
         }
       >
         <span
-          className={`inline-flex items-center gap-1 badge-radius border px-1.5 py-0.5 text-[11px] font-medium leading-none tabular-nums ${latencyTone}`}
+          className={`inline-flex items-center gap-1 badge-radius border px-1.5 py-0.5 text-[11px] font-medium leading-none tabular-nums ${health.badgeClass}`}
         >
+          <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${health.dotClass}`} aria-hidden="true" />
           <span>{formatLatency(n.latency)}</span>
         </span>
         {showExtraWhenWide && n.down_speed_mbps && n.down_speed_mbps > 0 ? (
@@ -939,7 +1058,7 @@ export function ProxiesView() {
       ? "关闭"
       : "Off";
 
-  const isFiltered = effectiveTab !== "all" || Boolean(search.trim()) || protoFilter !== "all";
+  const isFiltered = effectiveSelectedTabIds.length > 0 || Boolean(search.trim()) || protoFilter !== "all";
   const primaryProbeTargets =
     selectedValidIds.length > 0
       ? selectedValidIds
@@ -1158,6 +1277,21 @@ export function ProxiesView() {
                     {/* Row 2: Harmonious localized strategy pill + count + metadata badges */}
                     <div className="flex flex-wrap items-center gap-1.5">
                       {renderStrategyPill(strat, (g.node_ids || []).length)}
+                      {(strat === "urltest" || strat === "failover") && g.manual_pin ? (
+                        <>
+                          <span className="inline-flex shrink-0 items-center whitespace-nowrap rounded-full border border-amber-500/40 bg-amber-500/12 px-2 py-0.5 text-[10px] font-medium leading-none text-amber-700 dark:text-amber-400">
+                            {tr("proxies.manualPinnedBadge")}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => void handleSelectGroupNode(g.id, "", true)}
+                            className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-primary/35 bg-primary/10 px-2 py-0.5 text-[10px] font-medium leading-none text-primary transition-colors hover:bg-primary/20"
+                          >
+                            <RotateCcw className="h-2.5 w-2.5" aria-hidden="true" />
+                            <span>{tr("proxies.restoreAutoBtn")}</span>
+                          </button>
+                        </>
+                      ) : null}
                       {g.priority_rule ? (
                         <span className="inline-flex shrink-0 items-center whitespace-nowrap rounded-full border border-border bg-background px-1.5 py-0.5 text-[10px] leading-none text-muted-foreground">
                           {globalRuleLabel(g.priority_rule)}
@@ -1184,39 +1318,111 @@ export function ProxiesView() {
                       ) : null}
                     </div>
 
-                    <div className="flex flex-wrap gap-1.5">
-                      {(g.node_ids || []).map((nid, idx) => {
-                        const node = nodes.find((n) => n.id === nid);
-                        if (!node) return null;
-                        const selected = g.selected_node_id === nid;
-                        return (
-                          <button
-                            key={nid}
-                            type="button"
-                            onClick={() => void handleSelectGroupNode(g.id, nid)}
-                            className={[
-                              "inline-flex max-w-full items-center gap-1.5 rounded-lg border px-2 py-1 text-left font-sans text-xs leading-none transition-colors tabular-nums active:scale-[0.98]",
-                              selected
-                                ? "border-primary bg-primary/15 font-medium text-primary"
-                                : "bg-background text-muted-foreground hover:text-foreground",
-                            ].join(" ")}
-                          >
-                            <span className="inline-flex shrink-0 items-center rounded bg-muted px-1 py-0.5 text-[10px] font-semibold leading-none text-foreground tabular-nums">
-                              {tr("proxies.priorityRank", { rank: idx + 1 })}
-                            </span>
-                            <span className="truncate leading-normal">{node.user_alias || node.name}</span>
-                            <span className="shrink-0 text-xs leading-normal opacity-80 tabular-nums">
-                              {formatLatency(node.latency)}
-                            </span>
-                            {node.down_speed_mbps && node.down_speed_mbps > 0 ? (
-                              <span className="shrink-0 text-xs leading-normal text-emerald-600 dark:text-emerald-400 tabular-nums">
-                                {formatSpeedMbps(node.down_speed_mbps)}
-                              </span>
-                            ) : null}
-                          </button>
-                        );
-                      })}
-                    </div>
+                    {strat === "loadbalance" ? (
+                      <p className="text-[11px] leading-snug text-muted-foreground">{tr("proxies.lbReadonlyHint")}</p>
+                    ) : null}
+
+                    {(() => {
+                      const liveNodeId = status?.running ? status.live_group_nodes?.[g.id] : undefined;
+                      const lbShardRank = new Map<string, number>();
+                      if (strat === "loadbalance") {
+                        const memberIds = g.node_ids || [];
+                        const healthy = memberIds.filter((id) => {
+                          const nd = nodes.find((item) => item.id === id);
+                          return nd && (nd.latency ?? 0) >= 0;
+                        });
+                        const activeShards = (healthy.length > 0 ? healthy : memberIds).slice(0, 4);
+                        activeShards.forEach((id, sIdx) => lbShardRank.set(id, sIdx + 1));
+                      }
+                      return (
+                        <div className="flex flex-wrap gap-1.5">
+                          {(g.node_ids || []).map((nid, idx) => {
+                            const node = nodes.find((n) => n.id === nid);
+                            if (!node) return null;
+                            const healthState = getNodeHealthState(node.latency, highLatencyMs);
+                            const health = getNodeHealthStyles(healthState);
+                            if (strat === "loadbalance") {
+                              const shardNo = lbShardRank.get(nid);
+                              return (
+                                <div
+                                  key={nid}
+                                  title={`${node.user_alias || node.name} · ${nodeHealthLabel(healthState)} (${formatLatency(node.latency)})`}
+                                  className={[
+                                    "inline-flex max-w-full select-none items-center gap-1.5 rounded-lg border px-2 py-1 text-left font-sans text-xs leading-none tabular-nums",
+                                    shardNo
+                                      ? "border-emerald-500/35 bg-emerald-500/8 text-foreground"
+                                      : "border-border/70 bg-background/70 text-muted-foreground opacity-80",
+                                  ].join(" ")}
+                                >
+                                  <span
+                                    className={[
+                                      "inline-flex shrink-0 items-center rounded px-1 py-0.5 text-[10px] font-semibold leading-none tabular-nums",
+                                      shardNo
+                                        ? "bg-emerald-500/20 text-emerald-700 dark:text-emerald-300"
+                                        : "bg-muted text-muted-foreground",
+                                    ].join(" ")}
+                                  >
+                                    {shardNo ? `S${shardNo}` : tr("proxies.priorityRank", { rank: idx + 1 })}
+                                  </span>
+                                  <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${health.dotClass}`} aria-hidden="true" />
+                                  <span className="truncate leading-normal">{node.user_alias || node.name}</span>
+                                  <span className={`shrink-0 text-xs font-medium leading-normal tabular-nums ${health.textClass}`}>
+                                    {formatLatency(node.latency)}
+                                  </span>
+                                  {node.down_speed_mbps && node.down_speed_mbps > 0 ? (
+                                    <span className="shrink-0 text-xs leading-normal text-emerald-600 dark:text-emerald-400 tabular-nums">
+                                      {formatSpeedMbps(node.down_speed_mbps)}
+                                    </span>
+                                  ) : null}
+                                </div>
+                              );
+                            }
+
+                            const isManualSelected =
+                              strat === "selector"
+                                ? g.selected_node_id === nid
+                                : Boolean(g.manual_pin && g.selected_node_id === nid);
+                            const isLiveAuto =
+                              (strat === "urltest" || strat === "failover") && !g.manual_pin && liveNodeId === nid;
+                            return (
+                              <button
+                                key={nid}
+                                type="button"
+                                onClick={() => void handleSelectGroupNode(g.id, nid)}
+                                title={`${node.user_alias || node.name} · ${nodeHealthLabel(healthState)} (${formatLatency(node.latency)})`}
+                                className={[
+                                  "inline-flex max-w-full items-center gap-1.5 rounded-lg border px-2 py-1 text-left font-sans text-xs leading-none transition-colors tabular-nums active:scale-[0.98]",
+                                  isManualSelected
+                                    ? "border-primary bg-primary/15 font-medium text-primary"
+                                    : isLiveAuto
+                                      ? "border-emerald-500/45 bg-emerald-500/10 text-foreground"
+                                      : "bg-background text-muted-foreground hover:text-foreground",
+                                ].join(" ")}
+                              >
+                                <span className="inline-flex shrink-0 items-center rounded bg-muted px-1 py-0.5 text-[10px] font-semibold leading-none text-foreground tabular-nums">
+                                  {tr("proxies.priorityRank", { rank: idx + 1 })}
+                                </span>
+                                <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${health.dotClass}`} aria-hidden="true" />
+                                <span className="truncate leading-normal">{node.user_alias || node.name}</span>
+                                {isLiveAuto ? (
+                                  <span className="shrink-0 rounded bg-emerald-500/20 px-1 py-0.5 text-[10px] font-medium leading-none text-emerald-700 dark:text-emerald-300">
+                                    {tr("proxies.liveAutoBadge")}
+                                  </span>
+                                ) : null}
+                                <span className={`shrink-0 text-xs font-medium leading-normal tabular-nums ${health.textClass}`}>
+                                  {formatLatency(node.latency)}
+                                </span>
+                                {node.down_speed_mbps && node.down_speed_mbps > 0 ? (
+                                  <span className="shrink-0 text-xs leading-normal text-emerald-600 dark:text-emerald-400 tabular-nums">
+                                    {formatSpeedMbps(node.down_speed_mbps)}
+                                  </span>
+                                ) : null}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
                   </div>
                 );
               })}
@@ -1225,130 +1431,50 @@ export function ProxiesView() {
         </CardContent>
       </Card>
 
-      {/* Node Source / User-Defined Category Tabs */}
-      <div className="space-y-2 rounded-[10px] border border-border bg-card p-2">
-        <div className="flex items-center gap-2">
-          <div
-            role="tablist"
-            aria-label={tr("proxies.nodesTitle")}
-            className="tablist-scroller flex-1"
-          >
-            {nodeTabs.map((tab) => {
-              const active = effectiveTab === tab.id;
+      {/* Node Source / User-Defined Category Multi-Select Filter */}
+      <div className="flex flex-wrap items-center gap-2 rounded-[10px] border border-border bg-card p-2">
+        <NodeTabMultiSelect
+          mode="filter"
+          tabs={nodeTabs}
+          selectedTabIds={effectiveSelectedTabIds}
+          onChangeTabIds={setSelectedTabIds}
+          onCreateTab={handleCreateCustomTab}
+          onRenameTab={handleCommitRenameTab}
+          onDeleteTab={handleDeleteCustomTab}
+          busy={savingTabs}
+          className="w-full sm:w-72 shrink-0"
+        />
+
+        {effectiveSelectedTabIds.length > 0 ? (
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+            {effectiveSelectedTabIds.map((tabId) => {
+              const tab = nodeTabs.find((item) => item.id === tabId);
+              if (!tab) return null;
               return (
-                <button
+                <span
                   key={tab.id}
-                  ref={(el) => {
-                    if (el) tabRefs.current.set(tab.id, el);
-                    else tabRefs.current.delete(tab.id);
-                  }}
-                  type="button"
-                  role="tab"
-                  aria-selected={active}
-                  onClick={() => setCategoryTab(tab.id)}
-                  className={[
-                    "tab-chip inline-flex min-h-8 items-center gap-1.5 rounded-lg px-3 py-1 text-xs font-medium whitespace-nowrap transition-colors",
-                    active
-                      ? "bg-primary/15 text-primary"
-                      : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground",
-                  ].join(" ")}
+                  className="inline-flex items-center gap-1 rounded-full border border-primary/35 bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary"
                 >
                   {tab.tagName ? <Tag className="h-3 w-3 shrink-0" aria-hidden="true" /> : null}
-                  <span>{tab.label}</span>
-                  <span className="rounded-full bg-background/80 px-1.5 py-0.2 font-mono text-[11px] text-muted-foreground tabular-nums">
-                    {tab.count}
-                  </span>
-                </button>
+                  <span>{tab.tagName ? `#${tab.label}` : tab.label}</span>
+                  <span className="mono-num text-[10px] opacity-75">({tab.count})</span>
+                  <button
+                    type="button"
+                    aria-label={`${tr("action.delete")} ${tab.label}`}
+                    onClick={() => setSelectedTabIds((prev) => prev.filter((id) => id !== tab.id))}
+                    className="rounded-full p-0.5 text-primary/70 hover:bg-primary/15 hover:text-primary"
+                  >
+                    <X className="h-3 w-3" aria-hidden="true" />
+                  </button>
+                </span>
               );
             })}
           </div>
-
-          <Button
-            type="button"
-            variant={manageTabsOpen ? "default" : "outline"}
-            size="sm"
-            className="shrink-0"
-            onClick={() => setManageTabsOpen((o) => !o)}
-          >
-            <FolderPlus className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
-            {tr("proxies.manageTabs")}
-          </Button>
-        </div>
-
-        {manageTabsOpen ? (
-          <div className="space-y-2.5 border-t pt-2.5 text-xs">
-            <form onSubmit={(e) => void handleCreateCustomTab(e)} className="flex flex-wrap items-center gap-2">
-              <Input
-                className="h-8 max-w-xs text-xs"
-                placeholder={tr("proxies.newTabPlaceholder")}
-                value={newTabName}
-                onChange={(e) => setNewTabName(e.target.value)}
-              />
-              <Button type="submit" size="sm" disabled={savingTabs || !newTabName.trim()}>
-                <Plus className="mr-1 h-3.5 w-3.5" aria-hidden="true" />
-                {tr("proxies.createTab")}
-              </Button>
-            </form>
-
-            {customNodeTabs.length > 0 ? (
-              <div className="flex flex-wrap gap-2">
-                {customNodeTabs.map((tag) => (
-                  <div key={tag} className="inline-flex items-center gap-1 rounded-lg border bg-muted/40 px-2 py-1">
-                    {renamingTag === tag ? (
-                      <form
-                        onSubmit={(e) => {
-                          e.preventDefault();
-                          void handleCommitRenameTab(tag);
-                        }}
-                        className="flex items-center gap-1"
-                      >
-                        <Input
-                          className="h-6 w-28 px-1.5 text-xs"
-                          value={renameDraft}
-                          onChange={(e) => setRenameDraft(e.target.value)}
-                          autoFocus
-                        />
-                        <Button type="submit" size="sm" variant="outline" className="h-6 px-2 text-[11px]">
-                          {tr("action.save")}
-                        </Button>
-                        <button
-                          type="button"
-                          onClick={() => setRenamingTag(null)}
-                          className="text-muted-foreground hover:text-foreground"
-                        >
-                          <X className="h-3.5 w-3.5" />
-                        </button>
-                      </form>
-                    ) : (
-                      <>
-                        <span className="font-medium text-foreground">#{tag}</span>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setRenamingTag(tag);
-                            setRenameDraft(tag);
-                          }}
-                          aria-label={`${tr("proxies.renameTab")} ${tag}`}
-                          className="rounded p-0.5 text-muted-foreground hover:text-foreground"
-                        >
-                          <Pencil className="h-3 w-3" aria-hidden="true" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void handleDeleteCustomTab(tag)}
-                          aria-label={`${tr("proxies.deleteTab")} ${tag}`}
-                          className="rounded p-0.5 text-muted-foreground hover:text-destructive"
-                        >
-                          <Trash2 className="h-3 w-3" aria-hidden="true" />
-                        </button>
-                      </>
-                    )}
-                  </div>
-                ))}
-              </div>
-            ) : null}
-          </div>
-        ) : null}
+        ) : (
+          <span className="hidden sm:inline text-xs text-muted-foreground">
+            {tr("proxies.tabFilterPlaceholder")}
+          </span>
+        )}
       </div>
 
       {/* Filter Toolbar, Sort Controls & Multi-Mode Probe */}
@@ -1448,6 +1574,32 @@ export function ProxiesView() {
               <List className="h-3.5 w-3.5" aria-hidden="true" />
             </button>
           </div>
+
+          <label
+            title={tr("settings.highLatencyThresholdHint")}
+            className="hidden md:inline-flex h-8 shrink-0 items-center gap-1 rounded-[6px] border border-border bg-background px-2 text-[11px] text-muted-foreground"
+          >
+            <span className="h-2 w-2 shrink-0 rounded-full bg-amber-500" aria-hidden="true" />
+            <span className="whitespace-nowrap">{tr("proxies.highLatencyThreshold")} ≥</span>
+            <input
+              type="number"
+              min={100}
+              max={10000}
+              step={50}
+              disabled={savingHighLat}
+              aria-label={tr("settings.highLatencyThreshold")}
+              value={highLatInput}
+              onChange={(e) => setHighLatInput(e.target.value)}
+              onBlur={() => void commitHighLatencyThreshold()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.currentTarget.blur();
+                }
+              }}
+              className="w-12 bg-transparent text-right font-mono text-xs font-medium text-foreground tabular-nums focus:outline-none"
+            />
+            <span className="font-mono text-[10px]">ms</span>
+          </label>
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5">
@@ -1471,30 +1623,23 @@ export function ProxiesView() {
             </Button>
           ) : null}
 
-          {selectedValidIds.length > 0 && allUserTags.length > 0 ? (
-            <div className="w-28 shrink-0">
-              <Select
-                aria-label={tr("proxies.assignTab")}
-                size="sm"
-                value=""
-                onChange={(e) => {
-                  const v = e.target.value;
-                  if (v) void handleBatchAssignTag(v);
-                }}
-              >
-                <option value="">{tr("proxies.assignTab")}</option>
-                {allUserTags.map((tag) => (
-                  <option key={tag} value={tag}>
-                    #{tag}
-                  </option>
-                ))}
-              </Select>
-            </div>
+          {selectedValidIds.length > 0 ? (
+            <NodeTabMultiSelect
+              mode="assign"
+              lockedSources={batchLockedSources}
+              customTags={allUserTags}
+              tagStates={batchTagStates}
+              onToggleTag={handleBatchToggleTag}
+              onCreateAndAssignTag={handleBatchCreateAndAssignTag}
+              triggerLabel={tr("proxies.assignTab")}
+              busy={savingTabs}
+              className="w-36 shrink-0"
+            />
           ) : null}
 
-          <div className="hidden md:block w-28 shrink-0">
+          <div className="w-24 sm:w-28 shrink-0">
             <Select
-              aria-label="Probe mode"
+              aria-label={tr("proxies.probeMode")}
               size="sm"
               value={probeMode}
               onChange={(e) => setProbeMode(e.target.value as ProbeMode)}
@@ -1519,17 +1664,6 @@ export function ProxiesView() {
             <Gauge className={`mr-1.5 h-3.5 w-3.5 ${probingBatch ? "animate-spin" : ""}`} aria-hidden="true" />
             {primaryProbeLabel}
           </Button>
-          {primaryProbeTargets && nodes.length > primaryProbeTargets.length ? (
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              disabled={probingBatch}
-              onClick={() => void handleProbeBatch()}
-            >
-              {tr("action.testAll")}
-            </Button>
-          ) : null}
 
           <Button type="button" size="sm" variant="outline" onClick={() => setQrImportOpen(true)}>
             <QrCode className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
@@ -1616,17 +1750,17 @@ export function ProxiesView() {
                           </span>
                         ) : null}
                       </div>
-                      <span
-                        className={`badge-radius border px-1.5 py-0.5 mono-num text-[11px] shrink-0 ${
-                          n.latency && n.latency > 0
-                            ? "border-primary/40 text-primary"
-                            : n.latency === -1
-                              ? "border-destructive/40 text-destructive"
-                              : "border-border text-muted-foreground"
-                        }`}
-                      >
-                        {formatLatency(n.latency)}
-                      </span>
+                      {(() => {
+                        const health = getNodeHealthStyles(getNodeHealthState(n.latency, highLatencyMs));
+                        return (
+                          <span
+                            className={`inline-flex items-center gap-1 badge-radius border px-1.5 py-0.5 mono-num text-[11px] font-medium shrink-0 ${health.badgeClass}`}
+                          >
+                            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${health.dotClass}`} aria-hidden="true" />
+                            {formatLatency(n.latency)}
+                          </span>
+                        );
+                      })()}
                     </div>
                     <div className="flex items-center justify-between gap-2 mono-num text-xs text-muted-foreground">
                       <span className="truncate">
@@ -1858,7 +1992,7 @@ export function ProxiesView() {
         </>
       ) : (
         <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,17rem),1fr))] gap-2.5">
-          {displayedNodes.map((n) => {
+          {displayedNodes.map((n, cardIdx) => {
             const isActive = status?.running && status.active_node_id === n.id;
             const isSelected = selectedSet.has(n.id);
             const isInspected = inspectorMode === "node" && editingNode?.id === n.id;
@@ -1910,6 +2044,7 @@ export function ProxiesView() {
                   }}
                   className={[
                     "node-card-container prism-card-interactive cursor-pointer select-none",
+                    cardIdx >= 12 ? "node-card-deferred" : "",
                     isInspected
                       ? "border-primary bg-accent/45"
                       : isSelected
@@ -2081,7 +2216,7 @@ export function ProxiesView() {
                       setGroupToleranceVal(1);
                       setGroupToleranceUnit("s");
                     } else if (next === "loadbalance") {
-                      setGroupIntervalVal(3);
+                      setGroupIntervalVal(10);
                       setGroupIntervalUnit("m");
                       setGroupToleranceVal(50);
                       setGroupToleranceUnit("ms");
@@ -2098,6 +2233,11 @@ export function ProxiesView() {
                   <option value="failover">failover ({locale === "zh-CN" ? "主备故障转移" : "Failover"})</option>
                   <option value="loadbalance">loadbalance ({locale === "zh-CN" ? "主域名哈希负载均衡" : "Domain Hash LB"})</option>
                 </Select>
+                {groupStrategy === "loadbalance" ? (
+                  <p className="text-[11px] leading-snug text-muted-foreground">
+                    {tr("proxies.loadBalanceBatteryHint")}
+                  </p>
+                ) : null}
               </div>
 
               <div className="space-y-1">
@@ -2334,13 +2474,41 @@ export function ProxiesView() {
               </div>
             </div>
             <div className="space-y-1">
-              <label className="font-medium text-muted-foreground">Probe Mode</label>
+              <label className="font-medium text-muted-foreground">{tr("proxies.probeMode")}</label>
               <Select value={probeMode} onChange={(e) => setProbeMode(e.target.value as ProbeMode)}>
                 <option value="urltest">{tr("proxies.probeModeUrl")}</option>
                 <option value="ping">{tr("proxies.probeModePing")}</option>
                 <option value="speed">{tr("proxies.probeModeSpeed")}</option>
                 <option value="full">{tr("proxies.probeModeFull")}</option>
               </Select>
+            </div>
+            <div className="space-y-1">
+              <label className="font-medium text-muted-foreground">{tr("settings.highLatencyThreshold")}</label>
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  min={100}
+                  max={10000}
+                  step={50}
+                  disabled={savingHighLat}
+                  value={highLatInput}
+                  onChange={(e) => setHighLatInput(e.target.value)}
+                  onBlur={() => void commitHighLatencyThreshold()}
+                  className="font-mono text-xs tabular-nums"
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={savingHighLat}
+                  onClick={() => void commitHighLatencyThreshold()}
+                >
+                  {tr("action.save")}
+                </Button>
+              </div>
+              <p className="text-[11px] leading-snug text-muted-foreground">
+                {tr("settings.highLatencyThresholdHint")}
+              </p>
             </div>
             <div className="space-y-1">
               <label className="font-medium text-muted-foreground">{tr("settings.nodeViewMode")}</label>

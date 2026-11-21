@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/androidvpn"
@@ -26,53 +27,62 @@ import (
 
 // Server serves the PrismRay control-plane HTTP and WebSocket API.
 type Server struct {
-	auth               *authservice.Manager
-	web                http.Handler
-	webRoot            *os.Root
-	listenerHealth     string
-	httpMu             sync.Mutex
-	httpServer         *http.Server
-	wantRunning        bool
-	lastHealth         time.Time
-	coreMu             sync.Mutex
-	lastCoreCheck      time.Time
-	token              string
-	desktop            bool
-	mode               string
-	ipcPath            string
-	settingsPath       string
-	singBoxBinary      string
-	xrayBinary         string
-	protectPath        string
-	tunStack           string
-	opMu               sync.Mutex
-	orchMu             sync.Mutex
-	orch               *orchestrator.Orchestrator
-	androidVPNMu       sync.Mutex
-	androidVPN         *androidvpn.Manager
-	androidTun         *androidvpn.TunBridge
-	activeNodeID       string
-	activeGroupID      string
-	tunEnabled         bool
-	systemProxyWanted  bool
-	ksMu               sync.RWMutex
-	intendedActiveTag  string
-	killSwitchTripped  bool
-	killSwitchFailures int
-	killSwitchReason   string
-	pm                 *process.Manager
-	store              *storage.Store
-	stats              *stats.Client
-	cfg                *appconfig.Config
+	auth                *authservice.Manager
+	web                 http.Handler
+	webRoot             *os.Root
+	listenerHealth      string
+	httpMu              sync.Mutex
+	httpServer          *http.Server
+	wantRunning         bool
+	lastHealth          time.Time
+	coreMu              sync.Mutex
+	lastCoreCheck       time.Time
+	token               string
+	desktop             bool
+	mode                string
+	ipcPath             string
+	settingsPath        string
+	singBoxBinary       string
+	xrayBinary          string
+	protectPath         string
+	ownerPath           string
+	tunStack            string
+	opMu                sync.Mutex
+	orchMu              sync.Mutex
+	orch                *orchestrator.Orchestrator
+	androidVPNMu        sync.Mutex
+	androidVPN          *androidvpn.Manager
+	androidTun          *androidvpn.TunBridge
+	activeNodeID        string
+	activeGroupID       string
+	tunEnabled          bool
+	systemProxyWanted   bool
+	ksMu                sync.RWMutex
+	intendedActiveTag   string
+	killSwitchTripped   bool
+	killSwitchFailures  int
+	killSwitchReason    string
+	lastKillSwitchCheck time.Time
+	ruleSetSyncMu       sync.Mutex
+	autoSyncedRuleSets  atomic.Bool
+	failMu              sync.Mutex
+	nodeFailTimes       map[string][]time.Time
+	nodeFastProbeAt     map[string]time.Time
+	pm                  *process.Manager
+	store               *storage.Store
+	stats               *stats.Client
+	cfg                 *appconfig.Config
 }
 
 // NewServer constructs an API Server backed by SQLite storage and the dual-core Orchestrator.
 func NewServer(pm *process.Manager, store *storage.Store, statsClient *stats.Client, cfg *appconfig.Config) *Server {
 	s := &Server{
-		pm:    pm,
-		store: store,
-		stats: statsClient,
-		cfg:   cfg,
+		pm:              pm,
+		store:           store,
+		stats:           statsClient,
+		cfg:             cfg,
+		nodeFailTimes:   map[string][]time.Time{},
+		nodeFastProbeAt: map[string]time.Time{},
 	}
 	if cfg != nil {
 		s.singBoxBinary = cfg.SingBox.BinaryPath

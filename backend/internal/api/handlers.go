@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -58,48 +59,67 @@ func (s *Server) buildStatusPayload() map[string]any {
 	activeNodeName := ""
 	if activeNodeID != "" {
 		if n := s.store.Get(activeNodeID); n != nil {
-			activeNodeName = strings.TrimSpace(n.Name)
+			activeNodeName = strings.TrimSpace(n.DisplayName())
 		}
 	}
 	activeGroupName := ""
+	activeResolvedNodeName := ""
+	var liveGroupNodes map[string]string
+	if st.Running {
+		liveGroupNodes = s.ensureOrchestrator().ResolveAllGroupSelections(context.Background())
+	}
 	if activeGroupID != "" {
+		var selectedNodeID string
 		if groups, gErr := s.store.ListGroups(); gErr == nil {
 			for _, g := range groups {
 				if g.ID == activeGroupID {
 					activeGroupName = strings.TrimSpace(g.Name)
+					selectedNodeID = strings.TrimSpace(g.SelectedNodeID)
 					break
 				}
 			}
 		}
+		if liveID := liveGroupNodes[activeGroupID]; liveID != "" {
+			if n := s.store.Get(liveID); n != nil {
+				activeResolvedNodeName = strings.TrimSpace(n.DisplayName())
+			}
+		}
+		if activeResolvedNodeName == "" && selectedNodeID != "" {
+			if n := s.store.Get(selectedNodeID); n != nil {
+				activeResolvedNodeName = strings.TrimSpace(n.DisplayName())
+			}
+		}
 	}
 	return map[string]any{
-		"status":               statusStr,
-		"running":              st.Running,
-		"singbox_running":      st.SingBoxRunning,
-		"xray_running":         st.XrayRunning,
-		"singbox_pid":          st.SingBoxPID,
-		"xray_pid":             st.XrayPID,
-		"active_node_id":       activeNodeID,
-		"active_group_id":      activeGroupID,
-		"active_node_name":     activeNodeName,
-		"active_group_name":    activeGroupName,
-		"active_tag":           st.ActiveTag,
-		"tun_enabled":          st.TUNEnabled,
-		"android_mode":         st.AndroidMode,
-		"mixed_port":           st.MixedPort,
-		"clash_api_port":       st.ClashAPIPort,
-		"uptime_seconds":       st.UptimeSeconds,
-		"last_error":           st.LastError,
-		"skipped_naive":        st.SkippedNaive,
-		"resolved_singbox":     st.ResolvedSingBox,
-		"resolved_xray":        st.ResolvedXray,
-		"listener_health":      s.listenerHealth,
-		"mode":                 mode,
-		"system_proxy_enabled": s.proxyManager().Active(),
-		"system_proxy_wanted":  s.systemProxyWanted,
-		"kill_switch_enabled":  profile.KillSwitchEnabled(),
-		"kill_switch_tripped":  ksTripped,
-		"kill_switch_reason":   ksReason,
+		"status":                    statusStr,
+		"running":                   st.Running,
+		"singbox_running":           st.SingBoxRunning,
+		"xray_running":              st.XrayRunning,
+		"singbox_pid":               st.SingBoxPID,
+		"xray_pid":                  st.XrayPID,
+		"active_node_id":            activeNodeID,
+		"active_group_id":           activeGroupID,
+		"active_node_name":          activeNodeName,
+		"active_group_name":         activeGroupName,
+		"active_resolved_node_name": activeResolvedNodeName,
+		"live_group_nodes":          liveGroupNodes,
+		"active_tag":                st.ActiveTag,
+		"tun_enabled":               st.TUNEnabled,
+		"android_mode":              st.AndroidMode,
+		"mixed_port":                st.MixedPort,
+		"clash_api_port":            st.ClashAPIPort,
+		"uptime_seconds":            st.UptimeSeconds,
+		"last_error":                st.LastError,
+		"skipped_naive":             st.SkippedNaive,
+		"resolved_singbox":          st.ResolvedSingBox,
+		"resolved_xray":             st.ResolvedXray,
+		"listener_health":           s.listenerHealth,
+		"mode":                      mode,
+		"system_proxy_enabled":      s.proxyManager().Active(),
+		"system_proxy_wanted":       s.systemProxyWanted,
+		"kill_switch_enabled":       profile.KillSwitchEnabled(),
+		"kill_switch_tripped":       ksTripped,
+		"kill_switch_reason":        ksReason,
 	}
 }
 
@@ -532,6 +552,10 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request) {
 	}
 	node.ID = id
 	node.DetourID = strings.TrimSpace(node.DetourID)
+	if existing := s.store.Get(id); existing != nil && strings.TrimSpace(existing.SubID) != "" {
+		// Subscription-sourced nodes cannot have their origin subscription tab removed via node edits.
+		node.SubID = existing.SubID
+	}
 	if err := node.Validate(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -613,7 +637,7 @@ func (s *Server) handleImportSubscription(w http.ResponseWriter, r *http.Request
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		request.Header.Set("User-Agent", "PrismRay/1.0.0")
+		request.Header.Set("User-Agent", "PrismRay/1.0.1")
 		resp, err := client.Do(request)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)

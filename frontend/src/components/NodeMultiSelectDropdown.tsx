@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: MPL-2.0
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Check, ChevronDown, Search, X } from "lucide-react";
 import { type GroupConfig, type NodeConfig, type SubscriptionRecord } from "../lib/api.ts";
-import { buildNodeFilterTabs, formatLatency, nodeMatchesFilterTab } from "../lib/helpers.ts";
+import {
+  buildNodeFilterTabs,
+  formatLatency,
+  getNodeHealthState,
+  getNodeHealthStyles,
+  nodeMatchesFilterTab,
+} from "../lib/helpers.ts";
 import { useAppStore } from "../store/appStore.ts";
 import { BottomSheetDialog, useIsMobile } from "./ContextInspector.tsx";
 
@@ -38,19 +45,22 @@ export type NodeMultiSelectDropdownProps =
 
 export function NodeMultiSelectDropdown(props: NodeMultiSelectDropdownProps) {
   const { nodes, subscriptions, customNodeTabs, label, placeholder, className, triggerId } = props;
-  const { tr, locale } = useAppStore();
+  const { tr, locale, highLatencyMs } = useAppStore();
   const isMobile = useIsMobile();
 
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [tabId, setTabId] = useState("all");
-  const [placement, setPlacement] = useState<{ vertical: "bottom" | "top"; align: "left" | "right" }>({
-    vertical: "bottom",
-    align: "left",
-  });
+  const [menuPos, setMenuPos] = useState<{
+    top: number;
+    left: number;
+    width: number;
+    maxHeight: number;
+  }>({ top: 0, left: 0, width: 380, maxHeight: 420 });
 
   const containerRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   const tabs = useMemo(
@@ -88,45 +98,84 @@ export function NodeMultiSelectDropdown(props: NodeMultiSelectDropdownProps) {
 
   const selectedSet = useMemo(() => new Set(selectedNodeIds), [selectedNodeIds]);
 
-  const updateViewportPlacement = () => {
+  const updateViewportPlacement = useCallback(() => {
     if (typeof window === "undefined" || !triggerRef.current) return;
     const rect = triggerRef.current.getBoundingClientRect();
-    const spaceBelow = window.innerHeight - rect.bottom;
-    const spaceAbove = rect.top;
-    const vertical: "bottom" | "top" = spaceBelow < 320 && spaceAbove > spaceBelow ? "top" : "bottom";
-    const align: "left" | "right" = window.innerWidth - rect.left < 360 && rect.right > 360 ? "right" : "left";
-    setPlacement({ vertical, align });
-  };
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const pad = 12;
+    const gap = 6;
+    const width = Math.min(Math.max(rect.width, 380), vw - pad * 2);
+    const left = Math.max(pad, Math.min(rect.left, vw - width - pad));
+    const spaceBelow = vh - rect.bottom - gap - pad;
+    const spaceAbove = rect.top - gap - pad;
+    const preferredHeight = 400;
+    const openAbove = spaceBelow < 280 && spaceAbove > spaceBelow;
+    const availHeight = openAbove ? spaceAbove : spaceBelow;
+    const maxHeight = Math.max(200, Math.min(460, availHeight));
+    const estHeight = Math.min(preferredHeight, maxHeight);
+    const top = openAbove
+      ? Math.max(pad, rect.top - gap - estHeight)
+      : Math.max(pad, Math.min(rect.bottom + gap, vh - pad - estHeight));
+    setMenuPos({ top, left, width, maxHeight });
+  }, []);
 
   useEffect(() => {
     if (!open || isMobile) return;
+    const el = popoverRef.current;
     updateViewportPlacement();
 
-    const onPointerDown = (e: PointerEvent) => {
-      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
-        setOpen(false);
+    const canPopover =
+      el !== null &&
+      typeof HTMLElement !== "undefined" &&
+      "showPopover" in HTMLElement.prototype &&
+      typeof (el as HTMLElement & { showPopover?: () => void }).showPopover === "function";
+    if (canPopover && el) {
+      try {
+        (el as HTMLElement & { showPopover: () => void }).showPopover();
+      } catch {
+        // Ignore if already open or unsupported in current engine.
       }
+    }
+
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (containerRef.current?.contains(target)) return;
+      if (popoverRef.current?.contains(target)) return;
+      setOpen(false);
     };
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        e.stopPropagation();
         setOpen(false);
         triggerRef.current?.focus();
       }
     };
-    const onResizeOrScroll = () => updateViewportPlacement();
-
-    document.addEventListener("pointerdown", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
-    window.addEventListener("resize", onResizeOrScroll);
-    const scrollRoot = document.getElementById("prismray-scroll-root");
-    scrollRoot?.addEventListener("scroll", onResizeOrScroll, { passive: true });
-    return () => {
-      document.removeEventListener("pointerdown", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("resize", onResizeOrScroll);
-      scrollRoot?.removeEventListener("scroll", onResizeOrScroll);
+    const onResizeOrScroll = (e?: Event) => {
+      const target = e?.target as Node | null;
+      if (target && popoverRef.current?.contains(target)) return;
+      updateViewportPlacement();
     };
-  }, [open, isMobile]);
+
+    window.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("resize", onResizeOrScroll);
+    window.addEventListener("scroll", onResizeOrScroll, true);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("resize", onResizeOrScroll);
+      window.removeEventListener("scroll", onResizeOrScroll, true);
+      if (canPopover && el) {
+        try {
+          (el as HTMLElement & { hidePopover?: () => void }).hidePopover?.();
+        } catch {
+          // Ignore close races.
+        }
+      }
+    };
+  }, [open, isMobile, updateViewportPlacement]);
 
   useEffect(() => {
     if (open && !isMobile) {
@@ -364,6 +413,7 @@ export function NodeMultiSelectDropdown(props: NodeMultiSelectDropdownProps) {
           filteredNodes.map((n) => {
             const checked = selectedSet.has(n.id);
             const displayName = n.user_alias || n.name;
+            const health = getNodeHealthStyles(getNodeHealthState(n.latency, highLatencyMs));
             return (
               <button
                 key={n.id}
@@ -386,19 +436,14 @@ export function NodeMultiSelectDropdown(props: NodeMultiSelectDropdownProps) {
                   >
                     {checked ? <Check className="h-3 w-3" /> : null}
                   </span>
+                  <span className={`h-2 w-2 shrink-0 rounded-full ${health.dotClass}`} aria-hidden="true" />
                   <span className="truncate font-medium">{displayName}</span>
                 </span>
                 <span className="flex shrink-0 items-center gap-1.5">
                   <span className="rounded-[4px] border border-border px-1 py-0.5 font-mono text-[10px] uppercase text-muted-foreground">
                     {n.protocol}
                   </span>
-                  <span
-                    className={`mono-num text-[11px] ${
-                      n.latency && n.latency > 0
-                        ? "text-emerald-600 dark:text-emerald-400"
-                        : "text-muted-foreground"
-                    }`}
-                  >
+                  <span className={`mono-num text-[11px] font-medium ${health.textClass}`}>
                     {formatLatency(n.latency)}
                   </span>
                 </span>
@@ -444,17 +489,30 @@ export function NodeMultiSelectDropdown(props: NodeMultiSelectDropdownProps) {
         </span>
       </button>
 
-      {open && !isMobile ? (
-        <div
-          role="dialog"
-          aria-label={label || tr("proxies.groupsTitle")}
-          className={`absolute z-40 w-[min(420px,calc(100vw-24px))] rounded-[10px] border border-border bg-popover p-3 text-popover-foreground shadow-sm ${
-            placement.vertical === "top" ? "bottom-full mb-1" : "top-full mt-1"
-          } ${placement.align === "right" ? "right-0" : "left-0"}`}
-        >
-          {panelBody}
-        </div>
-      ) : null}
+      {open && !isMobile && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              ref={popoverRef}
+              {...({ popover: "manual" } as Record<string, string>)}
+              role="dialog"
+              aria-label={label || tr("proxies.groupsTitle")}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => e.stopPropagation()}
+              style={{
+                position: "fixed",
+                top: `${menuPos.top}px`,
+                left: `${menuPos.left}px`,
+                width: `${menuPos.width}px`,
+                maxHeight: `${menuPos.maxHeight}px`,
+                zIndex: 100,
+              }}
+              className="node-multiselect-popover overflow-y-auto rounded-[10px] border border-border bg-popover/95 p-3 text-popover-foreground shadow-xl backdrop-blur-md"
+            >
+              {panelBody}
+            </div>,
+            triggerRef.current?.closest("dialog") ?? document.body,
+          )
+        : null}
 
       {isMobile ? (
         <BottomSheetDialog

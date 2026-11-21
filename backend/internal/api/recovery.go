@@ -7,16 +7,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/config"
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/orchestrator"
 	sbcfg "github.com/CRACKRAMMER/PrismRay/backend/internal/singbox/config"
+	"github.com/CRACKRAMMER/PrismRay/backend/internal/storage"
 )
 
 const (
-	defaultSpeedDownURL = "https://speed.cloudflare.com/__down?bytes=10000000"
-	defaultSpeedUpURL   = "https://speed.cloudflare.com/__up"
+	defaultSpeedDownURL  = "https://speed.cloudflare.com/__down?bytes=10000000"
+	defaultSpeedUpURL    = "https://speed.cloudflare.com/__up"
+	defaultHighLatencyMS = 800
 )
 
 // HealthSettings configures background connectivity monitoring, probing URLs, and group priority failover.
@@ -26,6 +29,7 @@ type HealthSettings struct {
 	SpeedUpURL      string `json:"speed_up_url"`
 	IntervalSeconds int    `json:"interval_seconds"`
 	ToleranceMS     int    `json:"tolerance_ms"`
+	HighLatencyMS   int    `json:"high_latency_ms"`
 	PriorityRule    string `json:"priority_rule"` // "latency_first" | "speed_first" | "hybrid_score"
 	Failover        bool   `json:"failover"`
 	Recover         bool   `json:"recover"`
@@ -47,6 +51,7 @@ func (s *Server) healthSettings() (HealthSettings, error) {
 		SpeedUpURL:      defaultSpeedUpURL,
 		IntervalSeconds: 120,
 		ToleranceMS:     50,
+		HighLatencyMS:   defaultHighLatencyMS,
 		PriorityRule:    "latency_first",
 	}
 	if s.store == nil {
@@ -70,6 +75,9 @@ func (s *Server) healthSettings() (HealthSettings, error) {
 	}
 	if v.ToleranceMS <= 0 {
 		v.ToleranceMS = 50
+	}
+	if v.HighLatencyMS < 100 || v.HighLatencyMS > 10000 {
+		v.HighLatencyMS = defaultHighLatencyMS
 	}
 	v.PriorityRule = normalizePriorityRule(v.PriorityRule)
 	return v, nil
@@ -133,6 +141,13 @@ func (s *Server) handleHealthSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if v.ToleranceMS < 0 {
 		v.ToleranceMS = 50
+	}
+	if v.HighLatencyMS == 0 {
+		v.HighLatencyMS = defaultHighLatencyMS
+	} else if v.HighLatencyMS < 100 {
+		v.HighLatencyMS = 100
+	} else if v.HighLatencyMS > 10000 {
+		v.HighLatencyMS = 10000
 	}
 	v.PriorityRule = normalizePriorityRule(v.PriorityRule)
 	if err := s.store.PutSetting("health.settings", v); err != nil {
@@ -357,6 +372,21 @@ func (s *Server) incrementKillSwitchFailures() int {
 }
 
 func (s *Server) maintainKillSwitch(ctx context.Context) {
+	// Adaptive battery-friendly probing:
+	// - Healthy baseline: probe every 60s to avoid waking mobile radios every 15s.
+	// - After any failure or while tripped: probe every 15s for fast failover/recovery.
+	s.ksMu.Lock()
+	interval := 60 * time.Second
+	if s.killSwitchFailures > 0 || s.killSwitchTripped {
+		interval = 15 * time.Second
+	}
+	if !s.lastKillSwitchCheck.IsZero() && time.Since(s.lastKillSwitchCheck) < interval {
+		s.ksMu.Unlock()
+		return
+	}
+	s.lastKillSwitchCheck = time.Now()
+	s.ksMu.Unlock()
+
 	orch := s.ensureOrchestrator()
 	clash := orch.ClashClient()
 	var probeFn func(context.Context, string, string, int) (int, error)
@@ -437,6 +467,12 @@ func (s *Server) evaluateKillSwitchOnce(ctx context.Context, probeDelay func(con
 		return
 	}
 
+	// If the failing active target is a urltest/failover group with a manual pin, immediately
+	// auto-revert back to group-<id>-auto before tripping Kill Switch so healthy peers take over.
+	if activeGroupID != "" && s.revertPinnedGroupToAuto(ctx, activeGroupID, "Kill Switch 探测到手动锁定节点不可达") {
+		return
+	}
+
 	failures := s.incrementKillSwitchFailures()
 	if failures < 2 {
 		return
@@ -450,5 +486,146 @@ func (s *Server) evaluateKillSwitchOnce(ctx context.Context, probeDelay func(con
 		if clash := orch.ClashClient(); clash != nil {
 			_ = clash.CloseAllConnections(ctx)
 		}
+	}
+}
+
+func (s *Server) revertPinnedGroupToAuto(ctx context.Context, groupID, reason string) bool {
+	if s.store == nil || strings.TrimSpace(groupID) == "" {
+		return false
+	}
+	groups, err := s.store.ListGroups()
+	if err != nil {
+		return false
+	}
+	for _, g := range groups {
+		if g.ID != groupID {
+			continue
+		}
+		strat := storage.CanonicalGroupStrategy(g.Strategy)
+		if (strat != "urltest" && strat != "failover") || !g.ManualPin {
+			return false
+		}
+		if err := s.store.SetGroupSelection(g.ID, "", false); err != nil {
+			return false
+		}
+		orch := s.ensureOrchestrator()
+		if err := orch.HotSwitch(ctx, sbcfg.GroupTag(g.ID), sbcfg.GroupAutoTag(g.ID)); err == nil {
+			orch.AppendLog("system", "warn", fmt.Sprintf("策略组「%s」%s，已自动切回自动优选模式", g.Name, reason))
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+// handleOutboundFailureEvent reacts to real-time sing-box outbound dial/timeout/EOF log bursts.
+// Zero idle overhead: only probes a single node when it records >=2 failures within 10s AND is
+// currently pinned/active in a failover-capable group; on confirmed timeout, marks node red (-1)
+// and immediately switches back to auto mode.
+func (s *Server) handleOutboundFailureEvent(outboundTag, _ string) {
+	if s.store == nil {
+		return
+	}
+	nodeID := strings.TrimPrefix(strings.TrimSpace(outboundTag), "node-")
+	if idx := strings.Index(nodeID, "--via-"); idx > 0 {
+		nodeID = nodeID[:idx]
+	}
+	if nodeID == "" {
+		return
+	}
+
+	now := time.Now()
+	s.failMu.Lock()
+	if s.nodeFailTimes == nil {
+		s.nodeFailTimes = map[string][]time.Time{}
+	}
+	if s.nodeFastProbeAt == nil {
+		s.nodeFastProbeAt = map[string]time.Time{}
+	}
+	windowStart := now.Add(-10 * time.Second)
+	var recent []time.Time
+	for _, ts := range s.nodeFailTimes[nodeID] {
+		if ts.After(windowStart) {
+			recent = append(recent, ts)
+		}
+	}
+	recent = append(recent, now)
+	s.nodeFailTimes[nodeID] = recent
+	if len(recent) < 2 {
+		s.failMu.Unlock()
+		return
+	}
+	if lastProbe, ok := s.nodeFastProbeAt[nodeID]; ok && now.Sub(lastProbe) < 15*time.Second {
+		s.failMu.Unlock()
+		return
+	}
+	s.nodeFastProbeAt[nodeID] = now
+	s.nodeFailTimes[nodeID] = nil
+	s.failMu.Unlock()
+
+	groups, err := s.store.ListGroups()
+	if err != nil {
+		return
+	}
+	hs, _ := s.healthSettings()
+	var pinnedAutoGroups []storage.Group
+	var failoverSelectorGroups []storage.Group
+	for _, g := range groups {
+		strat := storage.CanonicalGroupStrategy(g.Strategy)
+		if (strat == "urltest" || strat == "failover") && g.ManualPin && g.SelectedNodeID == nodeID {
+			pinnedAutoGroups = append(pinnedAutoGroups, g)
+		} else if strat == "selector" && g.SelectedNodeID == nodeID && effectiveGroupAutoFailover(g, hs.Failover) {
+			failoverSelectorGroups = append(failoverSelectorGroups, g)
+		}
+	}
+	if len(pinnedAutoGroups) == 0 && len(failoverSelectorGroups) == 0 {
+		return
+	}
+
+	node := s.store.Get(nodeID)
+	if node == nil {
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	testURL := stringsTrim(hs.URL)
+	if testURL == "" {
+		testURL = defaultProbeURL
+	}
+	localDNS, androidMode, protectPath := s.probeEnvOptions()
+	allNodes := s.store.List()
+	results := s.ensureOrchestrator().ProbeNodesWithOptions(probeCtx, []*config.Node{node}, orchestrator.ProbeOptions{
+		Mode:        "urltest",
+		TestURL:     testURL,
+		LocalDNS:    localDNS,
+		AndroidMode: androidMode,
+		ProtectPath: protectPath,
+		Timeout:     5 * time.Second,
+		AllNodes:    allNodes,
+		AllGroups:   groups,
+	})
+	res, ok := results[nodeID]
+	highLatMS := int64(hs.HighLatencyMS)
+	if highLatMS <= 0 {
+		highLatMS = defaultHighLatencyMS
+	}
+	if ok && res.Error == "" && res.LatencyMS > 0 {
+		_ = s.store.UpdateLatency(nodeID, int(res.LatencyMS))
+		if res.LatencyMS < highLatMS {
+			return
+		}
+	} else {
+		_ = s.store.UpdateLatency(nodeID, -1)
+	}
+
+	reason := "连续报错且快速复测不可达"
+	if ok && res.Error == "" && res.LatencyMS >= highLatMS {
+		reason = fmt.Sprintf("连续报错且延迟过高 (%dms ≥ %dms)", res.LatencyMS, highLatMS)
+	}
+	for _, g := range pinnedAutoGroups {
+		_ = s.revertPinnedGroupToAuto(probeCtx, g.ID, reason)
+	}
+	for _, g := range failoverSelectorGroups {
+		_, _, _, _ = s.probeAndReorderGroup(probeCtx, g.ID, "urltest", "", hs, false)
 	}
 }

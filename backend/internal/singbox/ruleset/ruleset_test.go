@@ -76,3 +76,17 @@ func TestAllowLANBroadcastDefaultsAndLinksWithBypassLAN(t *testing.T) {
 		t.Fatal("expected Normalize to keep AllowLANBroadcast when BypassLAN is true")
 	}
 }
+
+func TestDefaultRemoteDNSAndMirrorURLs(t *testing.T) {
+	def := DefaultRoutingProfile()
+	if def.RemoteDNS != "https://1.1.1.1/dns-query" {
+		t.Fatalf("expected default RemoteDNS to be https://1.1.1.1/dns-query, got %q", def.RemoteDNS)
+	}
+	mirrors := MirrorURLs("https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs")
+	if len(mirrors) != 1 || mirrors[0] != "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs" {
+		t.Fatalf("unexpected jsDelivr mirror URLs: %+v", mirrors)
+	}
+	if len(MirrorURLs("https://example.com/custom.srs")) != 0 {
+		t.Fatal("expected no mirrors for non-GitHub custom URL")
+	}
+}

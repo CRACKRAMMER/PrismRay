@@ -92,7 +92,7 @@ func (s *Server) handleEnsureCores(w http.ResponseWriter, r *http.Request) {
 func latestCoreVersion(ctx context.Context, repository string) (string, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/"+repository+"/releases/latest", nil)
-	req.Header.Set("User-Agent", "PrismRay/1.0.0")
+	req.Header.Set("User-Agent", "PrismRay/1.0.1")
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err

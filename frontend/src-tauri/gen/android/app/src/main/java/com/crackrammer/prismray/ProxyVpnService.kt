@@ -5,22 +5,33 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
 import android.net.LocalServerSocket
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
+import android.os.Process
 import android.service.quicksettings.TileService
 import android.system.Os
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedReader
 import java.io.File
+import java.io.InputStreamReader
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -43,12 +54,31 @@ class ProxyVpnService : VpnService() {
             private set
 
         @Volatile
+        var activeTargetLabel: String = ""
+            private set
+
+        @Volatile
         var stateListener: ((running: Boolean, error: String?) -> Unit)? = null
     }
 
     private val running = AtomicBoolean(false)
     private val stopping = AtomicBoolean(false)
     private val sessionSeq = AtomicLong(0L)
+    private val screenWakeMonitor = Object()
+    private val uidPackageCache = ConcurrentHashMap<Int, String>()
+
+    @Volatile
+    private var screenReceiverRegistered = false
+
+    private val screenOnReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_SCREEN_ON) {
+                synchronized(screenWakeMonitor) {
+                    screenWakeMonitor.notifyAll()
+                }
+            }
+        }
+    }
 
     @Volatile
     private var boundProtectSocket: LocalSocket? = null
@@ -57,10 +87,18 @@ class ProxyVpnService : VpnService() {
     private var protectServerSocket: LocalServerSocket? = null
 
     @Volatile
+    private var boundOwnerSocket: LocalSocket? = null
+
+    @Volatile
+    private var ownerServerSocket: LocalServerSocket? = null
+
+    @Volatile
     private var vpnInterface: ParcelFileDescriptor? = null
 
     private var protectFile: File? = null
+    private var ownerFile: File? = null
     private var protectThread: Thread? = null
+    private var ownerThread: Thread? = null
     private var statsThread: Thread? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -98,8 +136,116 @@ class ProxyVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        unregisterScreenReceiver()
         stopVpnSession(notifyBackend = false)
         super.onDestroy()
+    }
+
+    private fun registerScreenReceiver() {
+        if (screenReceiverRegistered) return
+        try {
+            val filter = IntentFilter(Intent.ACTION_SCREEN_ON)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(screenOnReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                registerReceiver(screenOnReceiver, filter)
+            }
+            screenReceiverRegistered = true
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun unregisterScreenReceiver() {
+        if (!screenReceiverRegistered) return
+        screenReceiverRegistered = false
+        try {
+            unregisterReceiver(screenOnReceiver)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun isScreenInteractive(): Boolean {
+        return try {
+            val pm = getSystemService(PowerManager::class.java)
+            pm?.isInteractive ?: true
+        } catch (_: Throwable) {
+            true
+        }
+    }
+
+    private fun notificationTitle(label: String): String {
+        val trimmed = label.trim()
+        return if (trimmed.isNotEmpty()) "PrismRay · $trimmed" else "PrismRay VPN"
+    }
+
+    private fun startOwnerServer(socketFile: File) {
+        socketFile.parentFile?.mkdirs()
+        if (socketFile.exists()) {
+            socketFile.delete()
+        }
+        val bound = LocalSocket(LocalSocket.SOCKET_STREAM)
+        bound.bind(LocalSocketAddress(socketFile.absolutePath, LocalSocketAddress.Namespace.FILESYSTEM))
+        val server = LocalServerSocket(bound.fileDescriptor)
+        ownerFile = socketFile
+        boundOwnerSocket = bound
+        ownerServerSocket = server
+
+        ownerThread = Thread({
+            val cm = getSystemService(ConnectivityManager::class.java)
+            while (running.get()) {
+                val client = try {
+                    server.accept()
+                } catch (_: Throwable) {
+                    if (!running.get()) break
+                    continue
+                } ?: continue
+                try {
+                    client.soTimeout = 1000
+                    val reader = BufferedReader(InputStreamReader(client.inputStream))
+                    val req = reader.readLine()?.trim().orEmpty()
+                    val pkg = resolveConnectionOwnerPackage(cm, req)
+                    client.outputStream.write("$pkg\n".toByteArray(Charsets.UTF_8))
+                    client.outputStream.flush()
+                } catch (_: Throwable) {
+                } finally {
+                    try {
+                        client.close()
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }, "prismray-owner").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun resolveConnectionOwnerPackage(cm: ConnectivityManager?, req: String): String {
+        if (cm == null || req.isEmpty() || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return ""
+        }
+        val parts = req.split(',')
+        if (parts.size != 5) return ""
+        return try {
+            val proto = parts[0].toInt()
+            val srcAddr = InetSocketAddress(InetAddress.getByName(parts[1]), parts[2].toInt())
+            val dstAddr = InetSocketAddress(InetAddress.getByName(parts[3]), parts[4].toInt())
+            val uid = cm.getConnectionOwnerUid(proto, srcAddr, dstAddr)
+            if (uid == Process.INVALID_UID || uid <= 0) {
+                ""
+            } else {
+                uidPackageCache.computeIfAbsent(uid) { u ->
+                    try {
+                        packageManager.getPackagesForUid(u)?.firstOrNull().orEmpty()
+                    } catch (_: Throwable) {
+                        ""
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            ""
+        }
     }
 
     private fun ensureNotificationChannel() {
@@ -289,6 +435,13 @@ class ProxyVpnService : VpnService() {
             return
         }
 
+        val ownerSockFile = File(RuntimeIpc.dataDirectory(this), "owner.sock")
+        try {
+            startOwnerServer(ownerSockFile)
+        } catch (err: Throwable) {
+            Log.w(TAG, "Owner socket 启动失败 (自定义应用分流将不可用): ${err.message ?: err.javaClass.simpleName}")
+        }
+
         val inputJson = try {
             if (!configJsonRaw.isNullOrBlank()) JSONObject(configJsonRaw) else JSONObject()
         } catch (_: Throwable) {
@@ -320,6 +473,9 @@ class ProxyVpnService : VpnService() {
 
         val startPayload = JSONObject().apply {
             put("protect_path", protectSockFile.absolutePath)
+            if (ownerServerSocket != null) {
+                put("owner_path", ownerSockFile.absolutePath)
+            }
             if (inputJson.has("per_app_mode")) {
                 put("per_app_mode", inputJson.optString("per_app_mode", "all"))
             }
@@ -359,7 +515,6 @@ class ProxyVpnService : VpnService() {
             return
         }
 
-        var mixedPort = 10808
         var tunSocketPath = ""
         var perAppMode = inputJson.optString("per_app_mode", "all")
         var bypassLan = inputJson.optBoolean("bypass_lan", true)
@@ -367,8 +522,6 @@ class ProxyVpnService : VpnService() {
         val packages = mutableListOf<String>()
         try {
             val started = JSONObject(res.body)
-            val parsedPort = started.optInt("mixed_port", 10808)
-            if (parsedPort > 0) mixedPort = parsedPort
             tunSocketPath = started.optString("tun_socket_path", "").trim()
             val returnedMode = started.optString("per_app_mode", "").trim().lowercase()
             if (returnedMode.isNotEmpty()) perAppMode = returnedMode
@@ -394,6 +547,7 @@ class ProxyVpnService : VpnService() {
             .setSession("PrismRay")
             .setMtu(1500)
             .addAddress("172.19.0.1", 30)
+            .addAddress("fdfe:dcba:9876::1", 126)
             .addDnsServer("172.19.0.2")
             .setBlocking(false)
         applyVpnRoutes(builder, effectiveLanBroadcast)
@@ -464,9 +618,11 @@ class ProxyVpnService : VpnService() {
 
         isVpnRunning = true
         lastError = null
+        val initialNodeName = queryActiveTargetLabel()
+        activeTargetLabel = initialNodeName
+        registerScreenReceiver()
         requestTileRefresh()
         stateListener?.invoke(true, null)
-        val initialNodeName = queryActiveTargetLabel()
         VpnWidgetProvider.updateAllWidgets(
             this,
             running = true,
@@ -474,21 +630,29 @@ class ProxyVpnService : VpnService() {
             nodeName = initialNodeName,
             speedText = "↑ 0 B/s · ↓ 0 B/s",
         )
-        updateNotification("PrismRay VPN Active", "Full TUN · :$mixedPort · ↑ 0 B/s · ↓ 0 B/s")
+        updateNotification(notificationTitle(initialNodeName), "↑ 0 B/s · ↓ 0 B/s")
 
         statsThread = Thread({
             var lastUp = 0L
             var lastDown = 0L
             var lastTickMs = System.currentTimeMillis()
             var activeLabel = initialNodeName
+            var wasScreenOff = false
             while (running.get() && sessionSeq.get() == mySeq) {
+                val interactive = isScreenInteractive()
+                val sleepMs = if (interactive) 2000L else 15000L
                 try {
-                    Thread.sleep(2000)
+                    synchronized(screenWakeMonitor) {
+                        if (running.get() && sessionSeq.get() == mySeq) {
+                            screenWakeMonitor.wait(sleepMs)
+                        }
+                    }
                 } catch (_: InterruptedException) {
                     break
                 }
                 if (!running.get() || sessionSeq.get() != mySeq) break
 
+                val nowInteractive = isScreenInteractive()
                 val statusRes = RuntimeIpc.request(this, "GET", "/api/process/status")
                 if (statusRes != null && statusRes.statusCode in 200..299) {
                     try {
@@ -498,9 +662,27 @@ class ProxyVpnService : VpnService() {
                             break
                         }
                         val label = extractTargetLabel(statusJson)
-                        if (label.isNotBlank()) activeLabel = label
+                        if (label.isNotBlank() && label != activeLabel) {
+                            activeLabel = label
+                            activeTargetLabel = label
+                            requestTileRefresh()
+                        }
                     } catch (_: Throwable) {
                     }
+                }
+
+                // Battery optimization: while screen is off, skip /api/connections polling,
+                // notification redraws, and widget updates until ACTION_SCREEN_ON wakes us.
+                if (!nowInteractive) {
+                    wasScreenOff = true
+                    continue
+                }
+                if (wasScreenOff) {
+                    // Reset rate baseline on wake so cumulative screen-off bytes don't spike throughput.
+                    wasScreenOff = false
+                    lastUp = 0L
+                    lastDown = 0L
+                    lastTickMs = System.currentTimeMillis()
                 }
 
                 val connRes = RuntimeIpc.request(this, "GET", "/api/connections")
@@ -518,7 +700,7 @@ class ProxyVpnService : VpnService() {
                         lastTickMs = nowMs
                         val speedLine = "↑ ${formatRate(upRate)} · ↓ ${formatRate(downRate)}"
                         updateNotification(
-                            "PrismRay VPN Active",
+                            notificationTitle(activeLabel),
                             speedLine
                         )
                         VpnWidgetProvider.updateAllWidgets(
@@ -541,6 +723,9 @@ class ProxyVpnService : VpnService() {
 
     private fun closeSocketsAndInterface() {
         running.set(false)
+        synchronized(screenWakeMonitor) {
+            screenWakeMonitor.notifyAll()
+        }
         try {
             vpnInterface?.close()
         } catch (_: Throwable) {
@@ -564,12 +749,33 @@ class ProxyVpnService : VpnService() {
         } catch (_: Throwable) {
         }
         protectFile = null
+
+        try {
+            ownerServerSocket?.close()
+        } catch (_: Throwable) {
+        }
+        ownerServerSocket = null
+
+        try {
+            boundOwnerSocket?.close()
+        } catch (_: Throwable) {
+        }
+        boundOwnerSocket = null
+
+        try {
+            ownerFile?.delete()
+        } catch (_: Throwable) {
+        }
+        ownerFile = null
+        uidPackageCache.clear()
     }
 
     private fun stopVpnSession(notifyBackend: Boolean) {
         if (!stopping.compareAndSet(false, true)) return
         sessionSeq.incrementAndGet()
         isVpnRunning = false
+        activeTargetLabel = ""
+        unregisterScreenReceiver()
         closeSocketsAndInterface()
         statsThread?.interrupt()
         if (notifyBackend) {
@@ -599,11 +805,15 @@ class ProxyVpnService : VpnService() {
     }
 
     private fun extractTargetLabel(statusJson: JSONObject): String {
-        val node = statusJson.optString("active_node_name", "").trim()
-        if (node.isNotEmpty()) return node
         val group = statusJson.optString("active_group_name", "").trim()
-        if (group.isNotEmpty()) return group
-        return ""
+        val resolved = statusJson.optString("active_resolved_node_name", "").trim()
+        val node = statusJson.optString("active_node_name", "").trim()
+        return when {
+            group.isNotEmpty() && resolved.isNotEmpty() && resolved != group -> "$group → $resolved"
+            group.isNotEmpty() -> group
+            node.isNotEmpty() -> node
+            else -> ""
+        }
     }
 
     private fun requestTileRefresh() {
@@ -628,6 +838,9 @@ class ProxyVpnService : VpnService() {
     private fun applyVpnRoutes(builder: Builder, allowLanBroadcast: Boolean) {
         if (!allowLanBroadcast) {
             builder.addRoute("0.0.0.0", 0)
+            // Always capture IPv6 in tun0 so carrier 5G/Wi-Fi IPv6 never leaks around VPN;
+            // sing-box routes or rejects 2000::/3 cleanly based on user's IPv6 preference.
+            builder.addRoute("::", 0)
             return
         }
         // Exclude non-global / LAN / multicast / broadcast ranges so local discovery
@@ -662,7 +875,10 @@ class ProxyVpnService : VpnService() {
         // Always route TUN subnet (including DNS server 172.19.0.2) back into tun0.
         builder.addRoute("172.19.0.0", 30)
         routeCount += 1
-        Log.i(TAG, "Applied LAN+broadcast bypass routes ($routeCount IPv4 CIDR entries including 172.19.0.0/30 DNS)")
+        // Capture global unicast IPv6 (2000::/3) while keeping fe80::/10 link-local,
+        // fc00::/7 ULA, and ff00::/8 multicast on local LAN.
+        builder.addRoute("2000::", 3)
+        Log.i(TAG, "Applied LAN+broadcast bypass routes ($routeCount IPv4 CIDR + 2000::/3 IPv6 entries)")
     }
 
     private fun ipv4Range(ip: String, prefix: Int): Pair<Long, Long> {

@@ -19,7 +19,7 @@ import (
 
 // AppVersion and AppRepository identify the running PrismRay release for update checks.
 var (
-	AppVersion    = "1.0.0"
+	AppVersion    = "1.0.1"
 	AppRepository = "CRACKRAMMER/PrismRay"
 	githubAPIBase = "https://api.github.com"
 )

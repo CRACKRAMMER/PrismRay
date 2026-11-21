@@ -6,6 +6,7 @@ import {
   type ConnectionsSnapshot,
   type CoresStatus,
   type GroupConfig,
+  type HealthSettings,
   type ListenConfig,
   type LogEntry,
   type NodeConfig,
@@ -24,6 +25,7 @@ import {
   updateNativeTray,
 } from "../lib/api.ts";
 import { type Locale, getStoredLocale, setStoredLocale, t, type TranslationKey } from "../lib/i18n.ts";
+import { DEFAULT_HIGH_LATENCY_MS } from "../lib/helpers.ts";
 import {
   type ThemeMode,
   applyThemeMode,
@@ -180,6 +182,9 @@ export interface AppStoreValue {
   subscriptions: SubscriptionRecord[];
   tunState: TUNState | null;
   cores: CoresStatus | null;
+  healthSettings: HealthSettings | null;
+  highLatencyMs: number;
+  updateHighLatencyMs: (ms: number) => Promise<void>;
   systemProxyEnabled: boolean;
   lastImportDiagnostic: SubscriptionImportResult | null;
   setLastImportDiagnostic: (res: SubscriptionImportResult | null) => void;
@@ -192,6 +197,19 @@ export interface AppStoreValue {
   setAuthStatus: React.Dispatch<React.SetStateAction<AuthStatus | null>>;
 }
 
+export interface TrafficTelemetryValue {
+  trafficNow: TrafficSample;
+  trafficHistory: TrafficPoint[];
+}
+
+export interface ConnectionsTelemetryValue {
+  connections: ConnectionsSnapshot;
+}
+
+export interface LogsTelemetryValue {
+  logs: LogEntry[];
+}
+
 export interface AppTelemetryValue {
   connections: ConnectionsSnapshot;
   logs: LogEntry[];
@@ -200,7 +218,9 @@ export interface AppTelemetryValue {
 }
 
 const AppStoreContext = createContext<AppStoreValue | null>(null);
-const AppTelemetryContext = createContext<AppTelemetryValue | null>(null);
+const TrafficTelemetryContext = createContext<TrafficTelemetryValue | null>(null);
+const ConnectionsTelemetryContext = createContext<ConnectionsTelemetryValue | null>(null);
+const LogsTelemetryContext = createContext<LogsTelemetryValue | null>(null);
 
 function AppTelemetryProvider({ unlocked, children }: { unlocked: boolean; children?: React.ReactNode }) {
   const [connections, setConnections] = useState<ConnectionsSnapshot>({
@@ -262,14 +282,37 @@ function AppTelemetryProvider({ unlocked, children }: { unlocked: boolean; child
       }
     });
 
+    // Batch rapid log WebSocket bursts (150ms flush window) so log floods never stall UI frame budget.
+    let pendingLogs: LogEntry[] = [];
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    const flushLogs = () => {
+      flushTimer = null;
+      if (pendingLogs.length === 0) return;
+      const batch = pendingLogs;
+      pendingLogs = [];
+      setLogs((prev) => {
+        const seen = new Set(prev.map((item) => item.seq));
+        let changed = false;
+        const merged = [...prev];
+        for (const entry of batch) {
+          if (!seen.has(entry.seq)) {
+            seen.add(entry.seq);
+            merged.push(entry);
+            changed = true;
+          }
+        }
+        if (!changed) return prev;
+        return merged.length > 500 ? merged.slice(merged.length - 500) : merged;
+      });
+    };
+
     const unsubLogs = subscribeStream("logs", (evt) => {
       try {
         const entry = JSON.parse(evt.data) as LogEntry;
-        setLogs((prev) => {
-          if (prev.some((item) => item.seq === entry.seq)) return prev;
-          const next = [...prev, entry];
-          return next.length > 500 ? next.slice(next.length - 500) : next;
-        });
+        pendingLogs.push(entry);
+        if (flushTimer === null) {
+          flushTimer = setTimeout(flushLogs, 150);
+        }
       } catch {
         // Ignore malformed log line.
       }
@@ -277,23 +320,39 @@ function AppTelemetryProvider({ unlocked, children }: { unlocked: boolean; child
 
     return () => {
       initializedStreams.current = false;
+      if (flushTimer !== null) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      pendingLogs = [];
       unsubTraffic();
       unsubConnections();
       unsubLogs();
     };
   }, [unlocked]);
 
-  const telemetryValue = useMemo<AppTelemetryValue>(
-    () => ({
-      connections,
-      logs,
-      trafficNow,
-      trafficHistory,
-    }),
-    [connections, logs, trafficNow, trafficHistory],
+  const trafficValue = useMemo<TrafficTelemetryValue>(
+    () => ({ trafficNow, trafficHistory }),
+    [trafficNow, trafficHistory],
+  );
+  const connectionsValue = useMemo<ConnectionsTelemetryValue>(
+    () => ({ connections }),
+    [connections],
+  );
+  const logsValue = useMemo<LogsTelemetryValue>(
+    () => ({ logs }),
+    [logs],
   );
 
-  return React.createElement(AppTelemetryContext.Provider, { value: telemetryValue }, children);
+  return React.createElement(
+    TrafficTelemetryContext.Provider,
+    { value: trafficValue },
+    React.createElement(
+      ConnectionsTelemetryContext.Provider,
+      { value: connectionsValue },
+      React.createElement(LogsTelemetryContext.Provider, { value: logsValue }, children),
+    ),
+  );
 }
 
 export function AppStoreProvider({ children }: { children: React.ReactNode }) {
@@ -384,6 +443,7 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
   const [subscriptions, setSubscriptions] = useState<SubscriptionRecord[]>([]);
   const [tunState, setTunState] = useState<TUNState | null>(null);
   const [cores, setCores] = useState<CoresStatus | null>(null);
+  const [healthSettings, setHealthSettings] = useState<HealthSettings | null>(null);
   const [systemProxyEnabled, setSystemProxyEnabled] = useState(false);
   const [lastImportDiagnostic, setLastImportDiagnostic] = useState<SubscriptionImportResult | null>(null);
   const [busy, setBusy] = useState(false);
@@ -506,9 +566,10 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
       api.getCores(),
       api.getSystemProxy(),
       api.getNodeTabs(),
+      api.getHealthSettings(),
     ]);
 
-    const [stRes, ndRes, grRes, lsRes, rtRes, rsRes, sbRes, tunRes, coreRes, spRes, tabsRes] = results;
+    const [stRes, ndRes, grRes, lsRes, rtRes, rsRes, sbRes, tunRes, coreRes, spRes, tabsRes, hsRes] = results;
     if (stRes.status === "fulfilled") {
       setStatus(stRes.value);
       if (typeof stRes.value.system_proxy_enabled === "boolean") {
@@ -533,7 +594,35 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
     if (tabsRes.status === "fulfilled") {
       setCustomNodeTabs(Array.isArray(tabsRes.value?.tabs) ? tabsRes.value.tabs : []);
     }
+    if (hsRes.status === "fulfilled") {
+      setHealthSettings(hsRes.value);
+    }
   }, []);
+
+  const highLatencyMs =
+    healthSettings?.high_latency_ms && healthSettings.high_latency_ms > 0
+      ? healthSettings.high_latency_ms
+      : DEFAULT_HIGH_LATENCY_MS;
+
+  const updateHighLatencyMs = useCallback(
+    async (ms: number) => {
+      const clamped = Math.min(10000, Math.max(100, Math.round(ms)));
+      const base: HealthSettings = healthSettings || {
+        url: "https://www.gstatic.com/generate_204",
+        speed_down_url: "https://speed.cloudflare.com/__down?bytes=10000000",
+        speed_up_url: "https://speed.cloudflare.com/__up",
+        interval_seconds: 120,
+        tolerance_ms: 50,
+        high_latency_ms: DEFAULT_HIGH_LATENCY_MS,
+        priority_rule: "latency_first",
+        failover: true,
+        recover: true,
+      };
+      const saved = await api.saveHealthSettings({ ...base, high_latency_ms: clamped });
+      setHealthSettings(saved);
+    },
+    [healthSettings],
+  );
 
   const saveCustomNodeTabs = useCallback(
     async (tabs: string[]) => {
@@ -888,6 +977,9 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
       subscriptions,
       tunState,
       cores,
+      healthSettings,
+      highLatencyMs,
+      updateHighLatencyMs,
       systemProxyEnabled,
       lastImportDiagnostic,
       setLastImportDiagnostic,
@@ -936,6 +1028,9 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
       subscriptions,
       tunState,
       cores,
+      healthSettings,
+      highLatencyMs,
+      updateHighLatencyMs,
       systemProxyEnabled,
       lastImportDiagnostic,
       busy,
@@ -961,10 +1056,36 @@ export function useAppStore(): AppStoreValue {
   return ctx;
 }
 
-export function useTelemetry(): AppTelemetryValue {
-  const ctx = useContext(AppTelemetryContext);
+export function useTrafficTelemetry(): TrafficTelemetryValue {
+  const ctx = useContext(TrafficTelemetryContext);
   if (!ctx) {
-    throw new Error("useTelemetry must be used inside AppStoreProvider");
+    throw new Error("useTrafficTelemetry must be used inside AppStoreProvider");
   }
   return ctx;
+}
+
+export function useConnectionsTelemetry(): ConnectionsTelemetryValue {
+  const ctx = useContext(ConnectionsTelemetryContext);
+  if (!ctx) {
+    throw new Error("useConnectionsTelemetry must be used inside AppStoreProvider");
+  }
+  return ctx;
+}
+
+export function useLogsTelemetry(): LogsTelemetryValue {
+  const ctx = useContext(LogsTelemetryContext);
+  if (!ctx) {
+    throw new Error("useLogsTelemetry must be used inside AppStoreProvider");
+  }
+  return ctx;
+}
+
+export function useTelemetry(): AppTelemetryValue {
+  const { trafficNow, trafficHistory } = useTrafficTelemetry();
+  const { connections } = useConnectionsTelemetry();
+  const { logs } = useLogsTelemetry();
+  return useMemo(
+    () => ({ trafficNow, trafficHistory, connections, logs }),
+    [trafficNow, trafficHistory, connections, logs],
+  );
 }

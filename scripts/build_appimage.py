@@ -12,11 +12,70 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.request
 
 LINUX_TARGETS: dict[str, tuple[str, str]] = {
     "x86_64-unknown-linux-gnu": ("amd64", "linux-x64"),
     "aarch64-unknown-linux-gnu": ("arm64", "linux-arm64"),
 }
+
+APPIMAGE_RUNTIME_ARCH: dict[str, str] = {
+    "x86_64-unknown-linux-gnu": "x86_64",
+    "aarch64-unknown-linux-gnu": "aarch64",
+}
+
+APPIMAGE_RUNTIME_URL = (
+    "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-{arch}"
+)
+
+
+def ensure_appimage_runtime(rust_target: str, *, cache_dir: Path | None = None) -> Path | None:
+    """Cache AppImage type2-runtime locally so appimagetool never fails on transient GitHub hiccups."""
+    existing = os.environ.get("LDAI_RUNTIME_FILE", "").strip()
+    if existing:
+        existing_path = Path(existing)
+        if existing_path.is_file() and existing_path.stat().st_size > 100_000:
+            return existing_path
+
+    arch = APPIMAGE_RUNTIME_ARCH.get(rust_target)
+    if not arch:
+        return None
+
+    if cache_dir is None:
+        xdg_cache = os.environ.get("XDG_CACHE_HOME", "").strip()
+        cache_dir = (Path(xdg_cache) if xdg_cache else (Path.home() / ".cache")) / "tauri"
+
+    dest = cache_dir / f"runtime-{arch}"
+    if dest.is_file() and dest.stat().st_size > 100_000:
+        try:
+            if dest.read_bytes()[:4] == b"\x7fELF":
+                return dest
+        except OSError:
+            pass
+
+    url = APPIMAGE_RUNTIME_URL.format(arch=arch)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            print(f"==> Caching AppImage runtime ({arch}, attempt {attempt}/3)...", flush=True)
+            req = urllib.request.Request(url, headers={"User-Agent": "PrismRay-AppImage-Builder/1.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+            if len(data) <= 100_000 or data[:4] != b"\x7fELF":
+                raise RuntimeError(f"Invalid AppImage runtime payload ({len(data)} bytes)")
+            tmp = dest.with_name(f".{dest.name}.tmp.{os.getpid()}")
+            tmp.write_bytes(data)
+            tmp.chmod(0o755)
+            os.replace(tmp, dest)
+            return dest
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            if attempt < 3:
+                time.sleep(attempt * 2)
+    print(f"Warning: failed to pre-cache AppImage runtime from {url}: {last_err}", file=sys.stderr)
+    return None
 
 
 def detect_linux_target(target_override: str | None = None) -> str:
@@ -163,6 +222,9 @@ def build_appimage(
     tauri_env = os.environ.copy()
     tauri_env["APPIMAGE_EXTRACT_AND_RUN"] = os.environ.get("APPIMAGE_EXTRACT_AND_RUN", "1")
     tauri_env["NO_STRIP"] = os.environ.get("NO_STRIP", "true")
+    runtime_file = ensure_appimage_runtime(resolved_target)
+    if runtime_file is not None:
+        tauri_env["LDAI_RUNTIME_FILE"] = str(runtime_file)
 
     print(f"==> Bundling Tauri AppImage ({resolved_target})...")
     subprocess.run(tauri_cmd, cwd=frontend_dir, env=tauri_env, check=True)

@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/CRACKRAMMER/PrismRay/backend/internal/androidvpn"
 	authservice "github.com/CRACKRAMMER/PrismRay/backend/internal/auth"
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/config"
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/orchestrator"
@@ -78,6 +79,7 @@ func (s *Server) ensureOrchestrator() *orchestrator.Orchestrator {
 		SingBoxBinary: sbBin,
 		XrayBinary:    xrayBin,
 	})
+	s.orch.SetOutboundFailureHandler(s.handleOutboundFailureEvent)
 	return s.orch
 }
 
@@ -141,6 +143,16 @@ func (s *Server) routingProfile() (ruleset.RoutingProfile, error) {
 		return ruleset.DefaultRoutingProfile(), err
 	}
 	profile.Normalize()
+	// One-time migration: replace legacy untouched default https://dns.google/dns-query with
+	// literal-IP https://1.1.1.1/dns-query so Chrome proxy pre-resolution never stalls on blocked dns.google.
+	var migrated bool
+	if foundFlag, flagErr := s.store.GetSetting("migrations.remote_dns_cf_v1", &migrated); flagErr == nil && (!foundFlag || !migrated) {
+		if strings.EqualFold(strings.TrimSpace(profile.RemoteDNS), "https://dns.google/dns-query") {
+			profile.RemoteDNS = "https://1.1.1.1/dns-query"
+			_ = s.saveRoutingProfile(profile)
+		}
+		_ = s.store.PutSetting("migrations.remote_dns_cf_v1", true)
+	}
 	return profile, nil
 }
 
@@ -316,6 +328,30 @@ func (s *Server) effectiveProtectPath() string {
 	return p
 }
 
+func (s *Server) effectiveOwnerPath() string {
+	p := strings.TrimSpace(s.ownerPath)
+	if p == "" {
+		return ""
+	}
+	if _, err := os.Stat(p); err != nil {
+		return ""
+	}
+	return p
+}
+
+func (s *Server) syncAndroidAppRouting(st orchestrator.Status) {
+	if !st.AndroidMode {
+		return
+	}
+	s.ensureAndroidTun().ConfigureAppRouting(androidvpn.AppRoutingConfig{
+		MixedPort:       st.MixedPort,
+		AppSocksPort:    st.AppSocksPort,
+		AppSocksSecret:  st.AppSocksSecret,
+		OwnerSockPath:   s.effectiveOwnerPath(),
+		WatchedPackages: st.AppPackages,
+	})
+}
+
 func (s *Server) androidRuntimeSettings() (bool, string) {
 	p := s.effectiveProtectPath()
 	if s.mode == authservice.ModeAndroid {
@@ -438,12 +474,18 @@ func (s *Server) reconcileRuntime(ctx context.Context, activeNodeID, activeGroup
 	}
 	s.persistRuntimeSelection(activeNodeID, activeGroupID, enableTUN)
 	s.persistWantRunning(true)
+	if androidMode {
+		s.syncAndroidAppRouting(st)
+	}
 	if st.ActiveTag != "" && st.ActiveTag != sbcfg.BlockOutboundTag {
 		s.setKillSwitchBaseline(st.ActiveTag)
 	} else if routing.KillSwitchEnabled() && routing.Mode != "direct" && st.ActiveTag == sbcfg.BlockOutboundTag {
 		s.setKillSwitchTripped("", "无可用代理节点，Kill Switch 已阻断代理流量防止直连泄漏")
 	} else {
 		s.clearKillSwitch()
+	}
+	if st.Running {
+		s.maybeAutoSyncRuleSetsAsync()
 	}
 	return st, nil
 }

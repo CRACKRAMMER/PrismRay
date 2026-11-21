@@ -7,6 +7,7 @@ import { type NodeConfig, api, formatApiError } from "../lib/api.ts";
 import { ALL_PROTOCOLS } from "../lib/helpers.ts";
 import { useAppStore } from "../store/appStore.ts";
 import { HelpTip } from "./HelpTip.tsx";
+import { NodeTabMultiSelect, type LockedSourceTab, type TagCheckState } from "./NodeTabMultiSelect.tsx";
 import { Button } from "./ui/button.tsx";
 import { Input } from "./ui/input.tsx";
 import { Select } from "./ui/select.tsx";
@@ -96,8 +97,7 @@ function defaultSecurityForProtocol(proto: string): string {
 }
 
 export function NodeEditorForm({ initialNode, onClose, onSaved, embedded = false }: NodeEditorFormProps) {
-  const { locale, tr, notify, nodes, groups, customNodeTabs, saveCustomNodeTabs } = useAppStore();
-  const [newTagInput, setNewTagInput] = useState("");
+  const { locale, tr, notify, nodes, groups, subscriptions, customNodeTabs, saveCustomNodeTabs } = useAppStore();
 
   const [form, setForm] = useState<Omit<NodeConfig, "id">>({ ...EMPTY_NODE });
   const [alpnText, setAlpnText] = useState("");
@@ -206,27 +206,51 @@ export function NodeEditorForm({ initialNode, onClose, onSaved, embedded = false
   });
   const eligibleDetourNodes = nodes.filter((n) => n.id !== initialNode?.id);
 
+  const lockedSubSources: LockedSourceTab[] = (() => {
+    const sid = (form.sub_id || "").trim();
+    if (!sid) return [];
+    const sub = subscriptions.find((s) => s.id === sid);
+    return [{ id: sid, label: sub?.name || sid }];
+  })();
+
   const availableTagChoices = Array.from(
-    new Set([...(customNodeTabs || []), ...(form.tags || [])].map((t) => t.trim()).filter(Boolean)),
+    new Set(
+      [...(customNodeTabs || []), ...(form.tags || []), (form.group || "").trim()]
+        .map((t) => t.trim())
+        .filter(Boolean),
+    ),
   );
 
-  const toggleNodeTag = (tag: string) => {
-    const cur = new Set(form.tags || []);
-    if (cur.has(tag)) cur.delete(tag);
-    else cur.add(tag);
-    setField("tags", Array.from(cur));
+  const nodeTagStates: Record<string, TagCheckState> = {};
+  for (const tag of availableTagChoices) {
+    const active = (form.tags || []).some((t) => t.trim() === tag) || (form.group || "").trim() === tag;
+    nodeTagStates[tag] = active ? "all" : "none";
+  }
+
+  const handleToggleNodeTag = (tag: string, nextChecked: boolean) => {
+    const clean = tag.trim();
+    if (!clean) return;
+    setForm((prev) => {
+      if (nextChecked) {
+        const nextTags = Array.from(new Set([...(prev.tags || []), clean]));
+        return { ...prev, tags: nextTags };
+      }
+      const nextTags = (prev.tags || []).filter((t) => t.trim() !== clean);
+      const nextGroup = (prev.group || "").trim() === clean ? "" : prev.group;
+      return { ...prev, group: nextGroup, tags: nextTags };
+    });
   };
 
-  const handleAddInlineTag = async () => {
-    const clean = newTagInput.trim();
+  const handleAddInlineTag = async (rawName: string) => {
+    const clean = rawName.trim();
     if (!clean) return;
     if (!customNodeTabs.includes(clean)) {
       await saveCustomNodeTabs([...customNodeTabs, clean]).catch(() => {});
     }
-    const cur = new Set(form.tags || []);
-    cur.add(clean);
-    setField("tags", Array.from(cur));
-    setNewTagInput("");
+    setForm((prev) => ({
+      ...prev,
+      tags: Array.from(new Set([...(prev.tags || []), clean])),
+    }));
   };
 
   return (
@@ -255,46 +279,17 @@ export function NodeEditorForm({ initialNode, onClose, onSaved, embedded = false
               />
             </div>
 
-            <div className="space-y-2 sm:col-span-2">
+            <div className="space-y-1.5 sm:col-span-2">
               <label className={labelClass}>{tr("proxies.nodeTags")}</label>
-              <div className="flex flex-wrap items-center gap-1.5">
-                {availableTagChoices.map((tag) => {
-                  const selected = (form.tags || []).includes(tag);
-                  return (
-                    <button
-                      key={tag}
-                      type="button"
-                      aria-pressed={selected}
-                      onClick={() => toggleNodeTag(tag)}
-                      className={[
-                        "rounded-full border px-2.5 py-1 text-xs font-medium transition-colors",
-                        selected
-                          ? "border-primary bg-primary/15 text-primary"
-                          : "bg-background text-muted-foreground hover:text-foreground",
-                      ].join(" ")}
-                    >
-                      {tag}
-                    </button>
-                  );
-                })}
-                <div className="flex items-center gap-1.5">
-                  <Input
-                    className="h-8 w-36 text-xs"
-                    placeholder={tr("proxies.newTabPlaceholder")}
-                    value={newTagInput}
-                    onChange={(e) => setNewTagInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        void handleAddInlineTag();
-                      }
-                    }}
-                  />
-                  <Button type="button" size="sm" variant="outline" onClick={() => void handleAddInlineTag()}>
-                    {tr("action.add")}
-                  </Button>
-                </div>
-              </div>
+              <NodeTabMultiSelect
+                mode="assign"
+                lockedSources={lockedSubSources}
+                customTags={availableTagChoices}
+                tagStates={nodeTagStates}
+                onToggleTag={handleToggleNodeTag}
+                onCreateAndAssignTag={handleAddInlineTag}
+                placeholder={tr("proxies.nodeTags")}
+              />
             </div>
 
             <div className="space-y-1">

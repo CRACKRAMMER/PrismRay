@@ -27,29 +27,38 @@ const (
 	LinuxAutoRedirectOutputMark uint32 = 0x21782
 	// BlockOutboundTag identifies the fail-closed block outbound used by Kill Switch.
 	BlockOutboundTag = "block-out"
+	// MaxLoadBalanceShards caps simultaneous load-balance exit shards to curb battery/CPU overhead.
+	MaxLoadBalanceShards = 4
+	// AndroidAppInboundTag identifies the authenticated loopback SOCKS5 inbound used for Android per-app rules.
+	AndroidAppInboundTag = "android-app-in"
+	// AndroidAppOtherUser is the fallback SOCKS5 username for Android apps not matching any watched package rule.
+	AndroidAppOtherUser = "__other__"
 )
 
 // CompileInput holds the complete state required to compile a sing-box 1.14+ configuration.
 type CompileInput struct {
-	Nodes            []*config.Node
-	Groups           []storage.Group
-	Listeners        []*config.ListenConfig
-	Routing          ruleset.RoutingProfile
-	RuleSets         []ruleset.RuleSetSpec
-	ActiveNodeID     string
-	ActiveGroupID    string
-	MixedPort        int
-	ClashAPIPort     int
-	ClashAPISecret   string
-	EnableTUN        bool
-	TUNStack         string // mixed | system | gvisor
-	AndroidMode      bool
-	ProtectPath      string
-	DefaultMark      uint32
-	XrayBridgePorts  map[string]int // node.ID -> loopback SOCKS5 port on 127.0.0.1
-	IncludeNaive     bool
-	ForceRemoteRules bool
-	CacheFilePath    string
+	Nodes                 []*config.Node
+	Groups                []storage.Group
+	Listeners             []*config.ListenConfig
+	Routing               ruleset.RoutingProfile
+	RuleSets              []ruleset.RuleSetSpec
+	ActiveNodeID          string
+	ActiveGroupID         string
+	MixedPort             int
+	ClashAPIPort          int
+	ClashAPISecret        string
+	EnableTUN             bool
+	TUNStack              string // mixed | system | gvisor
+	AndroidMode           bool
+	ProtectPath           string
+	AndroidAppSocksPort   int
+	AndroidAppSocksSecret string
+	AndroidAppPackages    []string
+	DefaultMark           uint32
+	XrayBridgePorts       map[string]int // node.ID -> loopback SOCKS5 port on 127.0.0.1
+	IncludeNaive          bool
+	ForceRemoteRules      bool
+	CacheFilePath         string
 }
 
 // CompileOutput holds the generated JSON bytes alongside structural diagnostics.
@@ -87,6 +96,9 @@ func NodeTag(id string) string { return "node-" + id }
 
 // GroupTag returns the deterministic sing-box selector/urltest tag for a group ID.
 func GroupTag(id string) string { return "group-" + id }
+
+// GroupAutoTag returns the internal urltest/failover auto-selection outbound tag wrapped by GroupTag.
+func GroupAutoTag(id string) string { return "group-" + id + "-auto" }
 
 // GroupScopedNodeTag returns the scoped sing-box outbound tag used when a member node
 // is dialed through a policy group that configures its own detour relay.
@@ -457,7 +469,7 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 			}
 			return ob
 		case "loadbalance":
-			interval, idleTimeout, tol := normalizeGroupTiming(g.Interval, "3m", g.ToleranceMS, 150)
+			interval, idleTimeout, tol := normalizeGroupTiming(g.Interval, "10m", g.ToleranceMS, 150)
 			ob := map[string]any{
 				"type":      "urltest",
 				"tag":       tag,
@@ -486,6 +498,7 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 
 	groupTagMap := map[string]bool{}
 	groupObByID := map[string]map[string]any{}
+	groupAutoObByID := map[string]map[string]any{}
 	lbShards := map[string][]string{}
 	for _, g := range in.Groups {
 		members := make([]string, 0, len(g.NodeIDs))
@@ -503,13 +516,51 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 		if g.SelectedNodeID != "" && out.IncludedTags[NodeTag(g.SelectedNodeID)] {
 			defTag = NodeTag(g.SelectedNodeID)
 		}
+		strat := storage.CanonicalGroupStrategy(g.Strategy)
+		if strat == "urltest" || strat == "failover" {
+			// Two-layer hybrid outbound:
+			// 1. Internal urltest/failover auto-selector ("group-<id>-auto")
+			// 2. Public selector wrapper ("group-<id>") so manual pinning via Clash API works
+			//    without restarting TUN and can auto-revert cleanly back to "group-<id>-auto".
+			autoTag := GroupAutoTag(g.ID)
+			autoOb := buildGroupOutbound(g, autoTag, members, "")
+			outbounds = append(outbounds, autoOb)
+			groupAutoObByID[g.ID] = autoOb
+			out.IncludedTags[autoTag] = true
+
+			selMembers := make([]string, 0, len(members)+1)
+			selMembers = append(selMembers, autoTag)
+			selMembers = append(selMembers, members...)
+			selDef := autoTag
+			if g.ManualPin && defTag != "" {
+				for _, m := range members {
+					if m == defTag {
+						selDef = defTag
+						break
+					}
+				}
+			}
+			selOb := map[string]any{
+				"type":                        "selector",
+				"tag":                         gtag,
+				"outbounds":                   selMembers,
+				"default":                     selDef,
+				"interrupt_exist_connections": true,
+			}
+			outbounds = append(outbounds, selOb)
+			groupObByID[g.ID] = selOb
+			out.IncludedTags[gtag] = true
+			groupTagMap[gtag] = true
+			continue
+		}
+
 		gob := buildGroupOutbound(g, gtag, members, defTag)
 		outbounds = append(outbounds, gob)
 		groupObByID[g.ID] = gob
 		out.IncludedTags[gtag] = true
 		groupTagMap[gtag] = true
 
-		if storage.CanonicalGroupStrategy(g.Strategy) == "loadbalance" {
+		if strat == "loadbalance" {
 			var healthy []string
 			for _, id := range g.NodeIDs {
 				tag := NodeTag(id)
@@ -523,8 +574,8 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 			if len(healthy) == 0 {
 				healthy = append(healthy, members...)
 			}
-			if len(healthy) > 8 {
-				healthy = healthy[:8]
+			if len(healthy) > MaxLoadBalanceShards {
+				healthy = healthy[:MaxLoadBalanceShards]
 			}
 			if len(healthy) > 1 {
 				lbShards[gtag] = healthy
@@ -693,10 +744,28 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 		if len(scopedMembers) == 0 {
 			continue
 		}
-		gob["outbounds"] = scopedMembers
-		if g.SelectedNodeID != "" {
-			if defScoped := scopedByMemberID[g.SelectedNodeID]; defScoped != "" {
-				gob["default"] = defScoped
+		if autoOb := groupAutoObByID[g.ID]; autoOb != nil {
+			autoTag := GroupAutoTag(g.ID)
+			autoOb["outbounds"] = scopedMembers
+			selMembers := make([]string, 0, len(scopedMembers)+1)
+			selMembers = append(selMembers, autoTag)
+			selMembers = append(selMembers, scopedMembers...)
+			gob["outbounds"] = selMembers
+			if g.ManualPin && g.SelectedNodeID != "" {
+				if defScoped := scopedByMemberID[g.SelectedNodeID]; defScoped != "" {
+					gob["default"] = defScoped
+				} else {
+					gob["default"] = autoTag
+				}
+			} else {
+				gob["default"] = autoTag
+			}
+		} else {
+			gob["outbounds"] = scopedMembers
+			if g.SelectedNodeID != "" {
+				if defScoped := scopedByMemberID[g.SelectedNodeID]; defScoped != "" {
+					gob["default"] = defScoped
+				}
 			}
 		}
 		gtag := GroupTag(g.ID)
@@ -712,8 +781,8 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 			if len(remapped) == 0 {
 				remapped = append(remapped, scopedMembers...)
 			}
-			if len(remapped) > 8 {
-				remapped = remapped[:8]
+			if len(remapped) > MaxLoadBalanceShards {
+				remapped = remapped[:MaxLoadBalanceShards]
 			}
 			if len(remapped) > 1 {
 				lbShards[gtag] = remapped
@@ -914,32 +983,14 @@ func buildInbounds(in CompileInput) []map[string]any {
 		tunAddresses := []string{"172.19.0.1/30"}
 		tunExclude := []string{"127.0.0.0/8"}
 		if in.Routing.BypassLAN && in.Routing.AllowLANBroadcast {
-			// Exclude private LAN, link-local, multicast (mDNS/SSDP/DLNA), and broadcast
-			// (255.255.255.255 for KDE Connect) from OS-level TUN routes while keeping
-			// 172.19.0.0/30 inside TUN so virtual TUN DNS (172.19.0.2) stays intercepted.
+			// On Desktop TUN, exclude only non-DNS link-local, multicast (mDNS/SSDP/DLNA), and
+			// broadcast (255.255.255.255 for KDE Connect) ranges at the OS/nftables route layer.
+			// Do NOT exclude private unicast ranges (10.0.0.0/8, 100.64.0.0/10, 172.16.0.0/12,
+			// 192.168.0.0/16): Desktop hosts commonly send OS DNS queries to router/Tailscale
+			// resolvers (192.168.x.1, 10.x.x.1, 100.100.100.100:53), which must enter TUN for
+			// hijack-dns; non-DNS LAN unicast still routes directly via ip_is_private -> direct.
 			tunExclude = append(tunExclude,
-				"10.0.0.0/8",
-				"100.64.0.0/10",
 				"169.254.0.0/16",
-				"172.16.0.0/15",
-				"172.18.0.0/16",
-				"172.19.0.4/30",
-				"172.19.0.8/29",
-				"172.19.0.16/28",
-				"172.19.0.32/27",
-				"172.19.0.64/26",
-				"172.19.0.128/25",
-				"172.19.1.0/24",
-				"172.19.2.0/23",
-				"172.19.4.0/22",
-				"172.19.8.0/21",
-				"172.19.16.0/20",
-				"172.19.32.0/19",
-				"172.19.64.0/18",
-				"172.19.128.0/17",
-				"172.20.0.0/14",
-				"172.24.0.0/13",
-				"192.168.0.0/16",
 				"224.0.0.0/4",
 				"240.0.0.0/4",
 			)
@@ -1016,6 +1067,28 @@ func buildInbounds(in CompileInput) []map[string]any {
 			"listen_port": in.MixedPort,
 		})
 	}
+
+	if in.AndroidMode && in.AndroidAppSocksPort > 0 && strings.TrimSpace(in.AndroidAppSocksSecret) != "" && len(in.AndroidAppPackages) > 0 {
+		seen := map[string]bool{AndroidAppOtherUser: true}
+		users := []map[string]string{
+			{"username": AndroidAppOtherUser, "password": in.AndroidAppSocksSecret},
+		}
+		for _, rawPkg := range in.AndroidAppPackages {
+			pkg := strings.TrimSpace(rawPkg)
+			if pkg == "" || seen[pkg] {
+				continue
+			}
+			seen[pkg] = true
+			users = append(users, map[string]string{"username": pkg, "password": in.AndroidAppSocksSecret})
+		}
+		inbounds = append(inbounds, map[string]any{
+			"type":        "socks",
+			"tag":         AndroidAppInboundTag,
+			"listen":      "127.0.0.1",
+			"listen_port": in.AndroidAppSocksPort,
+			"users":       users,
+		})
+	}
 	return inbounds
 }
 
@@ -1026,7 +1099,7 @@ func buildRuleSets(specs []ruleset.RuleSetSpec, forceRemote bool) []map[string]a
 			continue
 		}
 		if s.LocalPath != "" {
-			if st, err := os.Stat(s.LocalPath); err == nil && st.Size() > 0 {
+			if st, err := os.Stat(s.LocalPath); err == nil && !st.IsDir() && st.Size() > 0 {
 				out = append(out, map[string]any{
 					"tag":    s.Tag,
 					"type":   "local",
@@ -1046,42 +1119,27 @@ func buildRuleSets(specs []ruleset.RuleSetSpec, forceRemote bool) []map[string]a
 			})
 			continue
 		}
-		// Offline inline fallback ensures sing-box starts reliably before .srs sync completes.
-		if fallback := inlineFallbackRules(s.Tag); len(fallback) > 0 {
-			out = append(out, map[string]any{
-				"tag":   s.Tag,
-				"type":  "inline",
-				"rules": fallback,
-			})
-		}
+		// Do not synthesize misleading tiny inline rule sets when real .srs files are not loaded yet;
+		// BlockAds and BypassCN stay inactive until real local .srs rule sets are synced.
 	}
 	return out
 }
 
-func inlineFallbackRules(tag string) []map[string]any {
-	switch tag {
-	case ruleset.TagGeoSiteCN:
-		return []map[string]any{
-			{"domain_suffix": []string{".cn", "baidu.com", "qq.com", "taobao.com", "jd.com", "bilibili.com"}},
-		}
-	case ruleset.TagGeoIPCN:
-		return []map[string]any{
-			{"ip_cidr": []string{"223.5.5.0/24", "114.114.114.0/24"}},
-		}
-	case ruleset.TagGeoSiteNotCN:
-		return []map[string]any{
-			{"domain_suffix": []string{"google.com", "github.com", "youtube.com", "openai.com", "cloudflare.com"}},
-		}
-	case ruleset.TagGeoSiteAds:
-		return []map[string]any{
-			{"domain_suffix": []string{"doubleclick.net", "googlesyndication.com", "googleadservices.com"}},
-		}
-	default:
-		return nil
-	}
+var dohBootstrapHosts = map[string][]string{
+	"dns.google":         {"8.8.8.8", "8.8.4.4"},
+	"cloudflare-dns.com": {"1.1.1.1", "1.0.0.1"},
+	"one.one.one.one":    {"1.1.1.1", "1.0.0.1"},
+	"dns.quad9.net":      {"9.9.9.9", "149.112.112.112"},
+	"dns.alidns.com":     {"223.5.5.5", "223.6.6.6"},
+	"doh.pub":            {"1.12.12.12", "120.53.53.53"},
 }
 
-func parseDNSServer(tag, addr string, directServer bool, protectPath string) map[string]any {
+func isLiteralIPHost(host string) bool {
+	_, err := netip.ParseAddr(strings.Trim(strings.TrimSpace(host), "[]"))
+	return err == nil
+}
+
+func parseDNSServer(tag, addr string, directServer bool, protectPath string) (map[string]any, string) {
 	addr = strings.TrimSpace(addr)
 	if strings.HasPrefix(addr, "https://") {
 		if u, err := url.Parse(addr); err == nil && u.Hostname() != "" {
@@ -1093,36 +1151,53 @@ func parseDNSServer(tag, addr string, directServer bool, protectPath string) map
 			if path == "" {
 				path = "/dns-query"
 			}
+			host := strings.ToLower(u.Hostname())
 			srv := map[string]any{
 				"tag":         tag,
 				"type":        "https",
-				"server":      u.Hostname(),
+				"server":      host,
 				"server_port": port,
 				"path":        path,
 			}
+			bootstrapHost := ""
 			if !directServer {
 				srv["detour"] = "proxy"
-				srv["domain_resolver"] = "local-dns"
+				if !isLiteralIPHost(host) {
+					if _, ok := dohBootstrapHosts[host]; ok {
+						srv["domain_resolver"] = "doh-bootstrap-dns"
+						bootstrapHost = host
+					} else {
+						srv["domain_resolver"] = "local-dns"
+					}
+				}
 			} else if protectPath != "" {
 				srv["protect_path"] = protectPath
 			}
-			return srv
+			return srv, bootstrapHost
 		}
 	}
 	if strings.HasPrefix(addr, "tls://") {
-		host := strings.TrimPrefix(addr, "tls://")
+		host := strings.ToLower(strings.TrimPrefix(addr, "tls://"))
 		srv := map[string]any{
 			"tag":    tag,
 			"type":   "tls",
 			"server": host,
 		}
+		bootstrapHost := ""
 		if !directServer {
 			srv["detour"] = "proxy"
-			srv["domain_resolver"] = "local-dns"
+			if !isLiteralIPHost(host) {
+				if _, ok := dohBootstrapHosts[host]; ok {
+					srv["domain_resolver"] = "doh-bootstrap-dns"
+					bootstrapHost = host
+				} else {
+					srv["domain_resolver"] = "local-dns"
+				}
+			}
 		} else if protectPath != "" {
 			srv["protect_path"] = protectPath
 		}
-		return srv
+		return srv, bootstrapHost
 	}
 	host := addr
 	if strings.HasPrefix(host, "udp://") {
@@ -1141,7 +1216,7 @@ func parseDNSServer(tag, addr string, directServer bool, protectPath string) map
 	} else if protectPath != "" {
 		srv["protect_path"] = protectPath
 	}
-	return srv
+	return srv, ""
 }
 
 func collectFakeIPBypass(routing ruleset.RoutingProfile, nodes []*config.Node) (exactDomains, domainSuffixes []string) {
@@ -1207,13 +1282,22 @@ func collectFakeIPBypass(routing ruleset.RoutingProfile, nodes []*config.Node) (
 }
 
 func buildDNS(routing ruleset.RoutingProfile, nodes []*config.Node, ruleSetTags map[string]bool, protectPath string) map[string]any {
-	localSrv := parseDNSServer("local-dns", routing.LocalDNS, true, protectPath)
+	localSrv, _ := parseDNSServer("local-dns", routing.LocalDNS, true, protectPath)
 	servers := []map[string]any{localSrv}
 	finalDNS := "local-dns"
 
 	var rules []map[string]any
 	if routing.Mode != "direct" {
-		remoteSrv := parseDNSServer("remote-dns", routing.RemoteDNS, false, "")
+		remoteSrv, bootstrapHost := parseDNSServer("remote-dns", routing.RemoteDNS, false, "")
+		if bootstrapHost != "" {
+			if ips, ok := dohBootstrapHosts[bootstrapHost]; ok {
+				servers = append(servers, map[string]any{
+					"tag":        "doh-bootstrap-dns",
+					"type":       "hosts",
+					"predefined": map[string][]string{bootstrapHost: ips},
+				})
+			}
+		}
 		servers = append(servers, remoteSrv)
 		finalDNS = "remote-dns"
 		rules = append(rules, map[string]any{"clash_mode": "Direct", "server": "local-dns"})
@@ -1323,13 +1407,44 @@ func makeIPv4ResolveRule(match map[string]any) map[string]any {
 
 const domainHashAlphabet = "scmpatbdflghrnoeuivkwyjqzx0123456789"
 
+// loadBalanceAffinityDomains pins multi-domain ecosystems (Google Play / Auth & IP-check suites)
+// to shard 0 under load-balance groups so linked requests never split across different exit IPs.
+var loadBalanceAffinityDomains = []string{
+	"google.com",
+	"googleapis.com",
+	"gstatic.com",
+	"googleusercontent.com",
+	"ggpht.com",
+	"gvt1.com",
+	"gvt2.com",
+	"youtube.com",
+	"googlevideo.com",
+	"ytimg.com",
+	"ippure.com",
+}
+
+// googlePlayAllowlistDomains prevents geosite-category-ads-all from blocking Google Play Store,
+// Play Points redemption, Play Billing, and Play Integrity telemetry endpoints.
+var googlePlayAllowlistDomains = []string{
+	"play.google.com",
+	"play.googleapis.com",
+	"play-fe.googleapis.com",
+	"playatoms-pa.googleapis.com",
+	"play-lh.googleusercontent.com",
+	"android.clients.google.com",
+	"payments.google.com",
+	"pay.google.com",
+	"firebaseinstallations.googleapis.com",
+	"firebaselogging-pa.googleapis.com",
+}
+
 // BuildDomainHashBucketRegexes splits eTLD+1 root domains deterministically into K shards.
 func BuildDomainHashBucketRegexes(shardCount int) []string {
 	if shardCount <= 1 {
 		return nil
 	}
-	if shardCount > 8 {
-		shardCount = 8
+	if shardCount > MaxLoadBalanceShards {
+		shardCount = MaxLoadBalanceShards
 	}
 	buckets := make([]strings.Builder, shardCount)
 	for idx := 0; idx < len(domainHashAlphabet); idx++ {
@@ -1382,6 +1497,19 @@ func appendShardedOrDirectRoute(
 		if preResolveIPv4 {
 			*rules = append(*rules, makeIPv4ResolveRule(baseCond))
 		}
+		// Keep Google ecosystem & IP-verification suites pinned to shard 0 so multi-domain
+		// sessions (e.g. Google Play Points / Auth / ippure.com) never split across exit IPs.
+		if len(baseCond) == 0 {
+			*rules = append(*rules, map[string]any{
+				"domain_suffix": loadBalanceAffinityDomains,
+				"outbound":      shards[0],
+			})
+		} else if _, hasSuffix := baseCond["domain_suffix"]; !hasSuffix {
+			aff := cloneRuleMap(baseCond)
+			aff["domain_suffix"] = loadBalanceAffinityDomains
+			aff["outbound"] = shards[0]
+			*rules = append(*rules, aff)
+		}
 		for i, rx := range BuildDomainHashBucketRegexes(len(shards)) {
 			if len(baseCond) == 0 {
 				*rules = append(*rules, map[string]any{
@@ -1427,6 +1555,10 @@ func buildRoute(
 	lbShards map[string][]string,
 	activeTag string,
 ) map[string]any {
+	// When IPv6 is disabled (prefer_ipv4 / ipv4_only), pre-resolve domain-targeted proxy flows
+	// (e.g. Chrome HTTP CONNECT / SOCKS5h via mixed-in) to IPv4 through remote-dns so remote VPS
+	// outbounds never stall or reset TLS on broken remote IPv6 / domain filters (e.g. ippure.com).
+	// Existing IPv4 destinations from TUN are already IP literals and skip resolution with zero overhead.
 	preResolveIPv4 := !routing.IPv6Enabled() && routing.Mode != "direct"
 	rules := []map[string]any{
 		{"action": "sniff"},
@@ -1480,8 +1612,26 @@ func buildRoute(
 			rules = append(rules, map[string]any{"ip_is_private": true, "outbound": "direct"})
 		}
 	}
+	if !routing.IPv6Enabled() && routing.Mode != "direct" && (in.AndroidMode || in.EnableTUN) {
+		// Reject global IPv6 destinations when IPv6 is disabled so Android/TUN captures ::/0
+		// without leaking real ISP IPv6 and apps fall back immediately to proxied IPv4.
+		rules = append(rules, map[string]any{
+			"ip_cidr": []string{"2000::/3"},
+			"action":  "reject",
+		})
+	}
 	if routing.BlockAds && routing.Mode != "direct" && ruleSetTags[ruleset.TagGeoSiteAds] {
-		rules = append(rules, map[string]any{"rule_set": ruleset.TagGeoSiteAds, "action": "reject"})
+		// Exclude Google Play Store / Play Points / Play Billing domains from ad rejection
+		// without shadowing downstream user custom rules.
+		rules = append(rules, map[string]any{
+			"type": "logical",
+			"mode": "and",
+			"rules": []map[string]any{
+				{"rule_set": ruleset.TagGeoSiteAds},
+				{"domain_suffix": googlePlayAllowlistDomains, "invert": true},
+			},
+			"action": "reject",
+		})
 	}
 
 	for _, cr := range routing.CustomRules {
@@ -1520,7 +1670,13 @@ func buildRoute(
 			rule["process_path"] = cr.ProcessPath
 		}
 		if len(cr.PackageName) > 0 {
-			rule["package_name"] = cr.PackageName
+			if in.AndroidMode && in.AndroidAppSocksPort > 0 {
+				// On unrooted Android, tun2socks resolves the real UID/package via ConnectivityManager
+				// and authenticates into android-app-in using the package name as SOCKS5 auth_user.
+				rule["auth_user"] = cr.PackageName
+			} else {
+				rule["package_name"] = cr.PackageName
+			}
 		}
 		if len(cr.Port) > 0 {
 			rule["port"] = cr.Port

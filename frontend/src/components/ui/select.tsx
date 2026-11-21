@@ -206,7 +206,11 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
         if (popoverRef.current?.contains(target)) return;
         setOpen(false);
       };
-      const onReposition = () => computeMenuPosition();
+      const onReposition = (e?: Event) => {
+        const target = e?.target as Node | null;
+        if (target && popoverRef.current?.contains(target)) return;
+        computeMenuPosition();
+      };
       window.addEventListener("pointerdown", onPointerDown, true);
       window.addEventListener("resize", onReposition);
       window.addEventListener("scroll", onReposition, true);
@@ -354,7 +358,8 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
 
         {name ? <input type="hidden" name={name} value={currentValue} /> : null}
 
-        {/* Desktop Viewport-Aware Glass Popover (top-layer promoted via Popover API) */}
+        {/* Desktop Viewport-Aware Glass Popover (top-layer promoted via Popover API;
+            portaled into nearest <dialog> ancestor when inside a modal dialog so it is never inert) */}
         {open && !mobileMode && typeof document !== "undefined"
           ? createPortal(
               <div
@@ -381,7 +386,7 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(
                   {renderOptionList(false)}
                 </div>
               </div>,
-              document.body,
+              triggerRef.current?.closest("dialog") ?? document.body,
             )
           : null}
 

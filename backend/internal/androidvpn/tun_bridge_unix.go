@@ -164,6 +164,11 @@ func (b *TunBridge) handleConn(conn *net.UnixConn) {
 	_, _ = conn.Write([]byte{0})
 }
 
+// ConfigureAppRouting updates live Android per-app routing settings used by tun2socks.
+func (b *TunBridge) ConfigureAppRouting(cfg AppRoutingConfig) {
+	DefaultAppRoutingProxy.Update(cfg)
+}
+
 // Active reports whether the embedded TUN forwarder is currently running.
 func (b *TunBridge) Active() bool {
 	b.mu.Lock()

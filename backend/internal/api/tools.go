@@ -138,7 +138,7 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":         "1.0.0",
+		"version":         "1.0.1",
 		"os":              runtime.GOOS,
 		"arch":            runtime.GOARCH,
 		"go":              runtime.Version(),

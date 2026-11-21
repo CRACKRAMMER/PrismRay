@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-import React, { useEffect, useId, useRef, useState } from "react";
-import { X } from "lucide-react";
-import { type GroupConfig, type ListenConfig, type NodeConfig, type RoutingRule } from "../lib/api.ts";
+import React, { useEffect, useId, useMemo, useRef, useState } from "react";
+import { ChevronDown, Smartphone, X } from "lucide-react";
+import { androidBridge, type GroupConfig, type ListenConfig, type NodeConfig, type RoutingRule } from "../lib/api.ts";
 import { useAppStore } from "../store/appStore.ts";
+import { AndroidAppPicker } from "./AndroidAppPicker.tsx";
 import { Button } from "./ui/button.tsx";
 import { Input } from "./ui/input.tsx";
 import { Select } from "./ui/select.tsx";
@@ -83,6 +84,12 @@ export function RuleEditorForm({
 
   const [form, setForm] = useState<RoutingRule>(EMPTY_RULE);
   const [textFields, setTextFields] = useState<Record<string, string>>({});
+  const [appPickerOpen, setAppPickerOpen] = useState(false);
+
+  const selectedPackages = useMemo(
+    () => splitCSV(textFields.package_name || ""),
+    [textFields.package_name],
+  );
 
   useEffect(() => {
     const base: RoutingRule = {
@@ -418,16 +425,52 @@ export function RuleEditorForm({
                 />
               </div>
               {isAndroid || (form.package_name?.length || 0) > 0 ? (
-                <div className="space-y-1 sm:col-span-2">
-                  <label className="block font-medium text-muted-foreground">
-                    {locale === "zh-CN" ? "应用包名 (package_name)" : "Package Name"}
-                  </label>
+                <div className="space-y-2 sm:col-span-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <label className="block font-medium text-muted-foreground">
+                      {locale === "zh-CN" ? "应用包名 (package_name)" : "Package Name"}
+                    </label>
+                    {isAndroid && androidBridge.available() ? (
+                      <button
+                        type="button"
+                        aria-expanded={appPickerOpen}
+                        onClick={() => setAppPickerOpen((prev) => !prev)}
+                        className="inline-flex items-center gap-1.5 rounded-[6px] border border-primary/30 bg-primary/10 px-2.5 py-1 text-[11px] font-medium text-primary transition-colors hover:bg-primary/15"
+                      >
+                        <Smartphone className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>
+                          {tr("routing.ruleAppPickerToggle")}
+                          {selectedPackages.length > 0 ? ` (${selectedPackages.length})` : ""}
+                        </span>
+                        <ChevronDown
+                          className={`h-3.5 w-3.5 transition-transform ${appPickerOpen ? "rotate-180" : ""}`}
+                          aria-hidden="true"
+                        />
+                      </button>
+                    ) : null}
+                  </div>
                   <Input
                     className={inputCls}
-                    placeholder="com.android.vending"
+                    placeholder="com.android.vending, com.google.android.youtube"
                     value={textFields.package_name || ""}
                     onChange={(e) => setTxt("package_name", e.target.value)}
                   />
+                  {isAndroid ? (
+                    <p className="text-[11px] leading-relaxed text-muted-foreground">
+                      {tr("routing.ruleAppPickerAndroid10Note")}
+                    </p>
+                  ) : null}
+                  {isAndroid && appPickerOpen ? (
+                    <div className="rounded-[10px] border border-border bg-muted/20 p-2.5">
+                      <AndroidAppPicker
+                        packages={selectedPackages}
+                        onChangePackages={(pkgs) => setTxt("package_name", pkgs.join(", "))}
+                        active={appPickerOpen}
+                        maxListHeightClass="max-h-56"
+                        showManualToggle={false}
+                      />
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
             </div>

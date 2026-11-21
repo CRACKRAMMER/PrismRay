@@ -46,6 +46,7 @@ type Group struct {
 	Name           string   `json:"name"`
 	Strategy       string   `json:"strategy"` // selector | urltest | failover | loadbalance
 	SelectedNodeID string   `json:"selected_node_id,omitempty"`
+	ManualPin      bool     `json:"manual_pin,omitempty"`
 	Filter         string   `json:"filter,omitempty"`
 	ToleranceMS    int      `json:"tolerance_ms,omitempty"`
 	Interval       string   `json:"interval,omitempty"`
@@ -179,6 +180,7 @@ func (s *Store) initialize() error {
 			name TEXT NOT NULL UNIQUE,
 			strategy TEXT NOT NULL DEFAULT 'selector',
 			selected_node_id TEXT NOT NULL DEFAULT '',
+			manual_pin INTEGER NOT NULL DEFAULT 0,
 			filter TEXT NOT NULL DEFAULT '',
 			tolerance_ms INTEGER NOT NULL DEFAULT 50,
 			interval TEXT NOT NULL DEFAULT '5m',
@@ -251,6 +253,11 @@ func (s *Store) ensureGroupsColumns() error {
 	}
 	if !cols["detour_id"] {
 		if _, err = s.db.Exec(`ALTER TABLE groups ADD COLUMN detour_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !cols["manual_pin"] {
+		if _, err = s.db.Exec(`ALTER TABLE groups ADD COLUMN manual_pin INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
 	}
@@ -1328,7 +1335,7 @@ func validateGroup(g Group) error {
 func (s *Store) ListGroups() ([]Group, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT id, name, strategy, selected_node_id, filter, tolerance_ms, interval, priority_rule, auto_failover, detour_id, sort_order FROM groups ORDER BY sort_order, name`)
+	rows, err := s.db.Query(`SELECT id, name, strategy, selected_node_id, manual_pin, filter, tolerance_ms, interval, priority_rule, auto_failover, detour_id, sort_order FROM groups ORDER BY sort_order, name`)
 	if err != nil {
 		return nil, err
 	}
@@ -1336,10 +1343,12 @@ func (s *Store) ListGroups() ([]Group, error) {
 	out := []Group{}
 	for rows.Next() {
 		var g Group
+		var manualPinRaw int
 		var autoFailoverRaw int
-		if err = rows.Scan(&g.ID, &g.Name, &g.Strategy, &g.SelectedNodeID, &g.Filter, &g.ToleranceMS, &g.Interval, &g.PriorityRule, &autoFailoverRaw, &g.DetourID, &g.SortOrder); err != nil {
+		if err = rows.Scan(&g.ID, &g.Name, &g.Strategy, &g.SelectedNodeID, &manualPinRaw, &g.Filter, &g.ToleranceMS, &g.Interval, &g.PriorityRule, &autoFailoverRaw, &g.DetourID, &g.SortOrder); err != nil {
 			return nil, err
 		}
+		g.ManualPin = manualPinRaw != 0
 		g.AutoFailover = decodeGroupAutoFailover(autoFailoverRaw)
 		out = append(out, g)
 	}
@@ -1387,13 +1396,18 @@ func (s *Store) SaveGroup(g Group) error {
 		return err
 	}
 	defer tx.Rollback()
+	manualPinInt := 0
+	if g.ManualPin {
+		manualPinInt = 1
+	}
 	if _, err = tx.Exec(`
-		INSERT INTO groups(id, name, strategy, selected_node_id, filter, tolerance_ms, interval, priority_rule, auto_failover, detour_id, sort_order)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO groups(id, name, strategy, selected_node_id, manual_pin, filter, tolerance_ms, interval, priority_rule, auto_failover, detour_id, sort_order)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name,
 			strategy=excluded.strategy,
 			selected_node_id=excluded.selected_node_id,
+			manual_pin=excluded.manual_pin,
 			filter=excluded.filter,
 			tolerance_ms=excluded.tolerance_ms,
 			interval=excluded.interval,
@@ -1401,7 +1415,7 @@ func (s *Store) SaveGroup(g Group) error {
 			auto_failover=excluded.auto_failover,
 			detour_id=excluded.detour_id,
 			sort_order=excluded.sort_order
-	`, g.ID, strings.TrimSpace(g.Name), g.Strategy, g.SelectedNodeID, g.Filter, g.ToleranceMS, g.Interval, g.PriorityRule, encodeGroupAutoFailover(g.AutoFailover), strings.TrimSpace(g.DetourID), g.SortOrder); err != nil {
+	`, g.ID, strings.TrimSpace(g.Name), g.Strategy, g.SelectedNodeID, manualPinInt, g.Filter, g.ToleranceMS, g.Interval, g.PriorityRule, encodeGroupAutoFailover(g.AutoFailover), strings.TrimSpace(g.DetourID), g.SortOrder); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(`DELETE FROM group_members WHERE group_id=?`, g.ID); err != nil {
@@ -1475,9 +1489,18 @@ func (s *Store) ReorderGroups(orderedIDs []string) error {
 
 // SelectGroupNode persists the currently selected node inside a selector group.
 func (s *Store) SelectGroupNode(groupID, nodeID string) error {
+	return s.SetGroupSelection(groupID, nodeID, false)
+}
+
+// SetGroupSelection persists selected_node_id and manual_pin state for a policy group.
+func (s *Store) SetGroupSelection(groupID, nodeID string, manualPin bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, err := s.db.Exec(`UPDATE groups SET selected_node_id=? WHERE id=?`, nodeID, groupID)
+	pinInt := 0
+	if manualPin && strings.TrimSpace(nodeID) != "" {
+		pinInt = 1
+	}
+	res, err := s.db.Exec(`UPDATE groups SET selected_node_id=?, manual_pin=? WHERE id=?`, strings.TrimSpace(nodeID), pinInt, groupID)
 	if err != nil {
 		return err
 	}
@@ -1534,10 +1557,14 @@ func (s *Store) ReplaceGroups(groups []Group) error {
 		if interval == "" {
 			interval = "5m"
 		}
+		pinInt := 0
+		if group.ManualPin && strings.TrimSpace(group.SelectedNodeID) != "" {
+			pinInt = 1
+		}
 		if _, err = tx.Exec(`
-			INSERT INTO groups(id, name, strategy, selected_node_id, filter, tolerance_ms, interval, priority_rule, auto_failover, detour_id, sort_order)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?)
-		`, group.ID, strings.TrimSpace(group.Name), group.Strategy, group.SelectedNodeID, group.Filter, tol, interval, normalizeGroupPriorityRule(group.PriorityRule), encodeGroupAutoFailover(group.AutoFailover), strings.TrimSpace(group.DetourID), group.SortOrder); err != nil {
+			INSERT INTO groups(id, name, strategy, selected_node_id, manual_pin, filter, tolerance_ms, interval, priority_rule, auto_failover, detour_id, sort_order)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+		`, group.ID, strings.TrimSpace(group.Name), group.Strategy, group.SelectedNodeID, pinInt, group.Filter, tol, interval, normalizeGroupPriorityRule(group.PriorityRule), encodeGroupAutoFailover(group.AutoFailover), strings.TrimSpace(group.DetourID), group.SortOrder); err != nil {
 			return err
 		}
 		for i, id := range group.NodeIDs {

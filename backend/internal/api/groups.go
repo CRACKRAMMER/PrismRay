@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"sort"
@@ -42,6 +43,12 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 		group.ID = newRandomID("grp-")
 	}
 	group.DetourID = strings.TrimSpace(group.DetourID)
+	if storage.CanonicalGroupStrategy(group.Strategy) == "loadbalance" {
+		group.SelectedNodeID = ""
+		group.ManualPin = false
+	} else if strings.TrimSpace(group.SelectedNodeID) == "" {
+		group.ManualPin = false
+	}
 	if err := sbcfg.ValidateGroupInterval(group.Interval); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -134,6 +141,12 @@ func (s *Server) handleGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	group.ID = id
 	group.DetourID = strings.TrimSpace(group.DetourID)
+	if storage.CanonicalGroupStrategy(group.Strategy) == "loadbalance" {
+		group.SelectedNodeID = ""
+		group.ManualPin = false
+	} else if strings.TrimSpace(group.SelectedNodeID) == "" {
+		group.ManualPin = false
+	}
 	if err := sbcfg.ValidateGroupInterval(group.Interval); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -183,16 +196,13 @@ func (s *Server) handleGroupSelect(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		NodeID string `json:"node_id"`
+		Auto   bool   `json:"auto,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	req.NodeID = strings.TrimSpace(req.NodeID)
-	if req.NodeID == "" || s.store.Get(req.NodeID) == nil {
-		http.Error(w, "node not found", http.StatusBadRequest)
-		return
-	}
 
 	groups, err := s.store.ListGroups()
 	if err != nil {
@@ -211,7 +221,50 @@ func (s *Server) handleGroupSelect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.store.SelectGroupNode(groupID, req.NodeID); err != nil {
+	strat := storage.CanonicalGroupStrategy(foundGroup.Strategy)
+	if strat == "loadbalance" {
+		http.Error(w, "负载均衡策略组按主域名自动分片，不支持手动选择单个节点", http.StatusBadRequest)
+		return
+	}
+
+	// Restore automatic urltest / failover mode when node_id is empty or auto=true.
+	restoreAuto := req.Auto || req.NodeID == ""
+	if restoreAuto {
+		if strat != "urltest" && strat != "failover" {
+			http.Error(w, "node_id is required for selector groups", http.StatusBadRequest)
+			return
+		}
+		if err := s.store.SetGroupSelection(groupID, "", false); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.opMu.Lock()
+		defer s.opMu.Unlock()
+		orch := s.ensureOrchestrator()
+		if orch.Status().Running {
+			if err := orch.HotSwitch(r.Context(), sbcfg.GroupTag(groupID), sbcfg.GroupAutoTag(groupID)); err != nil {
+				if _, applyErr := s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, s.tunEnabled); applyErr != nil {
+					respondError(w, applyErr, http.StatusBadGateway)
+					return
+				}
+			}
+			orch.AppendLog("system", "info", fmt.Sprintf("策略组「%s」已恢复自动优选模式", foundGroup.Name))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"group_id":   groupID,
+			"node_id":    "",
+			"manual_pin": false,
+		})
+		return
+	}
+
+	if s.store.Get(req.NodeID) == nil {
+		http.Error(w, "node not found", http.StatusBadRequest)
+		return
+	}
+
+	isManualPin := strat == "urltest" || strat == "failover"
+	if err := s.store.SetGroupSelection(groupID, req.NodeID, isManualPin); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -237,11 +290,19 @@ func (s *Server) handleGroupSelect(w http.ResponseWriter, r *http.Request) {
 				s.setKillSwitchBaseline(sbcfg.GroupTag(groupID))
 			}
 		}
+		if isManualPin {
+			nodeName := req.NodeID
+			if n := s.store.Get(req.NodeID); n != nil {
+				nodeName = n.DisplayName()
+			}
+			orch.AppendLog("system", "info", fmt.Sprintf("策略组「%s」已手动临时锁定至节点「%s」（超时或高延迟时将自动切回优选）", foundGroup.Name, nodeName))
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"group_id": groupID,
-		"node_id":  req.NodeID,
+		"group_id":   groupID,
+		"node_id":    req.NodeID,
+		"manual_pin": isManualPin,
 	})
 }
 
@@ -394,6 +455,26 @@ func (s *Server) probeAndReorderGroup(
 		return target, []orchestrator.ProbeResult{}, false, nil
 	}
 
+	computeLBShards := func(ids []string) []string {
+		var healthy []string
+		for _, id := range ids {
+			if n := s.store.Get(id); n != nil && n.Latency >= 0 {
+				healthy = append(healthy, id)
+			}
+		}
+		if len(healthy) == 0 {
+			healthy = append([]string(nil), ids...)
+		}
+		if len(healthy) > sbcfg.MaxLoadBalanceShards {
+			healthy = healthy[:sbcfg.MaxLoadBalanceShards]
+		}
+		return healthy
+	}
+	var prevLBShards []string
+	if storage.CanonicalGroupStrategy(target.Strategy) == "loadbalance" {
+		prevLBShards = computeLBShards(target.NodeIDs)
+	}
+
 	ordered, rawResults := s.probeNodesAndPersist(ctx, memberNodes, normMode, testURL, hs.SpeedDownURL, hs.SpeedUpURL, 10*time.Second)
 
 	rankedIDs := append([]string(nil), target.NodeIDs...)
@@ -406,49 +487,109 @@ func (s *Server) probeAndReorderGroup(
 	target.NodeIDs = rankedIDs
 
 	switched := false
+	revertedToAuto := false
 	bestID := rankedIDs[0]
 	bestRes, hasBestRes := rawResults[bestID]
 	bestReachable := isProbeReachable(normMode, nodeByID[bestID], bestRes, hasBestRes)
+	bestLat := effectiveProbeLatency(nodeByID[bestID], bestRes, hasBestRes)
 
-	allowAutoFailover := effectiveGroupAutoFailover(*target, hs.Failover)
-	manualPinnedNoSwitch := storage.CanonicalGroupStrategy(target.Strategy) == "selector" &&
-		target.AutoFailover != nil && !*target.AutoFailover && target.SelectedNodeID != ""
-	canSwitchSelected := (forceSwitch && !manualPinnedNoSwitch) || (!forceSwitch && allowAutoFailover)
+	strat := storage.CanonicalGroupStrategy(target.Strategy)
+	highLatMS := int64(hs.HighLatencyMS)
+	if highLatMS <= 0 {
+		highLatMS = defaultHighLatencyMS
+	}
 
-	if bestReachable && canSwitchSelected {
-		prevSelected := target.SelectedNodeID
-		if (forceSwitch && !manualPinnedNoSwitch) || prevSelected == "" {
-			target.SelectedNodeID = bestID
-		} else if prevSelected != bestID {
+	switch strat {
+	case "loadbalance":
+		// Loadbalance shards automatically across healthy members; never retain a single selected node.
+		target.SelectedNodeID = ""
+		target.ManualPin = false
+
+	case "urltest", "failover":
+		// When user manually pinned a node inside urltest/failover, keep it pinned until either:
+		// 1. Pinned node becomes unreachable (timeout/error), OR
+		// 2. Pinned node exceeds HighLatencyMS (default 800ms) while a faster healthy member exists.
+		if target.ManualPin && target.SelectedNodeID != "" {
+			prevSelected := target.SelectedNodeID
 			prevRes, hasPrevRes := rawResults[prevSelected]
 			prevReachable := isProbeReachable(normMode, nodeByID[prevSelected], prevRes, hasPrevRes)
 			prevLat := effectiveProbeLatency(nodeByID[prevSelected], prevRes, hasPrevRes)
-			bestLat := effectiveProbeLatency(nodeByID[bestID], bestRes, hasBestRes)
-			tol := int64(target.ToleranceMS)
-			if tol <= 0 {
-				tol = int64(hs.ToleranceMS)
+			highLatencyExceeded := prevLat >= highLatMS && bestReachable && bestID != prevSelected && bestLat > 0 && bestLat < highLatMS
+			if !prevReachable || highLatencyExceeded {
+				reason := "不可达"
+				if prevReachable {
+					reason = fmt.Sprintf("延迟过高 (%dms ≥ %dms)", prevLat, highLatMS)
+				}
+				target.ManualPin = false
+				target.SelectedNodeID = ""
+				switched = true
+				revertedToAuto = true
+				s.ensureOrchestrator().AppendLog("system", "warn", fmt.Sprintf("策略组「%s」手动锁定节点%s，已自动切回优选模式", target.Name, reason))
 			}
-			if tol <= 0 {
-				tol = 50
-			}
-			if !prevReachable || (bestLat > 0 && prevLat-bestLat >= tol) {
-				target.SelectedNodeID = bestID
-			}
+		} else {
+			target.ManualPin = false
+			target.SelectedNodeID = ""
 		}
-		switched = target.SelectedNodeID != "" && target.SelectedNodeID != prevSelected
+
+	default:
+		allowAutoFailover := effectiveGroupAutoFailover(*target, hs.Failover)
+		manualPinnedNoSwitch := target.AutoFailover != nil && !*target.AutoFailover && target.SelectedNodeID != ""
+		canSwitchSelected := (forceSwitch && !manualPinnedNoSwitch) || (!forceSwitch && allowAutoFailover)
+
+		if bestReachable && canSwitchSelected {
+			prevSelected := target.SelectedNodeID
+			if (forceSwitch && !manualPinnedNoSwitch) || prevSelected == "" {
+				target.SelectedNodeID = bestID
+			} else if prevSelected != bestID {
+				prevRes, hasPrevRes := rawResults[prevSelected]
+				prevReachable := isProbeReachable(normMode, nodeByID[prevSelected], prevRes, hasPrevRes)
+				prevLat := effectiveProbeLatency(nodeByID[prevSelected], prevRes, hasPrevRes)
+				tol := int64(target.ToleranceMS)
+				if tol <= 0 {
+					tol = int64(hs.ToleranceMS)
+				}
+				if tol <= 0 {
+					tol = 50
+				}
+				if !prevReachable || (bestLat > 0 && prevLat-bestLat >= tol) {
+					target.SelectedNodeID = bestID
+				}
+			}
+			switched = target.SelectedNodeID != "" && target.SelectedNodeID != prevSelected
+		}
 	}
 
 	if err := s.store.SaveGroup(*target); err != nil {
 		return nil, ordered, false, err
 	}
 
-	if s.ensureOrchestrator().Status().Running && (target.SelectedNodeID != "" || storage.CanonicalGroupStrategy(target.Strategy) == "loadbalance") {
+	if s.ensureOrchestrator().Status().Running {
 		s.opMu.Lock()
 		orch := s.ensureOrchestrator()
-		if storage.CanonicalGroupStrategy(target.Strategy) == "selector" && target.SelectedNodeID != "" {
-			_ = orch.HotSwitch(ctx, sbcfg.GroupTag(target.ID), sbcfg.NodeTag(target.SelectedNodeID))
-		} else {
-			_, _ = s.reconcileRuntime(ctx, s.activeNodeID, s.activeGroupID, s.tunEnabled)
+		if strat == "selector" && target.SelectedNodeID != "" {
+			memberTag := sbcfg.NodeTag(target.SelectedNodeID)
+			if strings.TrimSpace(target.DetourID) != "" {
+				if n := nodeByID[target.SelectedNodeID]; n != nil && !n.RequiresXray() {
+					memberTag = sbcfg.GroupScopedNodeTag(target.SelectedNodeID, target.ID)
+				}
+			}
+			_ = orch.HotSwitch(ctx, sbcfg.GroupTag(target.ID), memberTag)
+		} else if (strat == "urltest" || strat == "failover") && revertedToAuto {
+			_ = orch.HotSwitch(ctx, sbcfg.GroupTag(target.ID), sbcfg.GroupAutoTag(target.ID))
+		} else if strat == "loadbalance" && s.activeGroupID == target.ID {
+			newLBShards := computeLBShards(target.NodeIDs)
+			shardsChanged := len(newLBShards) != len(prevLBShards)
+			if !shardsChanged {
+				for i := range newLBShards {
+					if newLBShards[i] != prevLBShards[i] {
+						shardsChanged = true
+						break
+					}
+				}
+			}
+			if shardsChanged {
+				_, _ = s.reconcileRuntime(ctx, s.activeNodeID, s.activeGroupID, s.tunEnabled)
+			}
 		}
 		s.opMu.Unlock()
 	}

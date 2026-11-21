@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 
+from build_appimage import ensure_appimage_runtime
+
 ROOT = Path(__file__).resolve().parents[1]
 LINUX_RUST_TARGET = 'x86_64-unknown-linux-gnu'
 DEFAULT_TARGETS = ('linux-appimage', 'headless', 'android')
@@ -57,6 +59,9 @@ def build_linux_full_appimage(output_dir: Path) -> Path:
     tauri_env = os.environ.copy()
     tauri_env['APPIMAGE_EXTRACT_AND_RUN'] = '1'
     tauri_env['NO_STRIP'] = 'true'
+    runtime_file = ensure_appimage_runtime(LINUX_RUST_TARGET)
+    if runtime_file is not None:
+        tauri_env['LDAI_RUNTIME_FILE'] = str(runtime_file)
     run(
         [
             'npm',

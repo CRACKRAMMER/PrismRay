@@ -59,7 +59,9 @@ class ProxyTileService : TileService() {
 
     private fun refreshTileState() {
         Thread({
-            updateTile(isActive = queryActive())
+            val active = queryActive()
+            val label = if (active) querySubtitle() else ""
+            updateTile(isActive = active, subtitle = label)
         }, "prismray-tile-state").start()
     }
 
@@ -77,12 +79,37 @@ class ProxyTileService : TileService() {
         }
     }
 
-    private fun updateTile(isActive: Boolean) {
+    private fun querySubtitle(): String {
+        val cached = ProxyVpnService.activeTargetLabel.trim()
+        if (cached.isNotEmpty()) return cached
+        val res = RuntimeIpc.request(this, "GET", "/api/process/status") ?: return ""
+        if (res.statusCode !in 200..299) return ""
+        return try {
+            val j = JSONObject(res.body)
+            val group = j.optString("active_group_name", "").trim()
+            val resolved = j.optString("active_resolved_node_name", "").trim()
+            val node = j.optString("active_node_name", "").trim()
+            when {
+                group.isNotEmpty() && resolved.isNotEmpty() && resolved != group -> "$group → $resolved"
+                group.isNotEmpty() -> group
+                node.isNotEmpty() -> node
+                else -> ""
+            }
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    private fun updateTile(isActive: Boolean, subtitle: String = "") {
         val tile = qsTile ?: return
         tile.state = if (isActive) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
         tile.label = "PrismRay"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            tile.subtitle = if (isActive) "Active" else "Disconnected"
+            tile.subtitle = if (isActive) {
+                subtitle.trim().ifEmpty { "Active" }
+            } else {
+                "Disconnected"
+            }
         }
         tile.updateTile()
     }

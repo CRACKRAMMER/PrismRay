@@ -211,7 +211,7 @@ export function AppUpdateCard() {
           <ArrowUpCircle className="h-4 w-4 shrink-0 text-primary" aria-hidden="true" />
           <span className="font-semibold text-foreground">{tr("update.title")}</span>
           <span className="rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[11px] text-foreground">
-            v{result?.current_version || "1.0.0"}
+            v{result?.current_version || "1.0.1"}
           </span>
           {result?.platform ? (
             <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">

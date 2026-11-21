@@ -187,7 +187,7 @@ func (s *Server) refreshSubscription(ctx context.Context, v *Subscription) error
 		if reqErr != nil {
 			return nil, reqErr
 		}
-		req.Header.Set("User-Agent", "PrismRay/1.0.0")
+		req.Header.Set("User-Agent", "PrismRay/1.0.1")
 		return c.Do(req)
 	}
 	resp, err := doFetch(client)

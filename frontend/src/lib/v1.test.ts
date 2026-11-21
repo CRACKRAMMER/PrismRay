@@ -41,9 +41,13 @@ import {
   formatLatency,
   formatRate,
   formatSpeedMbps,
+  getNodeHealthState,
+  getNodeHealthStyles,
   isRoutingProfileEqual,
+  isRuleSetReady,
   nodeHasInsecureTLS,
   nodeMatchesFilterTab,
+  nodeMatchesFilterTabs,
   nodeNeedsXray,
   resolveConnectionRoute,
   sortNodesByMetric,
@@ -327,5 +331,76 @@ describe("v1.0.0 frontend modules", () => {
 
     const multiLine = classifyQrPayload("vmess://abc\nss://def");
     assert.equal(multiLine.kind, "nodes");
+  });
+
+  it("classifies 4-state node health with default 800ms and custom thresholds", () => {
+    assert.equal(getNodeHealthState(undefined), "untested");
+    assert.equal(getNodeHealthState(null), "untested");
+    assert.equal(getNodeHealthState(0), "untested");
+    assert.equal(getNodeHealthState(-1), "unavailable");
+    assert.equal(getNodeHealthState(120), "ok");
+    assert.equal(getNodeHealthState(799), "ok");
+    assert.equal(getNodeHealthState(800), "high");
+    assert.equal(getNodeHealthState(1450), "high");
+
+    // Custom threshold (e.g. 500ms)
+    assert.equal(getNodeHealthState(499, 500), "ok");
+    assert.equal(getNodeHealthState(500, 500), "high");
+
+    // Color mappings for all 4 states
+    assert.match(getNodeHealthStyles("unavailable").dotClass, /red/);
+    assert.match(getNodeHealthStyles("high").dotClass, /amber/);
+    assert.match(getNodeHealthStyles("ok").dotClass, /emerald/);
+    assert.match(getNodeHealthStyles("untested").dotClass, /muted/);
+  });
+
+  it("matches built-in .srs rule sets by tag even when id uses builtin-* prefix", () => {
+    const specs = [
+      { id: "builtin-geosite-ads", tag: "geosite-category-ads-all", synced: true, enabled: true },
+      { id: "builtin-geosite-cn", tag: "geosite-cn", synced: true, enabled: true },
+      { id: "builtin-geoip-cn", tag: "geoip-cn", synced: false, enabled: true },
+    ];
+    assert.equal(isRuleSetReady(specs, "geosite-category-ads-all"), true);
+    assert.equal(isRuleSetReady(specs, "geosite-cn"), true);
+    assert.equal(isRuleSetReady(specs, "geoip-cn"), false);
+    assert.equal(
+      isRuleSetReady(
+        [{ id: "builtin-geosite-ads", tag: "geosite-category-ads-all", synced: true, enabled: false }],
+        "geosite-category-ads-all",
+      ),
+      false,
+    );
+  });
+
+  it("supports multi-select node tab filtering and protects builtin & subscription tabs from deletion", () => {
+    const nodes = [
+      { id: "n1", name: "SubA-1", sub_id: "sub-a", tags: ["Game"] },
+      { id: "n2", name: "Manual-1", favorite: true, tags: ["AI"] },
+      { id: "n3", name: "SubB-1", sub_id: "sub-b" },
+    ];
+    const subs = [
+      { id: "sub-a", name: "Airport A" },
+      { id: "sub-b", name: "Airport B" },
+    ];
+    const tabs = buildNodeFilterTabs(nodes, subs, ["Game", "AI"], {
+      all: "All",
+      manual: "Manual",
+      favorites: "Favorites",
+    });
+
+    const byId = new Map(tabs.map((tab) => [tab.id, tab]));
+    assert.equal(byId.get("all")?.deletable, false);
+    assert.equal(byId.get("manual")?.deletable, false);
+    assert.equal(byId.get("favorites")?.deletable, false);
+    assert.equal(byId.get("sub:sub-a")?.kind, "subscription");
+    assert.equal(byId.get("sub:sub-a")?.deletable, false);
+    assert.equal(byId.get("utag:Game")?.kind, "custom");
+    assert.equal(byId.get("utag:Game")?.deletable, true);
+
+    // Multi-select union filtering
+    assert.equal(nodeMatchesFilterTabs(nodes[0], []), true);
+    assert.equal(nodeMatchesFilterTabs(nodes[0], ["sub:sub-a", "utag:AI"]), true);
+    assert.equal(nodeMatchesFilterTabs(nodes[1], ["sub:sub-a", "utag:AI"]), true);
+    assert.equal(nodeMatchesFilterTabs(nodes[2], ["sub:sub-a", "utag:AI"]), false);
   });
 });
