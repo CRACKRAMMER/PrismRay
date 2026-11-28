@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useId, useRef, useState } from "react";
 import { AlertTriangle, Camera, CameraOff, Check, Copy, Download, ImageUp, QrCode, Upload } from "lucide-react";
 import QRCode from "qrcode";
-import type { RoutingProfile } from "../lib/api.ts";
+import { androidBridge, type RoutingProfile } from "../lib/api.ts";
 import {
   QR_MAX_SAFE_CHARS,
   decodeRoutingShareInput,
@@ -23,13 +23,21 @@ export interface RoutingQrModalProps {
 
 async function decodeImageElementQr(source: HTMLImageElement | HTMLVideoElement, w: number, h: number): Promise<string | null> {
   if (w <= 0 || h <= 0) return null;
+  const maxDim = 1600;
+  let tw = w;
+  let th = h;
+  if (Math.max(w, h) > maxDim) {
+    const scale = maxDim / Math.max(w, h);
+    tw = Math.max(1, Math.round(w * scale));
+    th = Math.max(1, Math.round(h * scale));
+  }
   const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
+  canvas.width = tw;
+  canvas.height = th;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx) return null;
-  ctx.drawImage(source, 0, 0, w, h);
-  const imageData = ctx.getImageData(0, 0, w, h);
+  ctx.drawImage(source, 0, 0, tw, th);
+  const imageData = ctx.getImageData(0, 0, tw, th);
   const mod = await import("jsqr");
   const jsQR = mod.default;
   const found = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: "attemptBoth" });
@@ -62,6 +70,7 @@ export function RoutingQrModal({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const scanRafRef = useRef<number>(0);
+  const scanBusyRef = useRef<boolean>(false);
 
   const stopCamera = useCallback(() => {
     if (scanRafRef.current) {
@@ -156,7 +165,7 @@ export function RoutingQrModal({
         const img = await new Promise<HTMLImageElement>((resolve, reject) => {
           const el = new Image();
           el.onload = () => resolve(el);
-          el.onerror = () => reject(new Error("图片加载失败"));
+          el.onerror = () => reject(new Error(locale === "zh-CN" ? "图片加载失败" : "Failed to load image"));
           el.src = objectUrl;
         });
         const decoded = await decodeImageElementQr(img, img.naturalWidth, img.naturalHeight);
@@ -172,12 +181,33 @@ export function RoutingQrModal({
         URL.revokeObjectURL(objectUrl);
       }
     },
-    [tr, applyDecodedString],
+    [tr, locale, applyDecodedString],
   );
+
+  useEffect(() => {
+    if (!open || !androidBridge.available()) return;
+    const onNativeQr = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ text?: string; error?: string }>).detail;
+      if (detail?.error) {
+        setCameraError(detail.error);
+        return;
+      }
+      if (detail?.text) {
+        setImportText(detail.text);
+        void applyDecodedString(detail.text);
+      }
+    };
+    window.addEventListener("prismray-qr-result", onNativeQr);
+    return () => window.removeEventListener("prismray-qr-result", onNativeQr);
+  }, [open, applyDecodedString]);
 
   const startCamera = useCallback(async () => {
     setCameraError("");
     setImportError("");
+    if (androidBridge.available() && typeof window.PrismRayAndroid?.startQrScan === "function") {
+      window.PrismRayAndroid.startQrScan();
+      return;
+    }
     if (!navigator.mediaDevices?.getUserMedia) {
       setCameraError(
         tr("routing.qrCameraError", {
@@ -201,15 +231,20 @@ export function RoutingQrModal({
         let lastScan = 0;
         const tick = (now: number) => {
           if (!streamRef.current) return;
-          if (now - lastScan >= 250 && video.readyState >= 2 && video.videoWidth > 0) {
+          if (!scanBusyRef.current && now - lastScan >= 250 && video.readyState >= 2 && video.videoWidth > 0) {
             lastScan = now;
-            void decodeImageElementQr(video, video.videoWidth, video.videoHeight).then((found) => {
-              if (found && streamRef.current) {
-                stopCamera();
-                setImportText(found);
-                void applyDecodedString(found);
-              }
-            });
+            scanBusyRef.current = true;
+            void decodeImageElementQr(video, video.videoWidth, video.videoHeight)
+              .then((found) => {
+                if (found && streamRef.current) {
+                  stopCamera();
+                  setImportText(found);
+                  void applyDecodedString(found);
+                }
+              })
+              .finally(() => {
+                scanBusyRef.current = false;
+              });
           }
           scanRafRef.current = window.requestAnimationFrame(tick);
         };
@@ -230,7 +265,7 @@ export function RoutingQrModal({
     a.href = url;
     a.download = `prismray-routing-profile-${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1500);
   };
 
   const handleDownloadPng = () => {
@@ -243,10 +278,16 @@ export function RoutingQrModal({
 
   const handleCopyShare = async () => {
     if (!shareText) return;
-    await navigator.clipboard.writeText(shareText);
-    setCopied(true);
-    notify(locale === "zh-CN" ? "路由分享串已复制" : "Routing share string copied");
-    window.setTimeout(() => setCopied(false), 1800);
+    try {
+      if (!androidBridge.copyToClipboard(shareText)) {
+        await navigator.clipboard.writeText(shareText);
+      }
+      setCopied(true);
+      notify(locale === "zh-CN" ? "路由分享串已复制" : "Routing share string copied");
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch {
+      // Ignore clipboard restriction.
+    }
   };
 
   const handlePasteEvent = (e: React.ClipboardEvent) => {

@@ -2,15 +2,21 @@
 
 import React, { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
+  BookOpen,
+  Check,
+  Code2,
+  Copy,
   Cpu,
   Download,
   FileArchive,
   Fingerprint,
   Gauge,
   Image as ImageIcon,
+  KeyRound,
   Lock,
   LogOut,
   Monitor,
+  Network,
   Palette,
   Plus,
   QrCode,
@@ -22,6 +28,7 @@ import {
   ShieldAlert,
   Trash2,
   Upload,
+  X,
 } from "lucide-react";
 import {
   androidBridge,
@@ -32,6 +39,8 @@ import {
   type HealthSettings,
   type ListenConfig,
   api,
+  clearAndroidBiometricKey,
+  enrollAndroidBiometricKey,
   formatApiError,
   getBiometricStatus,
   getGpuStatus,
@@ -60,6 +69,7 @@ import {
 } from "../lib/duration.ts";
 import { formatBytes } from "../lib/helpers.ts";
 import { type TranslationKey } from "../lib/i18n.ts";
+import { RULE_SET_CATALOG, type RuleSetCatalogEntry } from "../lib/ruleSetCatalog.ts";
 import { ALL_CONNECTION_COLUMNS, type ConnectionColumnId, useAppStore, useLogsTelemetry } from "../store/appStore.ts";
 import { ColorWheelPicker } from "../components/ColorWheelPicker.tsx";
 import { DurationInput } from "../components/DurationInput.tsx";
@@ -70,11 +80,14 @@ import { RoutingQrModal } from "../components/RoutingQrModal.tsx";
 import { SectionAnchorBar } from "../components/SectionAnchorBar.tsx";
 import { Button } from "../components/ui/button.tsx";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card.tsx";
+import { Checkbox } from "../components/ui/checkbox.tsx";
 import { Input } from "../components/ui/input.tsx";
+import { ModalDialog } from "../components/ui/modal-dialog.tsx";
 import { Select } from "../components/ui/select.tsx";
+import { Slider } from "../components/ui/slider.tsx";
 import { Switch } from "../components/ui/switch.tsx";
 
-export function SettingsLogsView() {
+export function SettingsLogsView({ isActive = true }: { isActive?: boolean } = {}) {
   const {
     tr,
     locale,
@@ -98,6 +111,10 @@ export function SettingsLogsView() {
     ruleSets,
     registerUnsavedGuard,
     tunState,
+    isTunActive,
+    pendingAnchor,
+    consumePendingAnchor,
+    storeRevision,
     refreshAll,
     notify,
   } = useAppStore();
@@ -109,6 +126,8 @@ export function SettingsLogsView() {
   const [lisAddr, setLisAddr] = useState("127.0.0.1");
   const [lisPort, setLisPort] = useState(2081);
   const [lisAllowLan, setLisAllowLan] = useState(false);
+  const [lisUsername, setLisUsername] = useState("");
+  const [lisPassword, setLisPassword] = useState("");
   const [lisExit, setLisExit] = useState<ListenerExitValue>({ kind: "default" });
 
   const [gpuStatus, setGpuStatus] = useState<GpuStatus | null>(null);
@@ -152,10 +171,48 @@ export function SettingsLogsView() {
 
   const [lockPassword, setLockPassword] = useState("");
   const [lockCurrentPassword, setLockCurrentPassword] = useState("");
+  const [allowLanFetch, setAllowLanFetch] = useState(false);
+  const [savingLanFetch, setSavingLanFetch] = useState(false);
+  const [backupPassphrase, setBackupPassphrase] = useState("");
+  const [pendingEncryptedImport, setPendingEncryptedImport] = useState<{
+    mode: "restore" | "merge";
+    payload: Record<string, unknown>;
+  } | null>(null);
+  const [importPassphrase, setImportPassphrase] = useState("");
+  const [rsTag, setRsTag] = useState("");
+  const [rsUrl, setRsUrl] = useState("");
+  const [rsFormat, setRsFormat] = useState<"binary" | "source">("binary");
+  const [rsInterval, setRsInterval] = useState("24h");
+  const [savingRuleSet, setSavingRuleSet] = useState(false);
+  const [restoringRuleSets, setRestoringRuleSets] = useState(false);
   const [logLevelFilter, setLogLevelFilter] = useState("all");
   const [logSearch, setLogSearch] = useState("");
   const [syncingRulesets, setSyncingRulesets] = useState(false);
   const [ensuringCores, setEnsuringCores] = useState(false);
+  const [catalogOpen, setCatalogOpen] = useState(false);
+  const [addingCatalogId, setAddingCatalogId] = useState<string | null>(null);
+  const [savingNetworkPolicy, setSavingNetworkPolicy] = useState(false);
+  const [savingCoreLogLevel, setSavingCoreLogLevel] = useState(false);
+  const [changePwOpen, setChangePwOpen] = useState(false);
+  const [changePwCurrent, setChangePwCurrent] = useState("");
+  const [changePwNew, setChangePwNew] = useState("");
+  const [changePwConfirm, setChangePwConfirm] = useState("");
+  const [changingPw, setChangingPw] = useState(false);
+  const [compiledConfigModal, setCompiledConfigModal] = useState<{
+    open: boolean;
+    loading: boolean;
+    engine: string;
+    activeTag: string;
+    redacted: boolean;
+    config: string;
+  }>({
+    open: false,
+    loading: false,
+    engine: "",
+    activeTag: "",
+    redacted: true,
+    config: "",
+  });
 
   const [appearance, setAppearance] = useState<AppearanceConfig>(() => loadAppearanceConfig());
   const [wallpaperPreview, setWallpaperPreview] = useState<string | null>(null);
@@ -236,6 +293,10 @@ export function SettingsLogsView() {
         setHealthToleranceUnit(tolParts.unit);
       })
       .catch(() => {});
+    void api
+      .getSecurityPolicy()
+      .then((p) => setAllowLanFetch(Boolean(p.allow_lan_subscription_fetch)))
+      .catch(() => {});
     if (androidBridge.available()) {
       setAndroidBootAutostart(androidBridge.getBootAutostart());
       void getBiometricStatus()
@@ -259,6 +320,30 @@ export function SettingsLogsView() {
     raw
       .replace(/\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))/g, "")
       .replace(/\[(?:\d{1,3}(?:;\d{1,3})*)m/g, "");
+
+  const formatLogTimeLocal = (raw: string): string => {
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) {
+      return raw.replace(/^.*T/, "").replace(/[Z+].*$/, "");
+    }
+    return d.toLocaleTimeString([], {
+      hour12: false,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  };
+
+  const formatLogFullLocal = (raw: string): string => {
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) return raw;
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const offMin = -d.getTimezoneOffset();
+    const sign = offMin >= 0 ? "+" : "-";
+    const absMin = Math.abs(offMin);
+    const tz = `${sign}${pad(Math.floor(absMin / 60))}:${pad(absMin % 60)}`;
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${tz}`;
+  };
 
   const handleCopyLogLine = async (text: string) => {
     try {
@@ -289,6 +374,45 @@ export function SettingsLogsView() {
       // Ignore clipboard restriction.
     }
   };
+
+  useEffect(() => {
+    if (!isActive || !pendingAnchor || !pendingAnchor.startsWith("settings-")) return;
+    const anchor = consumePendingAnchor(pendingAnchor);
+    if (!anchor) return;
+    const timer = window.setTimeout(() => {
+      const el = document.getElementById(anchor);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+        el.classList.add("ring-2", "ring-primary/50", "rounded-xl");
+        window.setTimeout(() => el.classList.remove("ring-2", "ring-primary/50", "rounded-xl"), 1500);
+      }
+    }, 60);
+    return () => window.clearTimeout(timer);
+  }, [isActive, pendingAnchor, consumePendingAnchor]);
+
+  useEffect(() => {
+    if (!compiledConfigModal.open) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setCompiledConfigModal((m) => ({ ...m, open: false }));
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [compiledConfigModal.open]);
+
+  const showDebugFilter = useMemo(
+    () =>
+      (routing?.log_level || "warn").toLowerCase() === "debug" ||
+      logs.some((entry) => entry.level.toLowerCase() === "debug"),
+    [routing?.log_level, logs],
+  );
+
+  useEffect(() => {
+    if (!showDebugFilter && logLevelFilter === "debug") {
+      setLogLevelFilter("all");
+    }
+  }, [showDebugFilter, logLevelFilter]);
 
   const filteredLogs = useMemo(() => {
     const q = logSearch.trim().toLowerCase();
@@ -346,11 +470,15 @@ export function SettingsLogsView() {
         address: lisAddr.trim() || "127.0.0.1",
         port: Number(lisPort),
         allow_lan: lisAllowLan,
+        username: lisUsername.trim() || undefined,
+        password: lisPassword.trim() || undefined,
         target_outbound: encoded.target_outbound,
         target_group_id: encoded.target_group_id,
         node_ids: encoded.node_ids,
         enabled: true,
       });
+      setLisUsername("");
+      setLisPassword("");
       setLisExit({ kind: "default" });
       await refreshAll();
     } catch (err) {
@@ -493,6 +621,9 @@ export function SettingsLogsView() {
         password: lockPassword,
         current_password: lockCurrentPassword || undefined,
       });
+      if (!enable && isAndroid) {
+        clearAndroidBiometricKey();
+      }
       setLockPassword("");
       setLockCurrentPassword("");
       const nextAuth = await api.getAuthStatus();
@@ -510,10 +641,43 @@ export function SettingsLogsView() {
     }
     setSavingBiometric(true);
     try {
-      await api.setBiometricUnlock({
-        enabled: enable,
-        current_password: enable ? lockCurrentPassword : undefined,
-      });
+      if (isAndroid) {
+        if (enable) {
+          const res = await api.setBiometricUnlock({
+            enabled: true,
+            current_password: lockCurrentPassword,
+            hardware_wrap: true,
+          });
+          if (!res.biometric_kek) {
+            await api.setBiometricUnlock({ enabled: false }).catch(() => {});
+            throw new Error(
+              locale === "zh-CN"
+                ? "未收到硬件生物密钥，请重试"
+                : "Missing hardware biometric key material",
+            );
+          }
+          try {
+            await enrollAndroidBiometricKey(
+              res.biometric_kek,
+              locale === "zh-CN"
+                ? "验证指纹/面容以在 Android Keystore 中安全封装解锁密钥"
+                : "Verify biometrics to seal the unlock key in Android Keystore",
+            );
+          } catch (enrollErr) {
+            await api.setBiometricUnlock({ enabled: false }).catch(() => {});
+            clearAndroidBiometricKey();
+            throw enrollErr;
+          }
+        } else {
+          await api.setBiometricUnlock({ enabled: false });
+          clearAndroidBiometricKey();
+        }
+      } else {
+        await api.setBiometricUnlock({
+          enabled: enable,
+          current_password: enable ? lockCurrentPassword : undefined,
+        });
+      }
       setLockCurrentPassword("");
       const nextAuth = await api.getAuthStatus();
       setAuthStatus(nextAuth);
@@ -542,7 +706,7 @@ export function SettingsLogsView() {
       a.href = url;
       a.download = `prismray-routing-profile-${new Date().toISOString().slice(0, 10)}.json`;
       a.click();
-      URL.revokeObjectURL(url);
+      window.setTimeout(() => URL.revokeObjectURL(url), 1500);
     } catch (err) {
       notify(formatApiError(err), "error");
     }
@@ -552,20 +716,291 @@ export function SettingsLogsView() {
     .filter(([, checked]) => checked)
     .map(([key]) => key);
 
-  const handleExportBackup = async () => {
+  const handleToggleAllowLanFetch = async (checked: boolean) => {
+    setSavingLanFetch(true);
+    try {
+      const saved = await api.saveSecurityPolicy(checked);
+      setAllowLanFetch(Boolean(saved.allow_lan_subscription_fetch));
+      notify(tr("action.save"));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setSavingLanFetch(false);
+    }
+  };
+
+  const handleToggleDisableIpv6 = async (checked: boolean) => {
+    setSavingNetworkPolicy(true);
+    try {
+      const base = routing || (await api.getRouting());
+      const curStrat = (base.domain_strategy || "").trim().toLowerCase();
+      const nextStrat = checked
+        ? "ipv4_only"
+        : curStrat === "ipv4_only" || !curStrat
+          ? "prefer_ipv4"
+          : base.domain_strategy;
+      await api.saveRouting({
+        ...base,
+        disable_ipv6: checked,
+        domain_strategy: nextStrat,
+      });
+      await refreshAll();
+      notify(tr("action.save"));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setSavingNetworkPolicy(false);
+    }
+  };
+
+  const handleToggleBypassSystemTailscale = async (checked: boolean) => {
+    setSavingNetworkPolicy(true);
+    try {
+      const base = routing || (await api.getRouting());
+      await api.saveRouting({
+        ...base,
+        bypass_system_tailscale: checked,
+      });
+      await refreshAll();
+      notify(tr("action.save"));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setSavingNetworkPolicy(false);
+    }
+  };
+
+  const handleChangeTunStack = async (stack: string) => {
+    setSavingNetworkPolicy(true);
+    try {
+      await api.setTUN({ enabled: isTunActive, stack });
+      await refreshAll();
+      notify(tr("settings.tunStackSaved", { stack }));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setSavingNetworkPolicy(false);
+    }
+  };
+
+  const handleUpdateCoreLogLevel = async (level: string) => {
+    setSavingCoreLogLevel(true);
+    try {
+      const base = routing || (await api.getRouting());
+      await api.saveRouting({ ...base, log_level: level });
+      await refreshAll();
+      notify(tr("settings.coreLogLevelSaved", { level: level.toUpperCase() }));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setSavingCoreLogLevel(false);
+    }
+  };
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!changePwCurrent.trim()) return;
+    if (changePwNew.length < 8) {
+      notify(tr("settings.backupPassphraseShort"), "error");
+      return;
+    }
+    if (changePwNew !== changePwConfirm) {
+      notify(tr("auth.passwordMismatch"), "error");
+      return;
+    }
+    setChangingPw(true);
+    try {
+      await api.setPasswordLock({
+        enabled: true,
+        current_password: changePwCurrent,
+        password: changePwNew,
+      });
+      setChangePwCurrent("");
+      setChangePwNew("");
+      setChangePwConfirm("");
+      setChangePwOpen(false);
+      const nextAuth = await api.getAuthStatus();
+      setAuthStatus(nextAuth);
+      notify(tr("settings.passwordChanged"));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setChangingPw(false);
+    }
+  };
+
+  const handleOpenCompiledConfig = async () => {
+    setCompiledConfigModal({
+      open: true,
+      loading: true,
+      engine: "",
+      activeTag: "",
+      redacted: true,
+      config: "",
+    });
+    try {
+      const res = await api.getCompiledConfig();
+      setCompiledConfigModal({
+        open: true,
+        loading: false,
+        engine: res.engine,
+        activeTag: res.active_tag,
+        redacted: res.redacted,
+        config: res.config,
+      });
+    } catch (err) {
+      setCompiledConfigModal((m) => ({ ...m, open: false, loading: false }));
+      notify(formatApiError(err), "error");
+    }
+  };
+
+  const handleAddCatalogRuleSet = async (entry: RuleSetCatalogEntry) => {
+    setAddingCatalogId(entry.id);
+    try {
+      await api.saveRuleSet({
+        id: entry.id,
+        tag: entry.tag,
+        format: entry.format,
+        source_type: "remote",
+        url: entry.url,
+        update_interval: entry.update_interval,
+        enabled: true,
+      });
+      try {
+        await api.syncRuleSets([entry.id]);
+      } catch {
+        // Non-fatal: rule-set saved, user can retry sync later.
+      }
+      await refreshAll();
+      notify(tr("settings.rulesetAdded"));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setAddingCatalogId(null);
+    }
+  };
+
+  const handleAddCustomRuleSet = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const tag = rsTag.trim();
+    const url = rsUrl.trim();
+    if (!tag || !url) return;
+    setSavingRuleSet(true);
+    try {
+      await api.saveRuleSet({
+        id: tag,
+        tag,
+        format: rsFormat,
+        source_type: "remote",
+        url,
+        update_interval: rsInterval,
+        enabled: true,
+      });
+      setRsTag("");
+      setRsUrl("");
+      await refreshAll();
+      notify(tr("settings.rulesetAdded"));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setSavingRuleSet(false);
+    }
+  };
+
+  const handleDeleteCustomRuleSet = async (id: string) => {
+    try {
+      await api.deleteRuleSet(id);
+      await refreshAll();
+      notify(tr("settings.rulesetDeleted"));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    }
+  };
+
+  const handleRestoreBuiltinRuleSets = async () => {
+    setRestoringRuleSets(true);
+    try {
+      await api.restoreBuiltinRuleSets();
+      await refreshAll();
+      notify(tr("settings.rulesetRestored"));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setRestoringRuleSets(false);
+    }
+  };
+
+  const hasMissingBuiltinRuleSets = [
+    "builtin-geosite-cn",
+    "builtin-geoip-cn",
+    "builtin-geosite-not-cn",
+    "builtin-geosite-ads",
+  ].some((id) => !ruleSets.some((rs) => rs.id === id));
+
+  const handleExportBackup = async (plaintext = false) => {
     if (selectedBackupKeys.length === 0) {
       notify(locale === "zh-CN" ? "请至少勾选一个要导出的配置模块" : "Select at least one module to export", "error");
       return;
     }
+    if (!plaintext && backupPassphrase.length < 8) {
+      notify(tr("settings.backupPassphraseShort"), "error");
+      return;
+    }
     try {
-      const data = await api.exportBackup(selectedBackupKeys);
+      const data = plaintext
+        ? await api.exportBackup(selectedBackupKeys)
+        : await api.exportEncryptedBackup({
+            passphrase: backupPassphrase,
+            include: selectedBackupKeys,
+          });
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `prismray-backup-v4-${new Date().toISOString().slice(0, 10)}.json`;
+      const dateStr = new Date().toISOString().slice(0, 10);
+      a.download = plaintext ? `prismray-backup-v4-${dateStr}.json` : `prismray-backup-v5-${dateStr}.enc.json`;
       a.click();
-      URL.revokeObjectURL(url);
+      window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+      if (!plaintext) setBackupPassphrase("");
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    }
+  };
+
+  const executeBackupImport = async (mode: "restore" | "merge", parsed: Record<string, unknown>, passphrase?: string) => {
+    if (mode === "restore") {
+      await api.restoreBackup(parsed, passphrase);
+      await refreshAll();
+      if (isAndroid && androidBridge.getVpnStatus()?.active) {
+        const latestRouting = await api.getRouting().catch(() => null);
+        if (latestRouting) {
+          androidBridge.prepareAndStartVpn({
+            per_app_mode: latestRouting.per_app_mode || "all",
+            per_app_packages: latestRouting.per_app_packages || [],
+            bypass_lan: latestRouting.bypass_lan,
+            allow_lan_broadcast: Boolean(latestRouting.bypass_lan && latestRouting.allow_lan_broadcast),
+          });
+        }
+      }
+      notify(locale === "zh-CN" ? "备份恢复成功" : "Backup restored");
+    } else {
+      const res = await api.mergeBackup(parsed, passphrase);
+      await refreshAll();
+      notify(
+        locale === "zh-CN"
+          ? `合并导入成功（节点 ${res.nodes} / 分组 ${res.groups} / 规则 ${res.custom_rules}）`
+          : `Merged bundle (${res.nodes} nodes, ${res.groups} groups, ${res.custom_rules} rules)`,
+      );
+    }
+  };
+
+  const handleConfirmEncryptedImport = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!pendingEncryptedImport || !importPassphrase) return;
+    try {
+      await executeBackupImport(pendingEncryptedImport.mode, pendingEncryptedImport.payload, importPassphrase);
+      setPendingEncryptedImport(null);
+      setImportPassphrase("");
     } catch (err) {
       notify(formatApiError(err), "error");
     }
@@ -577,9 +1012,12 @@ export function SettingsLogsView() {
     try {
       const text = await file.text();
       const parsed = JSON.parse(text) as Record<string, unknown>;
-      await api.restoreBackup(parsed);
-      await refreshAll();
-      notify(locale === "zh-CN" ? "备份恢复成功" : "Backup restored");
+      if (parsed.format === "prismray-encrypted-backup") {
+        setPendingEncryptedImport({ mode: "restore", payload: parsed });
+        setImportPassphrase("");
+        return;
+      }
+      await executeBackupImport("restore", parsed);
     } catch (err) {
       notify(formatApiError(err), "error");
     } finally {
@@ -593,13 +1031,12 @@ export function SettingsLogsView() {
     try {
       const text = await file.text();
       const parsed = JSON.parse(text) as Record<string, unknown>;
-      const res = await api.mergeBackup(parsed);
-      await refreshAll();
-      notify(
-        locale === "zh-CN"
-          ? `合并导入成功（节点 ${res.nodes} / 分组 ${res.groups} / 规则 ${res.custom_rules}）`
-          : `Merged bundle (${res.nodes} nodes, ${res.groups} groups, ${res.custom_rules} rules)`,
-      );
+      if (parsed.format === "prismray-encrypted-backup") {
+        setPendingEncryptedImport({ mode: "merge", payload: parsed });
+        setImportPassphrase("");
+        return;
+      }
+      await executeBackupImport("merge", parsed);
     } catch (err) {
       notify(formatApiError(err), "error");
     } finally {
@@ -650,6 +1087,38 @@ export function SettingsLogsView() {
   };
 
   useEffect(() => {
+    if (!isActive || storeRevision === 0) return;
+    if (!settingsUnsavedRef.current.settingsPortsDirty) {
+      void api
+        .getSettings()
+        .then((s) => {
+          setSettingsDraft(s);
+          setSettingsBaseline(s);
+        })
+        .catch(() => {});
+    }
+    if (!settingsUnsavedRef.current.healthDirty) {
+      void api
+        .getHealthSettings()
+        .then((h) => {
+          setHealthDraft(h);
+          setHealthBaseline(h);
+          const intParts = splitSeconds(h.interval_seconds || 60, ["s", "m", "h", "d"], "m");
+          setHealthIntervalVal(intParts.value);
+          setHealthIntervalUnit(intParts.unit);
+          const tolParts = splitMilliseconds(h.tolerance_ms ?? 50, ["ms", "s", "m"], "ms");
+          setHealthToleranceVal(tolParts.value);
+          setHealthToleranceUnit(tolParts.unit);
+        })
+        .catch(() => {});
+    }
+    void api
+      .getSecurityPolicy()
+      .then((p) => setAllowLanFetch(Boolean(p.allow_lan_subscription_fetch)))
+      .catch(() => {});
+  }, [storeRevision, isActive]);
+
+  useEffect(() => {
     registerUnsavedGuard("settings", {
       isDirty: () => settingsUnsavedRef.current.healthDirty || settingsUnsavedRef.current.settingsPortsDirty,
       save: async () => {
@@ -690,7 +1159,7 @@ export function SettingsLogsView() {
       a.href = url;
       a.download = `prismray-logs-${new Date().toISOString().slice(0, 10)}.txt`;
       a.click();
-      URL.revokeObjectURL(url);
+      window.setTimeout(() => URL.revokeObjectURL(url), 1500);
     } catch (err) {
       notify(formatApiError(err), "error");
     }
@@ -985,14 +1454,13 @@ export function SettingsLogsView() {
                       <span className="text-muted-foreground">{tr("settings.bgBlur")}</span>
                       <span className="tabular-nums font-medium text-foreground">{appearance.bgBlur}px</span>
                     </div>
-                    <input
-                      type="range"
+                    <Slider
                       min={0}
                       max={24}
                       step={1}
+                      aria-label={tr("settings.bgBlur")}
                       value={appearance.bgBlur}
                       onChange={(e) => updateAppearance({ bgBlur: Number(e.target.value) })}
-                      className="w-full accent-primary cursor-pointer"
                     />
                   </label>
                   <label className="space-y-1.5">
@@ -1000,14 +1468,13 @@ export function SettingsLogsView() {
                       <span className="text-muted-foreground">{tr("settings.glassBlur")}</span>
                       <span className="tabular-nums font-medium text-foreground">{appearance.glassBlur}px</span>
                     </div>
-                    <input
-                      type="range"
+                    <Slider
                       min={0}
                       max={32}
                       step={1}
+                      aria-label={tr("settings.glassBlur")}
                       value={appearance.glassBlur}
                       onChange={(e) => updateAppearance({ glassBlur: Number(e.target.value) })}
-                      className="w-full accent-primary cursor-pointer"
                     />
                   </label>
                   <label className="space-y-1.5">
@@ -1015,14 +1482,13 @@ export function SettingsLogsView() {
                       <span className="text-muted-foreground">{tr("settings.bgDim")}</span>
                       <span className="tabular-nums font-medium text-foreground">{appearance.bgDim}%</span>
                     </div>
-                    <input
-                      type="range"
+                    <Slider
                       min={0}
                       max={85}
                       step={1}
+                      aria-label={tr("settings.bgDim")}
                       value={appearance.bgDim}
                       onChange={(e) => updateAppearance({ bgDim: Number(e.target.value) })}
-                      className="w-full accent-primary cursor-pointer"
                     />
                   </label>
                   <label className="space-y-1.5">
@@ -1030,14 +1496,13 @@ export function SettingsLogsView() {
                       <span className="text-muted-foreground">{tr("settings.cardGlass")}</span>
                       <span className="tabular-nums font-medium text-foreground">{appearance.cardOpacity}%</span>
                     </div>
-                    <input
-                      type="range"
+                    <Slider
                       min={20}
                       max={96}
                       step={1}
+                      aria-label={tr("settings.cardGlass")}
                       value={appearance.cardOpacity}
                       onChange={(e) => updateAppearance({ cardOpacity: Number(e.target.value) })}
-                      className="w-full accent-primary cursor-pointer"
                     />
                   </label>
                 </div>
@@ -1133,10 +1598,9 @@ export function SettingsLogsView() {
                 </div>
                 {autostartState.supported && (
                   <div className="flex shrink-0 items-center gap-4">
-                    <label className="flex items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground">
-                      <input
-                        type="checkbox"
-                        className="accent-primary"
+                    <label className="flex cursor-pointer items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground">
+                      <Checkbox
+                        size="sm"
                         checked={autostartState.minimized}
                         disabled={savingAutostart}
                         onChange={(e) => {
@@ -1322,12 +1786,32 @@ export function SettingsLogsView() {
                 {tr("action.add")}
               </Button>
             </div>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <Input
+                aria-label={tr("settings.listenerUsername")}
+                value={lisUsername}
+                onChange={(e) => setLisUsername(e.target.value)}
+                placeholder={tr("settings.listenerUsername")}
+                autoComplete="off"
+                className="text-xs"
+              />
+              <Input
+                aria-label={tr("settings.listenerPassword")}
+                type="password"
+                value={lisPassword}
+                onChange={(e) => setLisPassword(e.target.value)}
+                placeholder={tr("settings.listenerPassword")}
+                autoComplete="new-password"
+                className="text-xs"
+              />
+            </div>
           </form>
 
           <div className="space-y-2">
             {listeners.map((l) => {
               const exitVal = decodeListenerExit(l);
               const isLan = Boolean(l.allow_lan) || l.address === "0.0.0.0";
+              const hasAuth = Boolean((l.username && l.username.trim()) || (l.password && l.password.trim()));
               return (
                 <div key={l.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3 py-2 text-xs">
                   <div className="flex min-w-44 flex-wrap items-center gap-1.5">
@@ -1338,6 +1822,12 @@ export function SettingsLogsView() {
                     {isLan ? (
                       <span className="badge-radius border border-primary/40 bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-primary">
                         LAN
+                      </span>
+                    ) : null}
+                    {hasAuth ? (
+                      <span className="inline-flex items-center gap-0.5 badge-radius border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+                        <Lock className="h-2.5 w-2.5" aria-hidden="true" />
+                        AUTH
                       </span>
                     ) : null}
                   </div>
@@ -1559,25 +2049,49 @@ export function SettingsLogsView() {
           ) : null}
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
             <div className="min-w-0 space-y-2 rounded-[10px] border border-border bg-muted/30 p-3">
-              <div className="flex items-center justify-between gap-2">
-                <span className="font-semibold text-foreground">
-                  {tr("status.singbox")}
-                </span>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="font-semibold text-foreground">
+                    {tr("status.singbox")}
+                  </span>
+                  {cores?.sing_box?.version ? (
+                    <span className="badge-radius border border-border bg-background px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                      {cores.sing_box.version}
+                    </span>
+                  ) : null}
+                  {cores?.sing_box?.installed ? (
+                    <span
+                      className={`badge-radius border px-1.5 py-0.5 text-[10px] font-medium ${
+                        cores.sing_box.unified
+                          ? "border-emerald-500/40 bg-emerald-500/12 text-emerald-600 dark:text-emerald-400"
+                          : "border-amber-500/40 bg-amber-500/12 text-amber-600 dark:text-amber-400"
+                      }`}
+                    >
+                      {cores.sing_box.unified ? tr("settings.coreUnifiedBadge") : tr("settings.coreUpstreamBadge")}
+                    </span>
+                  ) : null}
+                </div>
                 {androidBundledCores ? (
                   <span className="badge-radius border border-primary/30 bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">
                     APK
                   </span>
                 ) : (
-                  <Button type="button" size="sm" variant="ghost" onClick={() => void handleInstallCore("sing-box")}>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    disabled={ensuringCores}
+                    onClick={() => void handleInstallCore("sing-box")}
+                  >
                     {tr("settings.installUpdate")}
                   </Button>
                 )}
               </div>
               <div className="font-mono text-muted-foreground break-words">{cores?.sing_box?.binary || "--"}</div>
               {!androidBundledCores ? (
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
+                <label className="flex cursor-pointer items-center gap-2">
+                  <Checkbox
+                    size="sm"
                     checked={Boolean(cores?.auto_update?.sing_box)}
                     onChange={(e) =>
                       void api
@@ -1598,25 +2112,38 @@ export function SettingsLogsView() {
             </div>
 
             <div className="min-w-0 space-y-2 rounded-[10px] border border-border bg-muted/30 p-3">
-              <div className="flex items-center justify-between gap-2">
-                <span className="font-semibold text-foreground">
-                  {tr("status.xray")}
-                </span>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="font-semibold text-foreground">
+                    {tr("status.xray")}
+                  </span>
+                  {cores?.xray?.version ? (
+                    <span className="badge-radius border border-border bg-background px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                      {cores.xray.version}
+                    </span>
+                  ) : null}
+                </div>
                 {androidBundledCores ? (
                   <span className="badge-radius border border-primary/30 bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">
                     APK
                   </span>
                 ) : (
-                  <Button type="button" size="sm" variant="ghost" onClick={() => void handleInstallCore("xray")}>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    disabled={ensuringCores}
+                    onClick={() => void handleInstallCore("xray")}
+                  >
                     {tr("settings.installUpdate")}
                   </Button>
                 )}
               </div>
               <div className="font-mono text-muted-foreground break-words">{cores?.xray?.binary || "--"}</div>
               {!androidBundledCores ? (
-                <label className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
+                <label className="flex cursor-pointer items-center gap-2">
+                  <Checkbox
+                    size="sm"
                     checked={Boolean(cores?.auto_update?.xray)}
                     onChange={(e) =>
                       void api
@@ -1639,17 +2166,153 @@ export function SettingsLogsView() {
 
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {ruleSets.map((rs) => (
-              <div key={rs.id} className="rounded-lg border px-3 py-2">
+              <div key={rs.id} className="rounded-lg border px-3 py-2 space-y-1">
                 <div className="flex items-center justify-between gap-2 font-medium text-foreground">
                   <span className="truncate">{rs.tag}</span>
-                  <span className={`shrink-0 whitespace-nowrap ${rs.synced ? "text-primary" : "text-amber-500"}`}>
-                    {rs.synced ? formatBytes(rs.size_bytes) : tr("settings.notSynced")}
-                  </span>
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <span className={`whitespace-nowrap ${rs.synced ? "text-primary" : "text-amber-500"}`}>
+                      {rs.synced ? formatBytes(rs.size_bytes) : tr("settings.notSynced")}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => void handleDeleteCustomRuleSet(rs.id)}
+                      aria-label={`${tr("action.delete")} ${rs.tag}`}
+                      title={tr("action.delete")}
+                      className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
+                    >
+                      <Trash2 className="h-3 w-3" aria-hidden="true" />
+                    </button>
+                  </div>
                 </div>
-                <div className="truncate font-mono text-xs text-muted-foreground">{rs.format} · {rs.source_type}</div>
+                <div className="truncate font-mono text-[11px] text-muted-foreground">
+                  {rs.format} · {rs.source_type} · {rs.update_interval || "24h"}
+                </div>
+                {rs.last_synced_at ? (
+                  <div className="truncate font-mono text-[10px] text-muted-foreground/80">
+                    {new Date(rs.last_synced_at).toLocaleString()}
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => setCatalogOpen((o) => !o)}
+            >
+              <BookOpen className="mr-1.5 h-3.5 w-3.5 text-primary" aria-hidden="true" />
+              {tr("settings.rulesetCatalogToggle")}
+            </Button>
+            {hasMissingBuiltinRuleSets ? (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={restoringRuleSets}
+                onClick={() => void handleRestoreBuiltinRuleSets()}
+              >
+                <RotateCcw className={`mr-1.5 h-3.5 w-3.5 ${restoringRuleSets ? "animate-spin" : ""}`} aria-hidden="true" />
+                {tr("settings.rulesetRestoreBuiltins")}
+              </Button>
+            ) : null}
+          </div>
+
+          {catalogOpen ? (
+            <div className="space-y-2 rounded-[10px] border border-primary/25 bg-primary/5 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-semibold text-foreground">{tr("settings.rulesetCatalogTitle")}</span>
+                <span className="text-[11px] text-muted-foreground">{tr("settings.rulesetCatalogDesc")}</span>
+              </div>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {RULE_SET_CATALOG.map((entry) => {
+                  const exists = ruleSets.some((rs) => rs.id === entry.id || rs.tag === entry.tag);
+                  const adding = addingCatalogId === entry.id;
+                  return (
+                    <div
+                      key={entry.id}
+                      className="flex items-center justify-between gap-2 rounded-lg border border-border bg-card px-2.5 py-2"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate font-medium text-foreground">
+                          {locale === "zh-CN" ? entry.nameZh : entry.nameEn}
+                        </div>
+                        <div className="truncate font-mono text-[10px] text-muted-foreground">{entry.tag}</div>
+                      </div>
+                      {exists ? (
+                        <span className="inline-flex shrink-0 items-center gap-1 badge-radius border border-emerald-500/35 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                          <Check className="h-3 w-3" aria-hidden="true" />
+                          {tr("settings.rulesetCatalogAdded")}
+                        </span>
+                      ) : (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={adding}
+                          onClick={() => void handleAddCatalogRuleSet(entry)}
+                          className="h-7 shrink-0 px-2 text-[11px]"
+                        >
+                          <Plus className="mr-1 h-3 w-3" aria-hidden="true" />
+                          {tr("action.add")}
+                        </Button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+
+          <form onSubmit={(e) => void handleAddCustomRuleSet(e)} className="space-y-2 rounded-[10px] border border-border/70 bg-muted/20 p-3">
+            <div className="font-semibold text-foreground">{tr("settings.rulesetAddTitle")}</div>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-5">
+              <Input
+                value={rsTag}
+                onChange={(e) => setRsTag(e.target.value)}
+                placeholder={tr("settings.rulesetTag")}
+                className="font-mono text-xs"
+                required
+              />
+              <Input
+                type="url"
+                value={rsUrl}
+                onChange={(e) => setRsUrl(e.target.value)}
+                placeholder={tr("settings.rulesetUrl")}
+                className="font-mono text-xs sm:col-span-2"
+                required
+              />
+              <div className="flex gap-1.5">
+                <Select
+                  size="sm"
+                  value={rsFormat}
+                  onChange={(e) => setRsFormat(e.target.value as "binary" | "source")}
+                  aria-label={tr("settings.rulesetFormat")}
+                >
+                  <option value="binary">.srs</option>
+                  <option value="source">.json</option>
+                </Select>
+                <Select
+                  size="sm"
+                  value={rsInterval}
+                  onChange={(e) => setRsInterval(e.target.value)}
+                  aria-label={tr("settings.rulesetInterval")}
+                >
+                  <option value="6h">6h</option>
+                  <option value="12h">12h</option>
+                  <option value="24h">24h</option>
+                  <option value="72h">72h</option>
+                  <option value="168h">7d</option>
+                </Select>
+              </div>
+              <Button type="submit" size="sm" disabled={savingRuleSet || !rsTag.trim() || !rsUrl.trim()}>
+                <Plus className="mr-1 h-3.5 w-3.5" aria-hidden="true" />
+                {tr("settings.rulesetAddBtn")}
+              </Button>
+            </div>
+          </form>
         </CardContent>
       </Card>
         );
@@ -1693,8 +2356,8 @@ export function SettingsLogsView() {
                     }`}
                   >
                     <span className="flex min-w-0 items-center gap-1.5">
-                      <input
-                        type="checkbox"
+                      <Checkbox
+                        size="sm"
                         checked={Boolean(backupModules[item.key])}
                         onChange={(e) =>
                           setBackupModules((prev) => ({
@@ -1712,48 +2375,99 @@ export function SettingsLogsView() {
                 ))}
               </div>
 
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  disabled={selectedBackupKeys.length === 0}
-                  onClick={() => void handleExportBackup()}
-                >
-                  <Download className="mr-1.5 h-4 w-4" aria-hidden="true" />
-                  {tr("settings.exportBackup")}
-                </Button>
-                <div className="relative inline-flex items-center">
-                  <input
-                    id={`${idPrefix}-restore-backup`}
-                    type="file"
-                    accept="application/json,.json"
-                    className="visually-hidden peer"
-                    onChange={(e) => void handleRestoreBackup(e)}
-                  />
-                  <label
-                    htmlFor={`${idPrefix}-restore-backup`}
-                    className="inline-flex min-h-9 cursor-pointer items-center rounded-md border border-input bg-background px-3 py-2 text-xs font-medium hover:bg-accent peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-ring"
+              <div className="space-y-2">
+                <Input
+                  type="password"
+                  value={backupPassphrase}
+                  onChange={(e) => setBackupPassphrase(e.target.value)}
+                  placeholder={tr("settings.backupPassphrase")}
+                />
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={selectedBackupKeys.length === 0 || backupPassphrase.length < 8}
+                    onClick={() => void handleExportBackup(false)}
                   >
-                    <Upload className="mr-1.5 h-4 w-4" aria-hidden="true" />
-                    {tr("settings.restoreBackup")}
-                  </label>
-                </div>
-                <div className="relative inline-flex items-center">
-                  <input
-                    id={`${idPrefix}-merge-backup`}
-                    type="file"
-                    accept="application/json,.json"
-                    className="visually-hidden peer"
-                    onChange={(e) => void handleMergeBackup(e)}
-                  />
-                  <label
-                    htmlFor={`${idPrefix}-merge-backup`}
-                    className="inline-flex min-h-9 cursor-pointer items-center rounded-md border border-input bg-background px-3 py-2 text-xs font-medium hover:bg-accent peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-ring"
+                    <Lock className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+                    {tr("settings.backupExportEncrypted")}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={selectedBackupKeys.length === 0}
+                    title={tr("settings.backupPlainWarn")}
+                    onClick={() => void handleExportBackup(true)}
                   >
-                    <Upload className="mr-1.5 h-4 w-4" aria-hidden="true" />
-                    {tr("settings.mergeBackup")}
-                  </label>
+                    <Download className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+                    {tr("settings.backupExportPlain")}
+                  </Button>
+                  <div className="relative inline-flex items-center">
+                    <input
+                      id={`${idPrefix}-restore-backup`}
+                      type="file"
+                      accept="application/json,.json"
+                      className="visually-hidden peer"
+                      onChange={(e) => void handleRestoreBackup(e)}
+                    />
+                    <label
+                      htmlFor={`${idPrefix}-restore-backup`}
+                      className="inline-flex min-h-9 cursor-pointer items-center rounded-md border border-input bg-background px-3 py-2 text-xs font-medium hover:bg-accent peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-ring"
+                    >
+                      <Upload className="mr-1.5 h-4 w-4" aria-hidden="true" />
+                      {tr("settings.restoreBackup")}
+                    </label>
+                  </div>
+                  <div className="relative inline-flex items-center">
+                    <input
+                      id={`${idPrefix}-merge-backup`}
+                      type="file"
+                      accept="application/json,.json"
+                      className="visually-hidden peer"
+                      onChange={(e) => void handleMergeBackup(e)}
+                    />
+                    <label
+                      htmlFor={`${idPrefix}-merge-backup`}
+                      className="inline-flex min-h-9 cursor-pointer items-center rounded-md border border-input bg-background px-3 py-2 text-xs font-medium hover:bg-accent peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-ring"
+                    >
+                      <Upload className="mr-1.5 h-4 w-4" aria-hidden="true" />
+                      {tr("settings.mergeBackup")}
+                    </label>
+                  </div>
                 </div>
+                {pendingEncryptedImport ? (
+                  <form
+                    onSubmit={(e) => void handleConfirmEncryptedImport(e)}
+                    className="space-y-2 rounded-[8px] border border-primary/40 bg-primary/5 p-2.5"
+                  >
+                    <div className="font-medium text-foreground">{tr("settings.backupDecryptPrompt")}</div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Input
+                        type="password"
+                        className="flex-1 min-w-[10rem]"
+                        value={importPassphrase}
+                        onChange={(e) => setImportPassphrase(e.target.value)}
+                        autoFocus
+                        required
+                      />
+                      <Button type="submit" size="sm">
+                        {tr("action.import")}
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => {
+                          setPendingEncryptedImport(null);
+                          setImportPassphrase("");
+                        }}
+                      >
+                        {tr("action.cancel")}
+                      </Button>
+                    </div>
+                  </form>
+                ) : null}
               </div>
 
               <div className="space-y-2 border-t pt-3">
@@ -1828,15 +2542,76 @@ export function SettingsLogsView() {
                   )}
                   <div className="flex flex-wrap gap-2">
                     {authStatus?.password_lock_enabled ? (
-                      <Button type="button" variant="destructive" size="sm" onClick={() => void handleTogglePasswordLock(false)}>
-                        {tr("settings.disableLock")}
-                      </Button>
+                      <>
+                        <Button type="button" variant="destructive" size="sm" onClick={() => void handleTogglePasswordLock(false)}>
+                          {tr("settings.disableLock")}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setChangePwOpen((o) => !o)}
+                        >
+                          <KeyRound className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+                          {tr("settings.changePasswordBtn")}
+                        </Button>
+                      </>
                     ) : (
                       <Button type="button" size="sm" onClick={() => void handleTogglePasswordLock(true)}>
                         {tr("settings.enableLock")}
                       </Button>
                     )}
                   </div>
+
+                  {authStatus?.password_lock_enabled && changePwOpen ? (
+                    <form
+                      onSubmit={(e) => void handleChangePassword(e)}
+                      className="space-y-2 rounded-[10px] border border-primary/35 bg-primary/5 p-3"
+                    >
+                      <div className="font-semibold text-foreground">{tr("settings.changePasswordTitle")}</div>
+                      <Input
+                        type="password"
+                        placeholder={tr("settings.currentPassword")}
+                        value={changePwCurrent}
+                        onChange={(e) => setChangePwCurrent(e.target.value)}
+                        required
+                      />
+                      <Input
+                        type="password"
+                        placeholder={tr("settings.newPassword")}
+                        value={changePwNew}
+                        onChange={(e) => setChangePwNew(e.target.value)}
+                        minLength={8}
+                        required
+                      />
+                      <Input
+                        type="password"
+                        placeholder={tr("auth.confirmPassword")}
+                        value={changePwConfirm}
+                        onChange={(e) => setChangePwConfirm(e.target.value)}
+                        minLength={8}
+                        required
+                      />
+                      <div className="flex flex-wrap gap-2">
+                        <Button type="submit" size="sm" disabled={changingPw}>
+                          {tr("action.save")}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => {
+                            setChangePwOpen(false);
+                            setChangePwCurrent("");
+                            setChangePwNew("");
+                            setChangePwConfirm("");
+                          }}
+                        >
+                          {tr("action.cancel")}
+                        </Button>
+                      </div>
+                    </form>
+                  ) : null}
 
                   {/* System Biometric Unlock Section */}
                   <div className="space-y-2 rounded-[10px] border border-border bg-muted/30 p-3">
@@ -1902,7 +2677,83 @@ export function SettingsLogsView() {
                 </div>
               ) : null}
 
+              <div className="space-y-2.5 rounded-[10px] border border-border bg-muted/20 p-3">
+                <div className="flex items-center gap-1.5 font-semibold text-foreground">
+                  <Network className="h-4 w-4 text-primary" aria-hidden="true" />
+                  <span>{tr("settings.networkPolicyTitle")}</span>
+                </div>
+
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="font-medium text-foreground">{tr("routing.disableIpv6")}</div>
+                    <p className="text-[11px] leading-snug text-muted-foreground">{tr("routing.disableIpv6Hint")}</p>
+                  </div>
+                  <Switch
+                    aria-label={tr("routing.disableIpv6")}
+                    checked={routing?.disable_ipv6 ?? true}
+                    disabled={savingNetworkPolicy}
+                    onCheckedChange={(checked) => void handleToggleDisableIpv6(checked)}
+                  />
+                </div>
+
+                {!isAndroid ? (
+                  <div className="flex items-center justify-between gap-3 border-t border-border/60 pt-2.5">
+                    <div className="min-w-0 space-y-0.5">
+                      <div className="font-medium text-foreground">{tr("routing.bypassSystemTailscale")}</div>
+                      <p className="text-[11px] leading-snug text-muted-foreground">
+                        {tr("routing.bypassSystemTailscaleHint")}
+                      </p>
+                    </div>
+                    <Switch
+                      aria-label={tr("routing.bypassSystemTailscale")}
+                      checked={routing?.bypass_system_tailscale ?? true}
+                      disabled={savingNetworkPolicy}
+                      onCheckedChange={(checked) => void handleToggleBypassSystemTailscale(checked)}
+                    />
+                  </div>
+                ) : null}
+
+                {!isAndroid ? (
+                  <div className="flex items-center justify-between gap-3 border-t border-border/60 pt-2.5">
+                    <div className="min-w-0 space-y-0.5">
+                      <div className="font-medium text-foreground">{tr("settings.tunStack")}</div>
+                      <p className="text-[11px] leading-snug text-muted-foreground">{tr("settings.tunStackHint")}</p>
+                    </div>
+                    <div className="w-28 shrink-0">
+                      <Select
+                        aria-label={tr("settings.tunStack")}
+                        size="sm"
+                        disabled={savingNetworkPolicy}
+                        value={tunState?.stack || "mixed"}
+                        onChange={(e) => void handleChangeTunStack(e.target.value)}
+                      >
+                        <option value="mixed">mixed</option>
+                        <option value="system">system</option>
+                        <option value="gvisor">gvisor</option>
+                      </Select>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="flex items-center justify-between gap-3 rounded-[10px] border border-border bg-muted/20 p-3">
+                <div className="min-w-0 space-y-0.5">
+                  <div className="font-semibold text-foreground">{tr("settings.allowLanFetch")}</div>
+                  <p className="text-[11px] leading-snug text-muted-foreground">{tr("settings.allowLanFetchDesc")}</p>
+                </div>
+                <Switch
+                  aria-label={tr("settings.allowLanFetch")}
+                  checked={allowLanFetch}
+                  disabled={savingLanFetch}
+                  onCheckedChange={(checked) => void handleToggleAllowLanFetch(checked)}
+                />
+              </div>
+
               <div className="flex flex-wrap items-center gap-2 border-t pt-3">
+                <Button type="button" variant="outline" size="sm" onClick={() => void handleOpenCompiledConfig()}>
+                  <Code2 className="mr-1.5 h-4 w-4 text-primary" aria-hidden="true" />
+                  {tr("settings.viewCompiledConfig")}
+                </Button>
                 {tunState?.sudo_cached ? (
                   <Button
                     type="button"
@@ -2011,7 +2862,23 @@ export function SettingsLogsView() {
             <ScrollText className="h-5 w-5 shrink-0 text-primary" aria-hidden="true" />
             <span>{tr("settings.logsTitle")}</span>
           </CardTitle>
-          <div className="flex min-w-0 flex-1 flex-nowrap items-center justify-end gap-2">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
+            <div className="flex items-center gap-1.5 shrink-0">
+              <span className="text-[11px] text-muted-foreground whitespace-nowrap">{tr("settings.coreLogLevel")}:</span>
+              <div className="w-24 shrink-0">
+                <Select
+                  aria-label={tr("settings.coreLogLevel")}
+                  size="sm"
+                  disabled={savingCoreLogLevel}
+                  value={(routing?.log_level || "warn").toLowerCase()}
+                  onChange={(e) => void handleUpdateCoreLogLevel(e.target.value)}
+                >
+                  <option value="warn">WARN</option>
+                  <option value="info">INFO</option>
+                  <option value="debug">DEBUG</option>
+                </Select>
+              </div>
+            </div>
             <div className="w-24 shrink-0">
               <Select
                 aria-label="Log level"
@@ -2020,7 +2887,7 @@ export function SettingsLogsView() {
                 onChange={(e) => setLogLevelFilter(e.target.value)}
               >
                 <option value="all">ALL</option>
-                <option value="debug">DEBUG</option>
+                {showDebugFilter ? <option value="debug">DEBUG</option> : null}
                 <option value="info">INFO</option>
                 <option value="warn">WARN</option>
                 <option value="error">ERROR</option>
@@ -2053,7 +2920,7 @@ export function SettingsLogsView() {
               filteredLogs.map((l) => {
                 const lvl = l.level.toLowerCase();
                 const cleanMsg = stripAnsiCodes(l.message);
-                const fullCopyText = `[${l.timestamp}] [${l.core}/${lvl.toUpperCase()}] ${cleanMsg}`;
+                const fullCopyText = `[${formatLogFullLocal(l.timestamp)}] [${l.core}/${lvl.toUpperCase()}] ${cleanMsg}`;
                 const badgeClass =
                   lvl === "error" || lvl === "fatal"
                     ? "border-destructive/40 bg-destructive/15 text-destructive"
@@ -2085,7 +2952,7 @@ export function SettingsLogsView() {
                     }}
                     className="cursor-pointer rounded-[6px] px-1.5 py-1 leading-relaxed break-words transition-colors hover:bg-background/70 active:bg-background"
                   >
-                    <span className="text-[11px] text-muted-foreground">{l.timestamp.replace(/^.*T/, "").replace(/[Z+].*$/, "")}</span>{" "}
+                    <span className="text-[11px] text-muted-foreground">{formatLogTimeLocal(l.timestamp)}</span>{" "}
                     <span className={`inline-flex items-center rounded border px-1 py-0 text-[10px] font-semibold uppercase leading-tight ${badgeClass}`}>
                       {l.core}/{lvl}
                     </span>{" "}
@@ -2118,8 +2985,70 @@ export function SettingsLogsView() {
         onImported={async (importedProfile) => {
           await api.saveRouting(importedProfile);
           await refreshAll();
+          if (androidBridge.available() && androidBridge.getVpnStatus()?.active) {
+            androidBridge.prepareAndStartVpn({
+              per_app_mode: importedProfile.per_app_mode || "all",
+              per_app_packages: importedProfile.per_app_packages || [],
+              bypass_lan: importedProfile.bypass_lan,
+              allow_lan_broadcast: Boolean(importedProfile.bypass_lan && importedProfile.allow_lan_broadcast),
+            });
+          }
         }}
       />
+      <ModalDialog
+        open={compiledConfigModal.open}
+        onClose={() => setCompiledConfigModal((m) => ({ ...m, open: false }))}
+        ariaLabel={tr("settings.compiledConfigTitle")}
+        className="max-w-3xl overflow-hidden"
+      >
+        <div className="flex max-h-[85dvh] flex-col overflow-hidden bg-card">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Code2 className="h-4 w-4 text-primary" aria-hidden="true" />
+              <span className="text-sm font-semibold text-foreground">{tr("settings.compiledConfigTitle")}</span>
+              {compiledConfigModal.engine ? (
+                <span className="badge-radius border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                  {compiledConfigModal.engine}
+                </span>
+              ) : null}
+              {compiledConfigModal.redacted ? (
+                <span className="badge-radius border border-emerald-500/35 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                  {tr("settings.compiledConfigRedacted")}
+                </span>
+              ) : null}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={compiledConfigModal.loading || !compiledConfigModal.config}
+                onClick={() => void handleCopyLogLine(compiledConfigModal.config)}
+              >
+                <Copy className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+                {tr("action.copy")}
+              </Button>
+              <button
+                type="button"
+                aria-label={tr("action.close")}
+                onClick={() => setCompiledConfigModal((m) => ({ ...m, open: false }))}
+                className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+          <div className="scrollable-surface flex-1 overflow-auto bg-muted/40 p-4">
+            {compiledConfigModal.loading ? (
+              <div className="py-12 text-center text-xs text-muted-foreground">{tr("common.loadingView")}</div>
+            ) : (
+              <pre className="whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-foreground">
+                {compiledConfigModal.config || "{}"}
+              </pre>
+            )}
+          </div>
+        </div>
+      </ModalDialog>
     </div>
   );
 }

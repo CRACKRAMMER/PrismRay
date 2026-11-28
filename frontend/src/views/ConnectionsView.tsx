@@ -1,23 +1,33 @@
 // SPDX-License-Identifier: MPL-2.0
 
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
   ArrowUpDown,
   Columns3,
+  History,
   Network,
   Pause,
   Play,
+  Plus,
   RotateCcw,
   Search,
   Trash2,
   X,
 } from "lucide-react";
-import { api, type ConnectionItem, formatApiError } from "../lib/api.ts";
+import {
+  api,
+  type ConnectionItem,
+  type ConnectionsSnapshot,
+  type RoutingRule,
+  formatApiError,
+  isAndroidClient,
+} from "../lib/api.ts";
 import {
   formatBytes,
   formatDurationShort,
+  formatRate,
   resolveConnectionRoute,
   type ResolvedConnectionRoute,
 } from "../lib/helpers.ts";
@@ -36,6 +46,7 @@ import { ColumnResizeHandle } from "../components/ColumnResizeHandle.tsx";
 import { type ColumnSpecMap, useResizableColumns } from "../lib/useResizableColumns.ts";
 import { Button } from "../components/ui/button.tsx";
 import { Card, CardContent } from "../components/ui/card.tsx";
+import { Checkbox } from "../components/ui/checkbox.tsx";
 import { Input } from "../components/ui/input.tsx";
 import { Select } from "../components/ui/select.tsx";
 
@@ -88,14 +99,39 @@ interface EnrichedConnection {
   route: ResolvedConnectionRoute;
   totalBytes: number;
   startMs: number;
+  upRate: number;
+  downRate: number;
+  closedAt?: number;
 }
 
-export function ConnectionsView() {
+interface ClosedConnectionEntry {
+  item: ConnectionItem;
+  closedAt: number;
+}
+
+const MAX_CLOSED_HISTORY = 150;
+
+function isLikelyIpAddress(host: string): boolean {
+  const h = host.trim();
+  if (!h) return false;
+  if (h.includes(":")) return true;
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(h);
+}
+
+function extractProcessName(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  const parts = trimmed.split(/[\\/]/);
+  return parts[parts.length - 1] || trimmed;
+}
+
+export function ConnectionsView({ isActive = true }: { isActive?: boolean } = {}) {
   const {
     tr,
     locale,
     nodes,
     groups,
+    routing,
     connectionColumns,
     setConnectionColumns,
     refreshAll,
@@ -111,34 +147,140 @@ export function ConnectionsView() {
     startResize: startConnColResize,
     resetColumn: resetConnColWidth,
   } = useResizableColumns("connections-live", CONN_COL_SPECS);
+  const [viewMode, setViewMode] = useState<"active" | "closed">("active");
   const [query, setQuery] = useState("");
   const [protoFilter, setProtoFilter] = useState<string>("all");
   const [engineFilter, setEngineFilter] = useState<string>("all");
   const [outboundFilter, setOutboundFilter] = useState<string>("all");
   const [paused, setPaused] = useState(false);
   const [frozenList, setFrozenList] = useState<ConnectionItem[]>(connections.connections || []);
+  const [manualSnapshot, setManualSnapshot] = useState<ConnectionsSnapshot | null>(null);
   const [colMenuOpen, setColMenuOpen] = useState(false);
+  const colMenuRef = useRef<HTMLDivElement>(null);
   const [sortCol, setSortCol] = useState<SortColumn>("traffic");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [sortStatus, setSortStatus] = useState("");
   const [closingAll, setClosingAll] = useState(false);
+  const [addingQuickRule, setAddingQuickRule] = useState(false);
   const [inspectedConnId, setInspectedConnId] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!paused) {
-      setFrozenList(connections.connections || []);
-    }
-  }, [connections.connections, paused]);
+  const prevSamplesRef = useRef<Map<string, { up: number; down: number; ts: number; item: ConnectionItem }>>(
+    new Map(),
+  );
+  const [liveRates, setLiveRates] = useState<Record<string, { upRate: number; downRate: number }>>({});
+  const [closedHistory, setClosedHistory] = useState<ClosedConnectionEntry[]>([]);
 
-  const activeList = paused ? frozenList : connections.connections || [];
+  useEffect(() => {
+    setManualSnapshot(null);
+    const now = Date.now();
+    const current = connections.connections || [];
+    const currentIds = new Set<string>();
+    const nextRates: Record<string, { upRate: number; downRate: number }> = {};
+
+    for (const c of current) {
+      currentIds.add(c.id);
+      const prev = prevSamplesRef.current.get(c.id);
+      if (prev) {
+        const dtSec = (now - prev.ts) / 1000;
+        if (dtSec >= 0.2) {
+          nextRates[c.id] = {
+            upRate: Math.max(0, (c.upload - prev.up) / dtSec),
+            downRate: Math.max(0, (c.download - prev.down) / dtSec),
+          };
+        }
+      }
+    }
+
+    const newlyClosed: ClosedConnectionEntry[] = [];
+    for (const [id, prev] of prevSamplesRef.current.entries()) {
+      if (!currentIds.has(id)) {
+        newlyClosed.push({ item: prev.item, closedAt: now });
+      }
+    }
+
+    const nextMap = new Map<string, { up: number; down: number; ts: number; item: ConnectionItem }>();
+    for (const c of current) {
+      nextMap.set(c.id, { up: c.upload || 0, down: c.download || 0, ts: now, item: c });
+    }
+    prevSamplesRef.current = nextMap;
+
+    if (newlyClosed.length > 0) {
+      setClosedHistory((prev) => {
+        const seen = new Set<string>();
+        const merged: ClosedConnectionEntry[] = [];
+        for (const entry of [...newlyClosed.reverse(), ...prev]) {
+          if (!seen.has(entry.item.id)) {
+            seen.add(entry.item.id);
+            merged.push(entry);
+            if (merged.length >= MAX_CLOSED_HISTORY) break;
+          }
+        }
+        return merged;
+      });
+    }
+
+    if (isActive && !paused) {
+      setLiveRates(nextRates);
+      setFrozenList(current);
+    }
+  }, [connections, paused, isActive]);
+
+  useEffect(() => {
+    if (!colMenuOpen || isMobile) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (colMenuRef.current && !colMenuRef.current.contains(e.target as Node)) {
+        setColMenuOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setColMenuOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [colMenuOpen, isMobile]);
+
+  const effectiveSnapshot = manualSnapshot ?? connections;
+  const activeList = paused ? frozenList : isActive ? effectiveSnapshot.connections || [] : [];
+  const closedAtMap = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const entry of closedHistory) {
+      map.set(entry.item.id, entry.closedAt);
+    }
+    return map;
+  }, [closedHistory]);
+  const displaySourceList = viewMode === "closed" ? closedHistory.map((h) => h.item) : activeList;
+
+  const nodeMap = useMemo(() => {
+    const map = new Map<string, (typeof nodes)[number]>();
+    for (const n of nodes) {
+      if (n.id) map.set(n.id, n);
+    }
+    return map;
+  }, [nodes]);
+
+  const groupMap = useMemo(() => {
+    const map = new Map<string, (typeof groups)[number]>();
+    for (const g of groups) {
+      if (g.id) map.set(g.id, g);
+    }
+    return map;
+  }, [groups]);
 
   const enriched = useMemo<EnrichedConnection[]>(() => {
-    return activeList.map((item) => {
+    if (!isActive || displaySourceList.length === 0) return [];
+    return displaySourceList.map((item) => {
       const m = item.metadata;
       const dest = `${m.host || m.destinationIP || "unknown"}:${m.destinationPort || ""}`;
       const source = m.sourceIP ? `${m.sourceIP}:${m.sourcePort || ""}` : "--";
-      const route = resolveConnectionRoute(item.chains, nodes, groups);
+      const route = resolveConnectionRoute(item.chains, nodes, groups, nodeMap, groupMap);
       const startMs = Date.parse(item.start) || 0;
+      const rate = viewMode === "active" ? liveRates[item.id] : undefined;
       return {
         item,
         dest,
@@ -146,9 +288,12 @@ export function ConnectionsView() {
         route,
         totalBytes: (item.upload || 0) + (item.download || 0),
         startMs,
+        upRate: rate?.upRate ?? 0,
+        downRate: rate?.downRate ?? 0,
+        closedAt: viewMode === "closed" ? closedAtMap.get(item.id) : undefined,
       };
     });
-  }, [activeList, nodes, groups]);
+  }, [isActive, displaySourceList, nodes, groups, nodeMap, groupMap, viewMode, liveRates, closedAtMap]);
 
   const uniqueOutbounds = useMemo(() => {
     const names = new Set<string>();
@@ -247,7 +392,9 @@ export function ConnectionsView() {
     setClosingAll(true);
     try {
       await api.closeAllConnections();
-      await refreshAll();
+      const fresh = await api.getConnections();
+      setManualSnapshot(fresh);
+      if (paused) setFrozenList(fresh.connections || []);
     } catch (err) {
       notify(formatApiError(err), "error");
     } finally {
@@ -258,9 +405,76 @@ export function ConnectionsView() {
   const handleCloseOne = async (id: string) => {
     try {
       await api.closeConnection(id);
-      await refreshAll();
+      const fresh = await api.getConnections();
+      setManualSnapshot(fresh);
+      if (paused) setFrozenList(fresh.connections || []);
     } catch (err) {
       notify(formatApiError(err), "error");
+    }
+  };
+
+  const handleQuickAddRule = async (
+    entry: EnrichedConnection,
+    kind: "target" | "process",
+    outbound: "direct" | "proxy" | "block",
+  ) => {
+    const m = entry.item.metadata;
+    const host = (m.host || "").trim();
+    const destIp = (m.destinationIP || "").trim();
+    const procName = extractProcessName(m.processPath || "");
+
+    const newRule: RoutingRule = {
+      id: `rule-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      enabled: true,
+      outbound,
+    };
+    let label = "";
+
+    if (kind === "target") {
+      if (host && !isLikelyIpAddress(host)) {
+        newRule.domain_suffix = [host];
+        label = host;
+      } else if (destIp) {
+        const cidr = destIp.includes("/") ? destIp : destIp.includes(":") ? `${destIp}/128` : `${destIp}/32`;
+        newRule.ip_cidr = [cidr];
+        label = cidr;
+      } else {
+        return;
+      }
+    } else {
+      if (!procName) return;
+      const looksAndroidPkg = isAndroidClient() && procName.includes(".") && !procName.includes(" ");
+      if (looksAndroidPkg) {
+        newRule.package_name = [procName];
+      } else {
+        newRule.process_name = [procName];
+      }
+      label = procName;
+    }
+
+    const outboundLabel =
+      outbound === "direct"
+        ? tr("routing.outboundDirect")
+        : outbound === "block"
+          ? tr("routing.outboundBlock")
+          : tr("routing.outboundMainProxy");
+    newRule.name = `${label} -> ${outboundLabel}`;
+
+    setAddingQuickRule(true);
+    try {
+      const base = routing || (await api.getRouting());
+      const nextRules = [newRule, ...(base.custom_rules || [])];
+      await api.saveRouting({
+        ...base,
+        custom_rules_enabled: true,
+        custom_rules: nextRules,
+      });
+      await refreshAll();
+      notify(tr("conns.quickRuleCreated", { target: label, outbound: outboundLabel }));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setAddingQuickRule(false);
     }
   };
 
@@ -339,7 +553,7 @@ export function ConnectionsView() {
               className="flex cursor-pointer items-center justify-between gap-2 rounded-[6px] px-2 py-1.5 max-md:min-h-12 hover:bg-muted/60"
             >
               <span className="text-foreground">{tr(COLUMN_LABEL_KEY[colId])}</span>
-              <input type="checkbox" checked={checked} onChange={() => toggleColumn(colId)} />
+              <Checkbox size="sm" checked={checked} onChange={() => toggleColumn(colId)} />
             </label>
           );
         })}
@@ -362,34 +576,75 @@ export function ConnectionsView() {
               <Network className="h-4 w-4 text-primary" aria-hidden="true" />
               {tr("connections.title")}
             </h2>
-            <span className="badge-radius border border-primary/30 bg-primary/15 px-2 py-0.5 text-[11px] font-semibold text-primary mono-num">
-              {sortedItems.length}
-            </span>
-            {paused ? (
+            <div className="inline-flex rounded-[6px] border border-border bg-background p-0.5 text-[11px]" role="tablist">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={viewMode === "active"}
+                onClick={() => setViewMode("active")}
+                className={`inline-flex items-center gap-1 rounded-[4px] px-2 py-0.5 font-medium transition-colors ${
+                  viewMode === "active"
+                    ? "bg-primary/15 text-primary"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <span>{tr("conns.tabActive")}</span>
+                <span className="mono-num opacity-80">({activeList.length})</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={viewMode === "closed"}
+                onClick={() => setViewMode("closed")}
+                className={`inline-flex items-center gap-1 rounded-[4px] px-2 py-0.5 font-medium transition-colors ${
+                  viewMode === "closed"
+                    ? "bg-primary/15 text-primary"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <History className="h-3 w-3" aria-hidden="true" />
+                <span>{tr("conns.tabClosed")}</span>
+                <span className="mono-num opacity-80">({closedHistory.length})</span>
+              </button>
+            </div>
+            {paused && viewMode === "active" ? (
               <span className="badge-radius border border-amber-500/30 bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-400">
                 {tr("conns.pausedBadge")}
               </span>
             ) : null}
           </div>
           <p className="mono-num text-[11px] text-muted-foreground">
-            {tr("conns.showingCount", { shown: sortedItems.length, total: activeList.length })} ·{" "}
-            {tr("conns.totalUpload")}: {formatBytes(connections.uploadTotal)} · {tr("conns.totalDownload")}:{" "}
-            {formatBytes(connections.downloadTotal)}
+            {tr("conns.showingCount", { shown: sortedItems.length, total: displaySourceList.length })} ·{" "}
+            {tr("conns.totalUpload")}: {formatBytes(effectiveSnapshot.uploadTotal)} · {tr("conns.totalDownload")}:{" "}
+            {formatBytes(effectiveSnapshot.downloadTotal)}
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-1.5">
-          <Button
-            type="button"
-            variant={paused ? "default" : "outline"}
-            size="sm"
-            onClick={() => setPaused((p) => !p)}
-          >
-            {paused ? <Play className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" /> : <Pause className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />}
-            {paused ? tr("conns.resume") : tr("conns.pause")}
-          </Button>
+          {viewMode === "active" ? (
+            <Button
+              type="button"
+              variant={paused ? "default" : "outline"}
+              size="sm"
+              onClick={() => setPaused((p) => !p)}
+            >
+              {paused ? <Play className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" /> : <Pause className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />}
+              {paused ? tr("conns.resume") : tr("conns.pause")}
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={closedHistory.length === 0}
+              onClick={() => setClosedHistory([])}
+            >
+              <Trash2 className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+              {tr("conns.clearClosed")}
+            </Button>
+          )}
 
-          <div className="relative hidden md:block">
+          <div ref={colMenuRef} className="relative hidden md:block">
             <Button
               type="button"
               variant="outline"
@@ -401,22 +656,24 @@ export function ConnectionsView() {
               {tr("conns.columns")}
             </Button>
             {colMenuOpen && !isMobile ? (
-              <div className="absolute right-0 z-30 mt-1.5 w-56 rounded-[10px] border border-border bg-popover p-3">
+              <div className="absolute right-0 z-30 mt-1.5 w-56 rounded-[10px] border border-border bg-popover p-3 shadow-lg">
                 {columnSelectorBody}
               </div>
             ) : null}
           </div>
 
-          <Button
-            type="button"
-            variant="destructive"
-            size="sm"
-            disabled={closingAll || activeList.length === 0}
-            onClick={() => void handleCloseAll()}
-          >
-            <Trash2 className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
-            {tr("connections.closeAll")}
-          </Button>
+          {viewMode === "active" ? (
+            <Button
+              type="button"
+              variant="destructive"
+              size="sm"
+              disabled={closingAll || activeList.length === 0}
+              onClick={() => void handleCloseAll()}
+            >
+              <Trash2 className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+              {tr("connections.closeAll")}
+            </Button>
+          ) : null}
         </div>
       </div>
 
@@ -478,19 +735,23 @@ export function ConnectionsView() {
       ) : (
         <>
           <div className="space-y-2 md:hidden">
-            {sortedItems.map(({ item, dest, route }) => (
+            {sortedItems.map(({ item, dest, route, upRate, downRate }) => (
               <SwipeActionRow
                 key={item.id}
                 className="rounded-[10px] border border-border bg-card"
-                actions={[
-                  {
-                    key: "close",
-                    label: tr("action.close"),
-                    icon: <X className="h-4 w-4" />,
-                    tone: "danger",
-                    onClick: () => void handleCloseOne(item.id),
-                  },
-                ]}
+                actions={
+                  viewMode === "active"
+                    ? [
+                        {
+                          key: "close",
+                          label: tr("action.close"),
+                          icon: <X className="h-4 w-4" />,
+                          tone: "danger",
+                          onClick: () => void handleCloseOne(item.id),
+                        },
+                      ]
+                    : []
+                }
               >
                 <div
                   role="button"
@@ -514,6 +775,11 @@ export function ConnectionsView() {
                       ↑{formatBytes(item.upload)} ↓{formatBytes(item.download)}
                     </span>
                   </div>
+                  {viewMode === "active" && (upRate > 0 || downRate > 0) ? (
+                    <div className="text-right mono-num text-[11px] text-muted-foreground">
+                      ↑{formatRate(upRate)} · ↓{formatRate(downRate)}
+                    </div>
+                  ) : null}
                 </div>
               </SwipeActionRow>
             ))}
@@ -576,7 +842,7 @@ export function ConnectionsView() {
                 </tr>
               </thead>
               <tbody>
-                {sortedItems.map(({ item, dest, source, route }) => {
+                {sortedItems.map(({ item, dest, source, route, upRate, downRate, closedAt }) => {
                   const m = item.metadata;
                   const chainText = (item.chains || []).join(" → ");
                   const isSelected = inspectedConnId === item.id;
@@ -657,13 +923,20 @@ export function ConnectionsView() {
                           case "traffic":
                             return (
                               <td key={colId} data-label={colLabel} className="whitespace-nowrap text-xs tabular-nums text-foreground">
-                                ↑ {formatBytes(item.upload)} / ↓ {formatBytes(item.download)}
+                                <div>
+                                  ↑ {formatBytes(item.upload)} / ↓ {formatBytes(item.download)}
+                                </div>
+                                {viewMode === "active" && (upRate > 0 || downRate > 0) ? (
+                                  <div className="text-[10px] text-muted-foreground">
+                                    ↑ {formatRate(upRate)} · ↓ {formatRate(downRate)}
+                                  </div>
+                                ) : null}
                               </td>
                             );
                           case "duration":
                             return (
                               <td key={colId} data-label={colLabel} className="whitespace-nowrap text-xs tabular-nums text-muted-foreground">
-                                {formatDurationShort(item.start, nowMs)}
+                                {formatDurationShort(item.start, closedAt ?? nowMs)}
                               </td>
                             );
                           case "source":
@@ -675,14 +948,18 @@ export function ConnectionsView() {
                           case "action":
                             return (
                               <td key={colId} data-label={colLabel} onClick={(e) => e.stopPropagation()}>
-                                <button
-                                  type="button"
-                                  onClick={() => void handleCloseOne(item.id)}
-                                  aria-label={`${tr("action.close")} ${dest}`}
-                                  className="inline-flex h-7 w-7 items-center justify-center rounded-[6px] text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
-                                >
-                                  <X className="h-3.5 w-3.5" aria-hidden="true" />
-                                </button>
+                                {viewMode === "active" ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleCloseOne(item.id)}
+                                    aria-label={`${tr("action.close")} ${dest}`}
+                                    className="inline-flex h-7 w-7 items-center justify-center rounded-[6px] text-muted-foreground hover:bg-destructive/15 hover:text-destructive"
+                                  >
+                                    <X className="h-3.5 w-3.5" aria-hidden="true" />
+                                  </button>
+                                ) : (
+                                  <span className="text-[10px] text-muted-foreground">--</span>
+                                )}
                               </td>
                             );
                         }
@@ -732,8 +1009,18 @@ export function ConnectionsView() {
               </div>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-muted-foreground">{tr("conns.colDuration")}</span>
-                <span className="mono-num text-foreground">{formatDurationShort(inspectedEntry.item.start, nowMs)}</span>
+                <span className="mono-num text-foreground">
+                  {formatDurationShort(inspectedEntry.item.start, inspectedEntry.closedAt ?? nowMs)}
+                </span>
               </div>
+              {inspectedEntry.closedAt ? (
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-muted-foreground">{tr("conns.closedAt")}</span>
+                  <span className="mono-num text-foreground">
+                    {new Date(inspectedEntry.closedAt).toLocaleTimeString([], { hour12: false })}
+                  </span>
+                </div>
+              ) : null}
             </div>
 
             <div className="rounded-[10px] border border-border bg-muted/30 p-3 space-y-2">
@@ -743,6 +1030,14 @@ export function ConnectionsView() {
                   ↑ {formatBytes(inspectedEntry.item.upload)} / ↓ {formatBytes(inspectedEntry.item.download)}
                 </span>
               </div>
+              {viewMode === "active" && (inspectedEntry.upRate > 0 || inspectedEntry.downRate > 0) ? (
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-muted-foreground">{tr("conns.liveSpeed")}</span>
+                  <span className="mono-num text-foreground">
+                    ↑ {formatRate(inspectedEntry.upRate)} / ↓ {formatRate(inspectedEntry.downRate)}
+                  </span>
+                </div>
+              ) : null}
               <div className="space-y-0.5">
                 <div className="text-muted-foreground">{tr("conns.colSource")}</div>
                 <div className="mono-num text-foreground break-all">{inspectedEntry.source || "--"}</div>
@@ -774,21 +1069,113 @@ export function ConnectionsView() {
               </div>
             </div>
 
-            <div className="flex justify-end gap-2">
-              <Button
-                type="button"
-                variant="destructive"
-                size="sm"
-                onClick={() => {
-                  const id = inspectedEntry.item.id;
-                  setInspectedConnId(null);
-                  void handleCloseOne(id);
-                }}
-              >
-                <X className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
-                {tr("action.close")}
-              </Button>
-            </div>
+            {/* One-Click Create Routing Rule */}
+            {(() => {
+              const host = (inspectedEntry.item.metadata.host || "").trim();
+              const destIp = (inspectedEntry.item.metadata.destinationIP || "").trim();
+              const targetLabel = host && !isLikelyIpAddress(host) ? host : destIp;
+              const procName = extractProcessName(inspectedEntry.item.metadata.processPath || "");
+              if (!targetLabel && !procName) return null;
+              return (
+                <div className="rounded-[10px] border border-border bg-muted/30 p-3 space-y-2.5">
+                  <div className="flex items-center gap-1.5 font-semibold text-foreground">
+                    <Plus className="h-3.5 w-3.5 text-primary" aria-hidden="true" />
+                    <span>{tr("conns.quickRuleTitle")}</span>
+                  </div>
+                  {targetLabel ? (
+                    <div className="space-y-1">
+                      <div className="truncate font-mono text-[11px] text-muted-foreground" title={targetLabel}>
+                        {host && !isLikelyIpAddress(host) ? tr("conns.quickRuleByDomain") : tr("conns.quickRuleByIp")}:{" "}
+                        <span className="text-foreground">{targetLabel}</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={addingQuickRule}
+                          onClick={() => void handleQuickAddRule(inspectedEntry, "target", "direct")}
+                        >
+                          {tr("routing.outboundDirect")}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={addingQuickRule}
+                          onClick={() => void handleQuickAddRule(inspectedEntry, "target", "proxy")}
+                        >
+                          {tr("routing.outboundMainProxy")}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={addingQuickRule}
+                          onClick={() => void handleQuickAddRule(inspectedEntry, "target", "block")}
+                        >
+                          {tr("routing.outboundBlock")}
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
+                  {procName ? (
+                    <div className="space-y-1 border-t border-border/60 pt-2">
+                      <div className="truncate font-mono text-[11px] text-muted-foreground" title={procName}>
+                        {tr("conns.quickRuleByProcess")}: <span className="text-foreground">{procName}</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={addingQuickRule}
+                          onClick={() => void handleQuickAddRule(inspectedEntry, "process", "direct")}
+                        >
+                          {tr("routing.outboundDirect")}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={addingQuickRule}
+                          onClick={() => void handleQuickAddRule(inspectedEntry, "process", "proxy")}
+                        >
+                          {tr("routing.outboundMainProxy")}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={addingQuickRule}
+                          onClick={() => void handleQuickAddRule(inspectedEntry, "process", "block")}
+                        >
+                          {tr("routing.outboundBlock")}
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })()}
+
+            {viewMode === "active" ? (
+              <div className="flex justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="destructive"
+                  size="sm"
+                  onClick={() => {
+                    const id = inspectedEntry.item.id;
+                    setInspectedConnId(null);
+                    void handleCloseOne(id);
+                  }}
+                >
+                  <X className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+                  {tr("action.close")}
+                </Button>
+              </div>
+            ) : null}
           </div>
         ) : null}
       </ContextInspector>

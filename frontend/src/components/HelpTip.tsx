@@ -57,7 +57,7 @@ export interface HelpTipProps {
  */
 export function HelpTip({
   text,
-  ariaLabel = "说明",
+  ariaLabel = "Info",
   className = "",
   tone = "muted",
 }: HelpTipProps) {

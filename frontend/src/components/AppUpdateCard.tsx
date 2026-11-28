@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: MPL-2.0
 
 import { useCallback, useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   AlertCircle,
   ArrowUpCircle,
   CheckCircle2,
-  Copy,
   Download,
   ExternalLink,
   Loader2,
   RefreshCw,
 } from "lucide-react";
 import {
+  androidBridge,
   api,
   formatApiError,
   isAndroidClient,
@@ -23,6 +22,15 @@ import {
 import { formatBytes } from "../lib/helpers.ts";
 import { useAppStore } from "../store/appStore.ts";
 import { Button } from "./ui/button.tsx";
+import { Checkbox } from "./ui/checkbox.tsx";
+
+function isSafeHttpsUrl(raw: string): boolean {
+  try {
+    return new URL(raw).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 
 export const AUTO_UPDATE_CHECK_STORAGE_KEY = "prismray.autoUpdateCheck";
 export const LAST_UPDATE_CHECK_TS_KEY = "prismray.lastUpdateCheckTs";
@@ -70,7 +78,10 @@ export function saveCachedUpdateResult(result: AppUpdateCheckResult): void {
 }
 
 async function openExternalLink(url: string): Promise<void> {
-  if (!url) return;
+  if (!url || !isSafeHttpsUrl(url)) return;
+  if (androidBridge.openExternalUrl(url)) {
+    return;
+  }
   if (isDesktop) {
     try {
       await openUrl(url);
@@ -82,45 +93,21 @@ async function openExternalLink(url: string): Promise<void> {
   window.open(url, "_blank", "noopener,noreferrer");
 }
 
-interface TauriPendingUpdate {
-  version: string;
-  body?: string;
-  downloadAndInstall: (onEvent?: (event: { event: string; data?: { contentLength?: number; chunkLength?: number } }) => void) => Promise<void>;
-}
-
 export function AppUpdateCard() {
-  const { tr, notify } = useAppStore();
+  const { tr, notify, pendingAction, consumePendingAction } = useAppStore();
   const [checking, setChecking] = useState(false);
-  const [installing, setInstalling] = useState(false);
-  const [installProgress, setInstallProgress] = useState<number | null>(null);
+  const [apkPhase, setApkPhase] = useState<string>("");
+  const [apkProgress, setApkProgress] = useState<number>(0);
   const [includePrerelease, setIncludePrerelease] = useState(false);
   const [autoCheck, setAutoCheck] = useState<boolean>(() => isAutoUpdateCheckEnabled());
   const [result, setResult] = useState<AppUpdateCheckResult | null>(() => loadCachedUpdateResult());
-  const [tauriUpdate, setTauriUpdate] = useState<TauriPendingUpdate | null>(null);
+  const isAndroid = isAndroidClient();
 
   const runCheck = useCallback(
     async (silent = false) => {
       setChecking(true);
-      setTauriUpdate(null);
       try {
-        // 1. Check signed Tauri desktop updater first if configured.
-        if (isDesktop && !isAndroidClient()) {
-          try {
-            const updaterMod = await import("@tauri-apps/plugin-updater");
-            const found = await updaterMod.check();
-            if (found && found.available) {
-              setTauriUpdate({
-                version: found.version,
-                body: found.body,
-                downloadAndInstall: (cb) => found.downloadAndInstall(cb as never),
-              });
-            }
-          } catch {
-            // Updater endpoint/pubkey may not be configured; fall back seamlessly to GitHub Releases.
-          }
-        }
-
-        // 2. Query backend /api/app/update-check (GitHub Releases with proxy fallback & platform matching).
+        // Query backend /api/app/update-check (GitHub Releases with proxy fallback & platform matching).
         const data = await api.checkAppUpdate(includePrerelease);
         setResult(data);
         saveCachedUpdateResult(data);
@@ -148,12 +135,69 @@ export function AppUpdateCard() {
   );
 
   useEffect(() => {
+    if (pendingAction === "update-check" && consumePendingAction("update-check")) {
+      void runCheck(false);
+    }
+  }, [pendingAction, consumePendingAction, runCheck]);
+
+  useEffect(() => {
     const onTrigger = () => {
       void runCheck(false);
     };
+    const onApkProgress = (ev: Event) => {
+      const detail = (
+        ev as CustomEvent<{
+          phase?: string;
+          progress?: number;
+          message?: string;
+        }>
+      ).detail;
+      if (!detail?.phase) return;
+      setApkPhase(detail.phase);
+      setApkProgress(Number(detail.progress || 0));
+      if (detail.phase === "error") {
+        notify(detail.message || tr("update.failed"), "error");
+        setApkPhase("");
+      } else if (detail.phase === "permission_required") {
+        notify(tr("update.androidGrantUnknown"), "warning");
+        setApkPhase("");
+      } else if (detail.phase === "installing") {
+        notify(tr("update.androidLaunching"));
+        window.setTimeout(() => setApkPhase(""), 2000);
+      }
+    };
     window.addEventListener(TRIGGER_UPDATE_CHECK_EVENT, onTrigger);
-    return () => window.removeEventListener(TRIGGER_UPDATE_CHECK_EVENT, onTrigger);
-  }, [runCheck]);
+    window.addEventListener("prismray-apk-update-progress", onApkProgress);
+    return () => {
+      window.removeEventListener(TRIGGER_UPDATE_CHECK_EVENT, onTrigger);
+      window.removeEventListener("prismray-apk-update-progress", onApkProgress);
+    };
+  }, [runCheck, notify, tr]);
+
+  const assetSha256 = (result?.recommended_asset?.sha256 || "").trim().toLowerCase();
+  const hasVerifiedApkSha = /^[a-f0-9]{64}$/.test(assetSha256);
+  const canAndroidInAppInstall =
+    isAndroid &&
+    typeof window.PrismRayAndroid?.downloadAndInstallApk === "function" &&
+    Boolean(result?.recommended_asset?.name?.toLowerCase().endsWith(".apk")) &&
+    hasVerifiedApkSha;
+
+  const handleAndroidInAppInstall = () => {
+    const asset = result?.recommended_asset;
+    if (!asset?.download_url || !hasVerifiedApkSha || !isSafeHttpsUrl(asset.download_url)) {
+      notify(tr("update.failed"), "error");
+      return;
+    }
+    setApkPhase("downloading");
+    setApkProgress(0);
+    const ok = androidBridge.downloadAndInstallApk(asset.download_url, assetSha256);
+    if (!ok) {
+      setApkPhase("");
+      if (result?.release_url && isSafeHttpsUrl(result.release_url)) {
+        void openExternalLink(result.release_url);
+      }
+    }
+  };
 
   const toggleAutoCheck = (next: boolean) => {
     setAutoCheck(next);
@@ -164,45 +208,10 @@ export function AppUpdateCard() {
     }
   };
 
-  const handleInstallTauriUpdate = async () => {
-    if (!tauriUpdate) return;
-    setInstalling(true);
-    setInstallProgress(0);
-    try {
-      await invoke("prepare_update");
-      let total = 0;
-      let downloaded = 0;
-      await tauriUpdate.downloadAndInstall((evt) => {
-        if (evt.event === "Started" && evt.data?.contentLength) {
-          total = evt.data.contentLength;
-        } else if (evt.event === "Progress" && evt.data?.chunkLength) {
-          downloaded += evt.data.chunkLength;
-          if (total > 0) {
-            setInstallProgress(Math.min(100, Math.round((downloaded / total) * 100)));
-          }
-        } else if (evt.event === "Finished") {
-          setInstallProgress(100);
-        }
-      });
-    } catch (err) {
-      notify(formatApiError(err), "error");
-      setInstalling(false);
-      setInstallProgress(null);
-    }
-  };
-
-  const handleCopyCommand = async (cmd: string) => {
-    try {
-      await navigator.clipboard.writeText(cmd);
-      notify(tr("update.copiedCmd"));
-    } catch {
-      // Ignore clipboard denial.
-    }
-  };
-
-  const effectiveHasUpdate = Boolean(tauriUpdate || result?.has_update);
-  const effectiveLatest = tauriUpdate?.version || result?.latest_version || "";
-  const effectiveNotes = tauriUpdate?.body || result?.release_notes || "";
+  const effectiveHasUpdate = Boolean(result?.has_update);
+  const effectiveLatest = result?.latest_version || "";
+  const effectiveNotes = result?.release_notes || "";
+  const fallbackVersion = tr("app.version").replace(/^v/i, "");
 
   return (
     <div className="space-y-3 rounded-[10px] border border-border bg-muted/30 p-3.5">
@@ -211,7 +220,7 @@ export function AppUpdateCard() {
           <ArrowUpCircle className="h-4 w-4 shrink-0 text-primary" aria-hidden="true" />
           <span className="font-semibold text-foreground">{tr("update.title")}</span>
           <span className="rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[11px] text-foreground">
-            v{result?.current_version || "1.0.1"}
+            v{result?.current_version || fallbackVersion}
           </span>
           {result?.platform ? (
             <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
@@ -241,29 +250,23 @@ export function AppUpdateCard() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {tauriUpdate ? (
-            <Button type="button" size="sm" disabled={installing} onClick={() => void handleInstallTauriUpdate()}>
-              {installing ? (
+          {effectiveHasUpdate && result?.recommended_asset && canAndroidInAppInstall ? (
+            <Button
+              type="button"
+              size="sm"
+              disabled={apkPhase === "downloading" || apkPhase === "verifying"}
+              onClick={handleAndroidInAppInstall}
+            >
+              {apkPhase === "downloading" || apkPhase === "verifying" ? (
                 <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden="true" />
               ) : (
                 <Download className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
               )}
-              {installing
-                ? `${tr("update.installing")}${installProgress !== null ? ` ${installProgress}%` : ""}`
-                : tr("update.installNow")}
-            </Button>
-          ) : null}
-
-          {effectiveHasUpdate && result?.recommended_asset ? (
-            <Button
-              type="button"
-              size="sm"
-              variant={tauriUpdate ? "outline" : "default"}
-              onClick={() => void openExternalLink(result.recommended_asset!.download_url)}
-            >
-              <Download className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
-              {tr("update.downloadInstaller")}
-              {result.recommended_asset.size > 0 ? ` (${formatBytes(result.recommended_asset.size)})` : ""}
+              {apkPhase === "downloading"
+                ? tr("update.androidDownloading", { pct: apkProgress })
+                : apkPhase === "verifying"
+                  ? tr("update.androidVerifying")
+                  : `${tr("update.androidInstallBtn")}${result.recommended_asset.size > 0 ? ` (${formatBytes(result.recommended_asset.size)})` : ""}`}
             </Button>
           ) : null}
 
@@ -271,7 +274,7 @@ export function AppUpdateCard() {
             <Button
               type="button"
               size="sm"
-              variant="outline"
+              variant={effectiveHasUpdate && !canAndroidInAppInstall ? "default" : "outline"}
               onClick={() => void openExternalLink(result.release_url!)}
             >
               <ExternalLink className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
@@ -290,18 +293,16 @@ export function AppUpdateCard() {
       <div className="flex flex-wrap items-center justify-between gap-3 text-[11px] text-muted-foreground">
         <div className="flex flex-wrap items-center gap-4">
           <label className="inline-flex cursor-pointer items-center gap-1.5">
-            <input
-              type="checkbox"
-              className="accent-primary"
+            <Checkbox
+              size="sm"
               checked={autoCheck}
               onChange={(e) => toggleAutoCheck(e.target.checked)}
             />
             <span>{tr("update.autoCheck")}</span>
           </label>
           <label className="inline-flex cursor-pointer items-center gap-1.5">
-            <input
-              type="checkbox"
-              className="accent-primary"
+            <Checkbox
+              size="sm"
               checked={includePrerelease}
               onChange={(e) => setIncludePrerelease(e.target.checked)}
             />
@@ -322,20 +323,6 @@ export function AppUpdateCard() {
       {result?.status === "error" && result.message ? (
         <div className="rounded-[6px] border border-destructive/30 bg-destructive/10 px-2.5 py-1.5 font-mono text-[11px] text-destructive">
           {result.message}
-        </div>
-      ) : null}
-
-      {result?.install_hint ? (
-        <div className="flex flex-wrap items-center justify-between gap-2 rounded-[6px] border border-border bg-background/80 px-2.5 py-1.5 font-mono text-[11px]">
-          <span className="truncate text-foreground">{result.install_hint}</span>
-          <button
-            type="button"
-            onClick={() => void handleCopyCommand(result.install_hint!)}
-            className="inline-flex shrink-0 items-center gap-1 rounded border border-border px-2 py-0.5 text-[10px] text-muted-foreground hover:bg-muted hover:text-foreground"
-          >
-            <Copy className="h-3 w-3" aria-hidden="true" />
-            {tr("action.copy")}
-          </button>
         </div>
       ) : null}
 

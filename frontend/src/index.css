@@ -29,8 +29,8 @@
   --color-card: var(--card);
   --color-card-foreground: var(--card-foreground);
 
-  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "JetBrains Mono", "Liberation Mono", monospace;
 
   --radius-xl: 12px;
   --radius-lg: 10px;
@@ -63,33 +63,35 @@
   --font-body: 13px;
   --drawer-width: 460px;
 
-  --background: light-dark(#f8f9fa, #0d0e11);
-  --foreground: light-dark(#111827, #f3f4f6);
-  --card: light-dark(#ffffff, #141519);
-  --card-foreground: light-dark(#111827, #f3f4f6);
-  --popover: light-dark(#ffffff, #1c1e24);
-  --popover-foreground: light-dark(#111827, #f3f4f6);
-  --primary: light-dark(#4f46e5, #5e6ad2);
-  --primary-rgb: 94, 106, 210;
+  --background: light-dark(#f6f7f9, #0b0d11);
+  --foreground: light-dark(#0f172a, #eef1f6);
+  --card: light-dark(#ffffff, #12151c);
+  --card-foreground: light-dark(#0f172a, #eef1f6);
+  --popover: light-dark(#ffffff, #181c25);
+  --popover-foreground: light-dark(#0f172a, #eef1f6);
+  --primary: light-dark(#4f46e5, #6366f1);
+  --primary-rgb: 99, 102, 241;
   --primary-foreground: #ffffff;
-  --secondary: light-dark(#eef0f4, #1c1e24);
-  --secondary-foreground: light-dark(#111827, #f3f4f6);
-  --muted: light-dark(#f1f3f5, #181a20);
-  --muted-foreground: light-dark(#4b5563, #9ca3af);
-  --accent: light-dark(rgba(79, 70, 229, 0.08), rgba(94, 106, 210, 0.14));
+  --secondary: light-dark(#eef1f5, #1b1f29);
+  --secondary-foreground: light-dark(#0f172a, #eef1f6);
+  --muted: light-dark(#eef1f5, #171a23);
+  --muted-foreground: light-dark(#475569, #94a3b8);
+  --accent: light-dark(rgba(79, 70, 229, 0.09), rgba(99, 102, 241, 0.16));
   --accent-foreground: light-dark(#4338ca, #c7d2fe);
   --destructive: light-dark(#dc2626, #ef4444);
   --destructive-foreground: #ffffff;
-  --border: light-dark(rgba(0, 0, 0, 0.08), rgba(255, 255, 255, 0.08));
-  --input: light-dark(rgba(0, 0, 0, 0.14), rgba(255, 255, 255, 0.12));
-  --ring: light-dark(#4f46e5, #5e6ad2);
-  --surface-elevated: light-dark(#ffffff, #141519);
-  --sidebar-surface: var(--background);
-  --hero-glow: light-dark(rgba(79, 70, 229, 0.13), rgba(94, 106, 210, 0.22));
+  --border: light-dark(rgba(15, 23, 42, 0.1), rgba(255, 255, 255, 0.08));
+  --input: light-dark(rgba(15, 23, 42, 0.16), rgba(255, 255, 255, 0.13));
+  --ring: light-dark(#4f46e5, #6366f1);
+  --surface-elevated: light-dark(#ffffff, #12151c);
+  --sidebar-surface: light-dark(#f2f4f8, #0b0d11);
+  --card-shadow: light-dark(0 1px 2px rgba(15, 23, 42, 0.05), 0 1px 0 rgba(255, 255, 255, 0.04) inset);
+  --hero-glow: light-dark(rgba(79, 70, 229, 0.14), rgba(99, 102, 241, 0.24));
 
-  --scrollbar-thumb: light-dark(rgba(0, 0, 0, 0.18), rgba(255, 255, 255, 0.16));
+  --scrollbar-thumb: light-dark(rgba(15, 23, 42, 0.24), rgba(148, 163, 184, 0.24));
   --scrollbar-track: transparent;
   scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  scrollbar-width: thin;
   accent-color: var(--primary);
 
   &:has(> head > meta[name="color-scheme"][content="dark"]) {
@@ -258,10 +260,15 @@
 .node-multiselect-popover[popover],
 .node-context-popover[popover] {
   margin: 0;
+  inset: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
   overflow: visible;
 }
 
-[data-custom-bg="true"] .node-multiselect-popover,
+[data-custom-bg="true"] .node-multiselect-popover > div,
 [data-custom-bg="true"] .node-context-popover {
   -webkit-backdrop-filter: blur(calc(var(--glass-blur, 18px) + 4px)) saturate(160%);
   backdrop-filter: blur(calc(var(--glass-blur, 18px) + 4px)) saturate(160%);
@@ -287,6 +294,7 @@
 
 .custom-select-popover[popover] {
   margin: 0;
+  inset: auto;
   padding: 0;
   border: 0;
   background: transparent;
@@ -473,7 +481,7 @@ body.prismray-row-resizing * {
   forced-color-adjust: none;
 }
 
-/* Modal <dialog> top-layer containment */
+/* Modal <dialog> top-layer containment & discrete entry/exit transitions */
 dialog:modal {
   overscroll-behavior: contain;
   margin: auto;
@@ -485,7 +493,7 @@ dialog:modal {
   max-inline-size: min(94dvw, 44rem);
   max-block-size: 88dvh;
   inline-size: 100%;
-  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.28);
+  box-shadow: 0 24px 56px -12px rgba(0, 0, 0, 0.36);
 }
 
 dialog[open] {
@@ -496,9 +504,257 @@ dialog[open] {
 dialog::backdrop {
   overflow: hidden;
   overscroll-behavior: contain;
-  background: rgba(0, 0, 0, 0.52);
-  -webkit-backdrop-filter: blur(3px);
-  backdrop-filter: blur(3px);
+  background: rgba(9, 11, 16, 0.56);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+}
+
+dialog.prism-modal-dialog {
+  opacity: 0;
+  transition:
+    opacity 180ms var(--ease-snappy),
+    transform 200ms var(--ease-snappy),
+    display 180ms,
+    overlay 180ms;
+  transition-behavior: allow-discrete;
+}
+
+dialog.prism-modal-dialog[open] {
+  opacity: 1;
+}
+
+dialog.prism-modal-dialog::backdrop {
+  opacity: 0;
+  transition:
+    opacity 180ms var(--ease-snappy),
+    display 180ms,
+    overlay 180ms;
+  transition-behavior: allow-discrete;
+}
+
+dialog.prism-modal-dialog[open]::backdrop {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  dialog.prism-modal-dialog {
+    transform: translateY(6px) scale(0.985);
+  }
+  dialog.prism-modal-dialog[open] {
+    transform: translateY(0) scale(1);
+  }
+  @starting-style {
+    dialog.prism-modal-dialog[open] {
+      opacity: 0;
+      transform: translateY(8px) scale(0.98);
+    }
+    dialog.prism-modal-dialog[open]::backdrop {
+      opacity: 0;
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  @starting-style {
+    dialog.prism-modal-dialog[open],
+    dialog.prism-modal-dialog[open]::backdrop {
+      opacity: 0;
+    }
+  }
+}
+
+/* Custom accessible checkbox primitive (.prism-checkbox) */
+.prism-checkbox {
+  -webkit-appearance: none;
+  appearance: none;
+  display: inline-grid;
+  place-content: center;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 5px;
+  border: 1.5px solid var(--input);
+  background-color: var(--background);
+  color: var(--primary-foreground);
+  cursor: pointer;
+  transition:
+    background-color 140ms var(--ease-snappy),
+    border-color 140ms var(--ease-snappy),
+    box-shadow 140ms var(--ease-snappy);
+}
+
+.prism-checkbox.prism-checkbox-sm {
+  width: 0.875rem;
+  height: 0.875rem;
+  border-radius: 4px;
+}
+
+.prism-checkbox:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--primary) 70%, var(--input));
+}
+
+.prism-checkbox:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.prism-checkbox:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.prism-checkbox::before {
+  content: "";
+  width: 0.72rem;
+  height: 0.72rem;
+  transform: scale(0);
+  transition: transform 120ms var(--ease-snappy);
+  background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='black' stroke-width='2.3' stroke-linecap='round' stroke-linejoin='round' d='M3.2 8.4L6.6 11.6L12.8 4.4'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='black' stroke-width='2.3' stroke-linecap='round' stroke-linejoin='round' d='M3.2 8.4L6.6 11.6L12.8 4.4'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+
+.prism-checkbox.prism-checkbox-sm::before {
+  width: 0.625rem;
+  height: 0.625rem;
+}
+
+.prism-checkbox:indeterminate::before {
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' d='M3.5 8H12.5'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' d='M3.5 8H12.5'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+
+.prism-checkbox:is(:checked, :indeterminate) {
+  border-color: var(--primary);
+  background-color: var(--primary);
+}
+
+.prism-checkbox:is(:checked, :indeterminate)::before {
+  transform: scale(1);
+}
+
+@media (forced-colors: active) {
+  .prism-checkbox:is(:checked, :indeterminate)::before {
+    background-color: CanvasText;
+  }
+}
+
+/* Custom accessible range slider primitive (.prism-slider; WebKit/Moz separated) */
+.prism-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 1.25rem;
+  background: transparent;
+  cursor: pointer;
+}
+
+.prism-slider:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.prism-slider:focus-visible {
+  outline: none;
+}
+
+.prism-slider::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    var(--primary) 0%,
+    var(--primary) var(--slider-progress, 0%),
+    color-mix(in oklab, var(--muted-foreground) 24%, var(--muted)) var(--slider-progress, 0%),
+    color-mix(in oklab, var(--muted-foreground) 24%, var(--muted)) 100%
+  );
+}
+
+.prism-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -4.5px;
+  border-radius: 999px;
+  border: 2px solid var(--primary);
+  background-color: var(--background);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
+  transition: transform 120ms var(--ease-snappy), box-shadow 120ms var(--ease-snappy);
+}
+
+.prism-slider:hover:not(:disabled)::-webkit-slider-thumb {
+  transform: scale(1.1);
+}
+
+.prism-slider:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 32%, transparent);
+}
+
+.prism-slider::-moz-range-track {
+  height: 5px;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    var(--primary) 0%,
+    var(--primary) var(--slider-progress, 0%),
+    color-mix(in oklab, var(--muted-foreground) 24%, var(--muted)) var(--slider-progress, 0%),
+    color-mix(in oklab, var(--muted-foreground) 24%, var(--muted)) 100%
+  );
+}
+
+.prism-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 2px solid var(--primary);
+  background-color: var(--background);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
+  transition: transform 120ms var(--ease-snappy), box-shadow 120ms var(--ease-snappy);
+}
+
+.prism-slider:hover:not(:disabled)::-moz-range-thumb {
+  transform: scale(1.1);
+}
+
+.prism-slider:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 32%, transparent);
+}
+
+/* Standardized thin scrollbars everywhere with gated legacy fallback */
+.scrollable-surface,
+.table-wrapper,
+.responsive-table,
+dialog,
+dialog *,
+pre,
+.overflow-y-auto,
+.overflow-auto {
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  scrollbar-width: thin;
+}
+
+@supports not (scrollbar-color: auto) {
+  :root,
+  .scrollable-surface,
+  .table-wrapper,
+  dialog {
+    scrollbar-width: auto;
+  }
+
+  :root::-webkit-scrollbar,
+  .scrollable-surface::-webkit-scrollbar,
+  .table-wrapper::-webkit-scrollbar,
+  dialog::-webkit-scrollbar {
+    width: 7px;
+    height: 7px;
+  }
+
+  :root::-webkit-scrollbar-thumb,
+  .scrollable-surface::-webkit-scrollbar-thumb,
+  .table-wrapper::-webkit-scrollbar-thumb,
+  dialog::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background-color: var(--scrollbar-thumb);
+  }
 }
 
 /* Responsive container-query tables + resizable columns */
@@ -912,7 +1168,7 @@ dialog.slide-over-drawer[open] {
 
   dialog.slide-over-drawer[open] {
     opacity: 1;
-    translate: 0 0;
+    translate: none;
     @starting-style {
       opacity: 0;
       translate: 1.5rem 0;
@@ -928,7 +1184,7 @@ dialog.slide-over-drawer[open] {
 
   dialog.bottom-sheet[open] {
     opacity: 1;
-    translate: 0 0;
+    translate: none;
     @starting-style {
       opacity: 0;
       translate: 0 1.5rem;
@@ -1218,6 +1474,11 @@ dialog.slide-over-drawer[open] {
 
 .prism-surface {
   background: var(--surface-elevated);
+  box-shadow: var(--card-shadow);
+}
+
+.prism-card {
+  box-shadow: var(--card-shadow);
 }
 
 .rule-row-dragging {

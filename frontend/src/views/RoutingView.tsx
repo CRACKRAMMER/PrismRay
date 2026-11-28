@@ -2,6 +2,7 @@
 
 import React, { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ArrowDown,
   ArrowUp,
   ChevronDown,
@@ -22,16 +23,20 @@ import {
   androidBridge,
   api,
   formatApiError,
+  isAndroidClient,
 } from "../lib/api.ts";
 import { isRoutingProfileEqual, isRuleSetReady } from "../lib/helpers.ts";
 import { useAppStore } from "../store/appStore.ts";
 import { BottomSheetDialog, ContextInspector } from "../components/ContextInspector.tsx";
+import { DnsDiagnosticsCard } from "../components/DnsDiagnosticsCard.tsx";
 import { HelpTip } from "../components/HelpTip.tsx";
 import { PerAppProxyCard } from "../components/PerAppProxyCard.tsx";
+import { ProfileSwitcher } from "../components/ProfileSwitcher.tsx";
 import { RoutingQrModal } from "../components/RoutingQrModal.tsx";
 import { RuleEditorForm } from "../components/RuleEditorModal.tsx";
 import { SectionAnchorBar } from "../components/SectionAnchorBar.tsx";
 import { SwipeActionRow } from "../components/SwipeActionRow.tsx";
+import { TailscaleCard } from "../components/TailscaleCard.tsx";
 import { Button } from "../components/ui/button.tsx";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card.tsx";
 import { Input } from "../components/ui/input.tsx";
@@ -54,6 +59,7 @@ const DEFAULT_PROFILE: RoutingProfile = {
   kill_switch: true,
   per_app_mode: "all",
   per_app_packages: [],
+  custom_rules_enabled: true,
   custom_rules: [],
 };
 
@@ -86,14 +92,59 @@ function summarizeRuleConditions(rule: RoutingRule): string[] {
   return badges;
 }
 
-export function RoutingView() {
-  const { activeTab, tr, locale, routing, ruleSets, status, nodes, groups, listeners, refreshAll, notify, registerUnsavedGuard } =
-    useAppStore();
+export function RoutingView({ isActive = true }: { isActive?: boolean } = {}) {
+  const {
+    activeTab,
+    pendingAnchor,
+    consumePendingAnchor,
+    pendingAction,
+    consumePendingAction,
+    tr,
+    locale,
+    routing,
+    ruleSets,
+    status,
+    isTunActive,
+    nodes,
+    groups,
+    listeners,
+    refreshAll,
+    notify,
+    registerUnsavedGuard,
+  } = useAppStore();
   const idPrefix = useId();
   const [draft, setDraft] = useState<RoutingProfile>(routing || DEFAULT_PROFILE);
   const [saving, setSaving] = useState(false);
   const [syncingRuleSets, setSyncingRuleSets] = useState(false);
   const [qrModalOpen, setQrModalOpen] = useState(false);
+  const [tailscaleExpandSignal, setTailscaleExpandSignal] = useState(0);
+
+  // Consume cross-tab anchor jumps (e.g. Overview "Configure Tailscale" -> #routing-tailscale)
+  useEffect(() => {
+    if (!isActive || !pendingAnchor || !pendingAnchor.startsWith("routing-")) return;
+    const anchor = consumePendingAnchor();
+    if (!anchor) return;
+    if (anchor === "routing-tailscale") {
+      setTailscaleExpandSignal((n) => n + 1);
+    }
+    let attempts = 0;
+    const scrollToTarget = () => {
+      const el = document.getElementById(anchor);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+        el.focus?.({ preventScroll: true });
+        el.classList.add("ring-2", "ring-primary/50", "rounded-[12px]");
+        window.setTimeout(() => {
+          el.classList.remove("ring-2", "ring-primary/50", "rounded-[12px]");
+        }, 1600);
+        return;
+      }
+      if (++attempts < 10) {
+        window.requestAnimationFrame(scrollToTarget);
+      }
+    };
+    window.requestAnimationFrame(scrollToTarget);
+  }, [isActive, pendingAnchor, consumePendingAnchor]);
 
   const adsRuleReady = useMemo(() => isRuleSetReady(ruleSets, "geosite-category-ads-all"), [ruleSets]);
   const cnRuleReady = useMemo(
@@ -144,6 +195,13 @@ export function RoutingView() {
   const dragStartedAtRef = useRef<number>(0);
 
   useEffect(() => {
+    if (isActive && pendingAction === "quick-create:rule" && consumePendingAction("quick-create:rule")) {
+      setEditingRuleIdx(null);
+      setRuleModalOpen(true);
+    }
+  }, [isActive, pendingAction, consumePendingAction]);
+
+  useEffect(() => {
     const onQuickCreate = (e: Event) => {
       if ((e as CustomEvent<string>).detail === "rule") {
         setEditingRuleIdx(null);
@@ -169,6 +227,7 @@ export function RoutingView() {
       fake_ip_filter: routing.fake_ip_filter || [],
       kill_switch: routing.kill_switch !== false,
       per_app_packages: routing.per_app_packages || [],
+      custom_rules_enabled: routing.custom_rules_enabled !== false,
       custom_rules: routing.custom_rules || [],
     };
   }, [routing]);
@@ -213,7 +272,20 @@ export function RoutingView() {
     setReorderStatus(tr("routing.reorderedNotice", { name: ruleName, pos: toIndex + 1 }));
   };
 
+  const reorderRuleRef = useRef(reorderRule);
+  reorderRuleRef.current = reorderRule;
+
+  const clearHoldTimer = () => {
+    if (holdTimerRef.current !== null) {
+      window.clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => () => clearHoldTimer(), []);
+
   useEffect(() => {
+    if (dragIndex === null) return;
     const onPointerMove = (e: PointerEvent) => {
       const currentIdx = activeDragRef.current;
       if (currentIdx === null || !listRef.current) return;
@@ -224,7 +296,7 @@ export function RoutingView() {
         const rect = row.getBoundingClientRect();
         const mid = rect.top + rect.height / 2;
         if ((currentIdx < idxAttr && e.clientY > mid) || (currentIdx > idxAttr && e.clientY < mid)) {
-          reorderRule(currentIdx, idxAttr);
+          reorderRuleRef.current(currentIdx, idxAttr);
           activeDragRef.current = idxAttr;
           setDragIndex(idxAttr);
           break;
@@ -233,10 +305,7 @@ export function RoutingView() {
     };
 
     const endDrag = () => {
-      if (holdTimerRef.current !== null) {
-        window.clearTimeout(holdTimerRef.current);
-        holdTimerRef.current = null;
-      }
+      clearHoldTimer();
       if (activeDragRef.current !== null) {
         activeDragRef.current = null;
         setDragIndex(null);
@@ -251,7 +320,7 @@ export function RoutingView() {
       window.removeEventListener("pointerup", endDrag);
       window.removeEventListener("pointercancel", endDrag);
     };
-  });
+  }, [dragIndex !== null]);
 
   const startDrag = (idx: number) => {
     activeDragRef.current = idx;
@@ -317,15 +386,22 @@ export function RoutingView() {
       const payload: RoutingProfile = {
         ...draft,
         allow_lan_broadcast: Boolean(draft.bypass_lan && draft.allow_lan_broadcast),
+        custom_rules_enabled: draft.custom_rules_enabled !== false,
       };
       const prevRouting = routing;
+      const hasEnabledPackageRule = (p: RoutingProfile | null | undefined) =>
+        Boolean(
+          p?.custom_rules_enabled !== false &&
+            p?.custom_rules?.some((r) => r.enabled && (r.package_name?.length ?? 0) > 0),
+        );
       const vpnLayerChanged =
         isAndroid &&
         prevRouting != null &&
         (Boolean(prevRouting.bypass_lan) !== Boolean(payload.bypass_lan) ||
           Boolean(prevRouting.bypass_lan && prevRouting.allow_lan_broadcast) !== Boolean(payload.allow_lan_broadcast) ||
           (prevRouting.per_app_mode || "all") !== (payload.per_app_mode || "all") ||
-          JSON.stringify(prevRouting.per_app_packages || []) !== JSON.stringify(payload.per_app_packages || []));
+          JSON.stringify(prevRouting.per_app_packages || []) !== JSON.stringify(payload.per_app_packages || []) ||
+          hasEnabledPackageRule(prevRouting) !== hasEnabledPackageRule(payload));
 
       await api.saveRouting(payload);
       await refreshAll();
@@ -375,36 +451,98 @@ export function RoutingView() {
   const applyRulePreset = (preset: "steam" | "cdn" | "google") => {
     setPresetsOpen(false);
     if (preset === "google") {
-      const googleRule: RoutingRule = {
-        id: "preset-google-proxy",
-        name: locale === "zh-CN" ? "Google 全家桶与 AI 服务 (代理)" : "Google Suite & AI (Proxy)",
-        enabled: true,
-        domain_suffix: [
-          "google.com",
-          "google.com.hk",
-          "googleapis.com",
-          "gstatic.com",
-          "googleusercontent.com",
-          "googlevideo.com",
-          "youtube.com",
-          "youtu.be",
-          "ytimg.com",
-          "ggpht.com",
-          "gmail.com",
-          "googlemail.com",
-          "g.co",
-          "goo.gl",
-          "deepmind.google",
-          "ai.dev",
-          "android.com",
-          "gvt1.com",
-          "gvt2.com",
-        ],
-        outbound: "proxy",
-      };
+      // Ordered from most-specific subdomains (AI / Play / YouTube) to broad core domains
+      // so users can route AI or Play to dedicated nodes/groups without being shadowed by google.com.
+      const googleRules: RoutingRule[] = [
+        {
+          id: "preset-google-ai",
+          name: locale === "zh-CN" ? "Google AI / Gemini (代理)" : "Google AI / Gemini (Proxy)",
+          enabled: true,
+          domain_suffix: [
+            "gemini.google.com",
+            "aistudio.google.com",
+            "generativelanguage.googleapis.com",
+            "ai.google.dev",
+            "deepmind.google",
+            "ai.dev",
+            "notebooklm.google.com",
+            "labs.google",
+            "antigravity.google",
+            "antigravity.google.com",
+            "jetski-webchannel.googleapis.com",
+            "aicode.googleapis.com",
+            "cloudcode-pa.googleapis.com",
+            "daily-cloudcode-pa.googleapis.com",
+          ],
+          outbound: "proxy",
+        },
+        {
+          id: "preset-google-play",
+          name: locale === "zh-CN" ? "Google Play 商店与下载 (代理)" : "Google Play Store & Downloads (Proxy)",
+          enabled: true,
+          domain_suffix: [
+            "play.google.com",
+            "play.googleapis.com",
+            "play-fe.googleapis.com",
+            "playatoms-pa.googleapis.com",
+            "play-lh.googleusercontent.com",
+            "android.clients.google.com",
+            "android.googleapis.com",
+            "android.com",
+            "gvt1.com",
+            "gvt2.com",
+            "gvt3.com",
+            "gvt1-cn.com",
+            "gvt2-cn.com",
+            "xn--ngstr-lra8j.com",
+            "dl.google.com",
+            "services.googleapis.cn",
+            "payments.google.com",
+            "pay.google.com",
+          ],
+          outbound: "proxy",
+        },
+        {
+          id: "preset-google-youtube",
+          name: locale === "zh-CN" ? "YouTube 流媒体 (代理)" : "YouTube Streaming (Proxy)",
+          enabled: true,
+          domain_suffix: [
+            "youtube.com",
+            "youtu.be",
+            "googlevideo.com",
+            "ytimg.com",
+            "ggpht.com",
+          ],
+          outbound: "proxy",
+        },
+        {
+          id: "preset-google-core",
+          name: locale === "zh-CN" ? "Google 核心与账号 (代理)" : "Google Core & Account (Proxy)",
+          enabled: true,
+          domain_suffix: [
+            "google.com",
+            "google.com.hk",
+            "googleapis.com",
+            "gstatic.com",
+            "googleusercontent.com",
+            "gmail.com",
+            "googlemail.com",
+            "g.co",
+            "goo.gl",
+          ],
+          outbound: "proxy",
+        },
+      ];
+      const googlePresetIds = new Set([
+        "preset-google-proxy",
+        "preset-google-ai",
+        "preset-google-play",
+        "preset-google-youtube",
+        "preset-google-core",
+      ]);
       setDraft((prev) => {
-        const filtered = prev.custom_rules.filter((r) => r.id !== "preset-google-proxy");
-        return { ...prev, custom_rules: [googleRule, ...filtered] };
+        const filtered = prev.custom_rules.filter((r) => !r.id || !googlePresetIds.has(r.id));
+        return { ...prev, custom_rules: [...googleRules, ...filtered] };
       });
       notify(tr("routing.presetAdded", { name: tr("routing.presetGoogle") }));
       return;
@@ -485,7 +623,9 @@ export function RoutingView() {
   const anchorItems = [
     { id: "routing-mode", label: tr("routing.anchorMode") },
     { id: "routing-dns", label: tr("routing.anchorDns") },
+    { id: "routing-dns-diag", label: tr("dnsDiag.tabDns") },
     ...(isAndroid ? [{ id: "routing-per-app", label: tr("routing.anchorPerApp") }] : []),
+    { id: "routing-tailscale", label: tr("routing.anchorTailscale") },
     { id: "routing-rules", label: tr("routing.anchorRules") },
   ];
 
@@ -505,6 +645,7 @@ export function RoutingView() {
             ) : null}
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <ProfileSwitcher compact />
             <Button
               type="button"
               variant="outline"
@@ -674,6 +815,23 @@ export function RoutingView() {
                     onCheckedChange={(checked) => setDraft((prev) => ({ ...prev, kill_switch: checked }))}
                   />
                 </div>
+                {!isAndroid ? (
+                  <div className="flex items-center justify-between gap-3 border-t pt-3 text-sm">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <span className="font-medium text-foreground">{tr("routing.bypassSystemTailscale")}</span>
+                      <HelpTip
+                        ariaLabel={tr("routing.bypassSystemTailscale")}
+                        text={tr("routing.bypassSystemTailscaleHint")}
+                      />
+                    </div>
+                    <Switch
+                      className="shrink-0"
+                      aria-label={tr("routing.bypassSystemTailscale")}
+                      checked={draft.bypass_system_tailscale !== false}
+                      onCheckedChange={(checked) => setDraft((prev) => ({ ...prev, bypass_system_tailscale: checked }))}
+                    />
+                  </div>
+                ) : null}
               </div>
             </CardContent>
           </Card>
@@ -711,6 +869,38 @@ export function RoutingView() {
                   onChange={(e) => setDraft((prev) => ({ ...prev, remote_dns: e.target.value }))}
                 />
               </div>
+              <div className="flex items-center justify-between gap-3 rounded-[8px] border border-border/70 bg-muted/25 px-3 py-2 text-sm">
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <span className="font-medium text-foreground">{tr("routing.disableIpv6")}</span>
+                  <HelpTip ariaLabel={tr("routing.disableIpv6")} text={tr("routing.disableIpv6Hint")} />
+                </div>
+                <Switch
+                  className="shrink-0"
+                  aria-label={tr("routing.disableIpv6")}
+                  checked={
+                    draft.disable_ipv6 !== undefined
+                      ? draft.disable_ipv6
+                      : !(
+                          draft.domain_strategy === "prefer_ipv6" ||
+                          draft.domain_strategy === "ipv6_only" ||
+                          draft.domain_strategy === "as_is"
+                        )
+                  }
+                  onCheckedChange={(checked) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      disable_ipv6: checked,
+                      domain_strategy: checked
+                        ? prev.domain_strategy === "ipv4_only"
+                          ? "ipv4_only"
+                          : "prefer_ipv4"
+                        : prev.domain_strategy === "ipv4_only" || prev.domain_strategy === "prefer_ipv4" || !prev.domain_strategy
+                          ? "prefer_ipv6"
+                          : prev.domain_strategy,
+                    }))
+                  }
+                />
+              </div>
               <div className="space-y-1">
                 <label htmlFor={`${idPrefix}-domain-strategy`} className="text-xs font-medium text-muted-foreground">
                   {tr("routing.domainStrategy")}
@@ -718,7 +908,19 @@ export function RoutingView() {
                 <Select
                   id={`${idPrefix}-domain-strategy`}
                   value={draft.domain_strategy || "prefer_ipv4"}
-                  onChange={(e) => setDraft((prev) => ({ ...prev, domain_strategy: e.target.value }))}
+                  onChange={(e) => {
+                    const nextStrategy = e.target.value;
+                    const nextDisableV6 = !(
+                      nextStrategy === "prefer_ipv6" ||
+                      nextStrategy === "ipv6_only" ||
+                      nextStrategy === "as_is"
+                    );
+                    setDraft((prev) => ({
+                      ...prev,
+                      domain_strategy: nextStrategy,
+                      disable_ipv6: nextDisableV6,
+                    }));
+                  }}
                 >
                   <option value="prefer_ipv4">prefer_ipv4</option>
                   <option value="prefer_ipv6">prefer_ipv6</option>
@@ -751,20 +953,48 @@ export function RoutingView() {
               </div>
 
               {draft.fake_ip ? (
-                <div className="space-y-1">
-                  <label htmlFor={`${idPrefix}-fakeip-filter`} className="block text-xs font-medium text-muted-foreground">
-                    {tr("routing.fakeIpFilter")}
-                  </label>
-                  <Input
-                    id={`${idPrefix}-fakeip-filter`}
-                    className="font-mono text-xs"
-                    autoCorrect="off"
-                    autoCapitalize="none"
-                    spellCheck={false}
-                    placeholder=".lan, .ts.net, pool.ntp.org"
-                    value={(draft.fake_ip_filter || []).join(", ")}
-                    onChange={(e) => setDraft((prev) => ({ ...prev, fake_ip_filter: splitCSV(e.target.value) }))}
-                  />
+                <div className="space-y-2.5">
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <div className="space-y-1">
+                      <label htmlFor={`${idPrefix}-fakeip-v4`} className="block text-xs font-medium text-muted-foreground">
+                        {tr("routing.fakeIpV4Range")}
+                      </label>
+                      <Input
+                        id={`${idPrefix}-fakeip-v4`}
+                        className="font-mono text-xs"
+                        placeholder="198.18.0.0/15"
+                        value={draft.fake_ip_v4_range || "198.18.0.0/15"}
+                        onChange={(e) => setDraft((prev) => ({ ...prev, fake_ip_v4_range: e.target.value }))}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label htmlFor={`${idPrefix}-fakeip-v6`} className="block text-xs font-medium text-muted-foreground">
+                        {tr("routing.fakeIpV6Range")}
+                      </label>
+                      <Input
+                        id={`${idPrefix}-fakeip-v6`}
+                        className="font-mono text-xs"
+                        placeholder="fc00::/18"
+                        value={draft.fake_ip_v6_range || "fc00::/18"}
+                        onChange={(e) => setDraft((prev) => ({ ...prev, fake_ip_v6_range: e.target.value }))}
+                      />
+                    </div>
+                  </div>
+                  <div className="space-y-1">
+                    <label htmlFor={`${idPrefix}-fakeip-filter`} className="block text-xs font-medium text-muted-foreground">
+                      {tr("routing.fakeIpFilter")}
+                    </label>
+                    <Input
+                      id={`${idPrefix}-fakeip-filter`}
+                      className="font-mono text-xs"
+                      autoCorrect="off"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                      placeholder=".lan, .ts.net, pool.ntp.org"
+                      value={(draft.fake_ip_filter || []).join(", ")}
+                      onChange={(e) => setDraft((prev) => ({ ...prev, fake_ip_filter: splitCSV(e.target.value) }))}
+                    />
+                  </div>
                 </div>
               ) : null}
 
@@ -786,12 +1016,23 @@ export function RoutingView() {
                   <option value="proxy">{tr("overview.webrtcProxy")}</option>
                   <option value="direct">{tr("overview.webrtcDirect")}</option>
                 </Select>
+                {!isAndroidClient() && !isTunActive ? (
+                  <div className="flex items-start gap-2 rounded-[8px] border border-amber-500/25 bg-amber-500/8 px-2.5 py-1.5 text-[11px] leading-snug text-amber-700 dark:text-amber-300">
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                    <span>{tr("overview.webrtcNonTunCaveat")}</span>
+                  </div>
+                ) : null}
               </div>
             </div>
           </CardContent>
         </Card>
         </section>
       </div>
+
+      {/* Rule Simulation & DNS Leak Diagnostics */}
+      <section id="routing-dns-diag" tabIndex={-1} className="scroll-mt-28 outline-none">
+        <DnsDiagnosticsCard />
+      </section>
 
       {/* Android Per-App Proxy (placed directly above Custom Rules on mobile/Android) */}
       {isAndroid ? (
@@ -807,6 +1048,11 @@ export function RoutingView() {
         </section>
       ) : null}
 
+      {/* Built-in Parallel Tailscale / Headscale Mesh */}
+      <section id="routing-tailscale" tabIndex={-1} className="scroll-mt-28 outline-none">
+        <TailscaleCard forceExpandSignal={tailscaleExpandSignal} />
+      </section>
+
       {/* Ordered Compact Custom Rules */}
       <section id="routing-rules" tabIndex={-1} className="scroll-mt-28 outline-none">
       <p role="status" className="visually-hidden">
@@ -819,6 +1065,16 @@ export function RoutingView() {
             <HelpTip ariaLabel={tr("routing.customRules")} text={tr("routing.compactHint")} />
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <label className="inline-flex items-center gap-2 rounded-[6px] border border-border bg-muted/40 px-2.5 py-1 text-xs font-medium text-foreground cursor-pointer select-none">
+              <span>{tr("routing.customRulesEnabled")}</span>
+              <Switch
+                aria-label={tr("routing.customRulesEnabled")}
+                checked={draft.custom_rules_enabled !== false}
+                onCheckedChange={(checked) =>
+                  setDraft((prev) => ({ ...prev, custom_rules_enabled: checked }))
+                }
+              />
+            </label>
             <div ref={presetsMenuRef} className="relative">
               <Button
                 type="button"
@@ -911,12 +1167,20 @@ export function RoutingView() {
           </div>
         </CardHeader>
         <CardContent>
+          {draft.custom_rules_enabled === false ? (
+            <div className="mb-3 rounded-[8px] border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-700 dark:text-amber-300">
+              {tr("routing.customRulesPausedBanner")}
+            </div>
+          ) : null}
           {draft.custom_rules.length === 0 ? (
             <p className="py-4 text-center text-xs text-muted-foreground">
               {locale === "zh-CN" ? "暂无自定义规则，将按内置规则与 DNS 策略执行。" : "No custom rules configured."}
             </p>
           ) : (
-            <div ref={listRef} className="space-y-1.5">
+            <div
+              ref={listRef}
+              className={`space-y-1.5 transition-opacity ${draft.custom_rules_enabled === false ? "opacity-60" : ""}`}
+            >
               {draft.custom_rules.map((rule, idx) => {
                 const ruleLabel = rule.name || `Rule #${idx + 1}`;
                 const condPills = summarizeRuleConditions(rule);
@@ -929,7 +1193,9 @@ export function RoutingView() {
                       ? tr("routing.outboundDirect")
                       : rule.outbound === "block"
                         ? tr("routing.outboundBlock")
-                        : resolvedGroup
+                        : rule.outbound === "tailscale-ep"
+                          ? tr("routing.outboundTailscale")
+                          : resolvedGroup
                           ? `${tr("settings.targetGroupPrefix")}: ${resolvedGroup.name}`
                           : resolvedNode
                             ? `${tr("settings.targetNodePrefix")}: ${resolvedNode.user_alias || resolvedNode.name}`
@@ -968,6 +1234,9 @@ export function RoutingView() {
                   <div
                     data-rule-row={idx}
                     onPointerDown={(e) => handleRowPointerDown(idx, e)}
+                    onPointerUp={clearHoldTimer}
+                    onPointerCancel={clearHoldTimer}
+                    onPointerLeave={clearHoldTimer}
                     className="dense-row flex flex-wrap items-center gap-2 px-2.5 py-1.5 text-xs select-none hover:bg-muted/35"
                   >
                     <button
@@ -1111,6 +1380,14 @@ export function RoutingView() {
           setDraft(importedProfile);
           await api.saveRouting(importedProfile);
           await refreshAll();
+          if (isAndroid && androidBridge.getVpnStatus()?.active) {
+            androidBridge.prepareAndStartVpn({
+              per_app_mode: importedProfile.per_app_mode || "all",
+              per_app_packages: importedProfile.per_app_packages || [],
+              bypass_lan: importedProfile.bypass_lan,
+              allow_lan_broadcast: Boolean(importedProfile.bypass_lan && importedProfile.allow_lan_broadcast),
+            });
+          }
         }}
       />
     </div>

@@ -15,9 +15,8 @@ import {
   Shield,
   Split,
 } from "lucide-react";
-import { TRIGGER_UPDATE_CHECK_EVENT } from "./AppUpdateCard.tsx";
 import { formatLatency } from "../lib/helpers.ts";
-import { api, formatApiError } from "../lib/api.ts";
+import { api, formatApiError, isAndroidClient } from "../lib/api.ts";
 import { type NavTab, useAppStore } from "../store/appStore.ts";
 
 interface CommandEntry {
@@ -37,8 +36,10 @@ export function CommandPalette() {
     commandPaletteOpen,
     setCommandPaletteOpen,
     setActiveTab,
+    dispatchTabAction,
     status,
-    tunState,
+    isProxyRunning,
+    isTunActive,
     systemProxyEnabled,
     routing,
     nodes,
@@ -160,7 +161,7 @@ export function CommandPalette() {
         id: "act:connect",
         group: actGroup,
         label: tr("cmd.actionToggleConnect"),
-        meta: status?.running ? tr("status.running") : tr("status.stopped"),
+        meta: isProxyRunning ? tr("status.running") : tr("status.stopped"),
         icon: Power,
         keywords: "connect disconnect toggle start stop 连接 断开 开关",
         run: () => toggleConnect(),
@@ -169,20 +170,24 @@ export function CommandPalette() {
         id: "act:tun",
         group: actGroup,
         label: tr("cmd.actionToggleTun"),
-        meta: tunState?.enabled ? "ON" : "OFF",
+        meta: isTunActive ? "ON" : "OFF",
         icon: Shield,
         keywords: "tun virtual nic 虚拟网卡 接管",
-        run: () => toggleTUN(!Boolean(tunState?.enabled)),
+        run: () => toggleTUN(!isTunActive),
       },
-      {
-        id: "act:sysproxy",
-        group: actGroup,
-        label: tr("cmd.actionToggleSysProxy"),
-        meta: systemProxyEnabled ? "ON" : "OFF",
-        icon: Globe,
-        keywords: "system proxy http socks 系统代理",
-        run: () => toggleSystemProxy(!systemProxyEnabled),
-      },
+      ...(!isAndroidClient()
+        ? [
+            {
+              id: "act:sysproxy",
+              group: actGroup,
+              label: tr("cmd.actionToggleSysProxy"),
+              meta: systemProxyEnabled ? "ON" : "OFF",
+              icon: Globe,
+              keywords: "system proxy http socks 系统代理",
+              run: () => toggleSystemProxy(!systemProxyEnabled),
+            },
+          ]
+        : []),
       {
         id: "act:mode-rule",
         group: actGroup,
@@ -221,11 +226,7 @@ export function CommandPalette() {
         icon: ArrowUpCircle,
         keywords: "update upgrade version release 检查更新 版本 升级",
         run: () => {
-          setActiveTab("settings");
-          window.setTimeout(() => {
-            document.getElementById("settings-cores")?.scrollIntoView({ behavior: "smooth", block: "start" });
-            window.dispatchEvent(new CustomEvent(TRIGGER_UPDATE_CHECK_EVENT));
-          }, 180);
+          dispatchTabAction("settings", "update-check", "settings-cores");
         },
       },
     ];
@@ -238,7 +239,7 @@ export function CommandPalette() {
         meta: `${g.strategy} · ${g.node_ids?.length || 0}`,
         icon: FolderKanban,
         keywords: `group ${g.name} ${g.strategy} 策略组`,
-        active: Boolean(status?.running) && status?.active_group_id === g.id,
+        active: isProxyRunning && status?.active_group_id === g.id,
         run: () => toggleConnect({ groupId: g.id }),
       });
     }
@@ -252,7 +253,7 @@ export function CommandPalette() {
         meta: `${n.protocol.toUpperCase()} · ${formatLatency(n.latency)}`,
         icon: Server,
         keywords: `node ${display} ${n.name} ${n.address} ${n.protocol} 节点`,
-        active: Boolean(status?.running) && !status?.active_group_id && status?.active_node_id === n.id,
+        active: isProxyRunning && !status?.active_group_id && status?.active_node_id === n.id,
         run: () => toggleConnect({ nodeId: n.id }),
       });
     }
@@ -262,7 +263,8 @@ export function CommandPalette() {
     tr,
     routing,
     status,
-    tunState,
+    isProxyRunning,
+    isTunActive,
     systemProxyEnabled,
     groups,
     nodes,

@@ -7,6 +7,8 @@ import {
   ArrowUp,
   ArrowUpDown,
   CheckSquare,
+  Copy,
+  Eraser,
   Gauge,
   GitBranch,
   GripVertical,
@@ -22,6 +24,7 @@ import {
   Search,
   ShieldCheck,
   SlidersHorizontal,
+  Sparkles,
   Square,
   Star,
   Tag,
@@ -68,6 +71,7 @@ import {
 import { type ColumnSpecMap, useResizableColumns } from "../lib/useResizableColumns.ts";
 import { Button } from "../components/ui/button.tsx";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card.tsx";
+import { Checkbox } from "../components/ui/checkbox.tsx";
 import { Input } from "../components/ui/input.tsx";
 import { Select } from "../components/ui/select.tsx";
 
@@ -77,14 +81,14 @@ type ProxyTableCol = "select" | "name" | "protocol" | "endpoint" | "ping" | "lat
 
 const PROXY_TABLE_COL_SPECS: ColumnSpecMap<ProxyTableCol> = {
   select: { defaultWidth: 36, minWidth: 34, maxWidth: 64 },
-  name: { defaultWidth: 224, minWidth: 140, maxWidth: 560 },
-  protocol: { defaultWidth: 88, minWidth: 70, maxWidth: 180 },
-  endpoint: { defaultWidth: 162, minWidth: 110, maxWidth: 380 },
-  ping: { defaultWidth: 74, minWidth: 62, maxWidth: 150 },
-  latency: { defaultWidth: 84, minWidth: 72, maxWidth: 160 },
-  down: { defaultWidth: 84, minWidth: 70, maxWidth: 160 },
-  up: { defaultWidth: 84, minWidth: 70, maxWidth: 160 },
-  action: { defaultWidth: 196, minWidth: 184, maxWidth: 280 },
+  name: { defaultWidth: 196, minWidth: 140, maxWidth: 560 },
+  protocol: { defaultWidth: 84, minWidth: 70, maxWidth: 180 },
+  endpoint: { defaultWidth: 152, minWidth: 110, maxWidth: 380 },
+  ping: { defaultWidth: 66, minWidth: 56, maxWidth: 150 },
+  latency: { defaultWidth: 78, minWidth: 68, maxWidth: 160 },
+  down: { defaultWidth: 76, minWidth: 66, maxWidth: 160 },
+  up: { defaultWidth: 76, minWidth: 66, maxWidth: 160 },
+  action: { defaultWidth: 192, minWidth: 184, maxWidth: 280 },
 };
 
 const groupCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
@@ -97,11 +101,65 @@ function canonicalStrategy(raw: string): GroupStrategy {
   return "selector";
 }
 
+function nodeDuplicateFingerprint(n: NodeConfig): string {
+  return [
+    (n.protocol || "").trim().toLowerCase(),
+    (n.address || "").trim().toLowerCase(),
+    String(n.port || 0),
+    (n.uuid || "").trim(),
+    (n.password || "").trim(),
+    (n.username || "").trim(),
+    (n.method || n.cipher || "").trim().toLowerCase(),
+    (n.flow || "").trim().toLowerCase(),
+    (n.security || "").trim().toLowerCase(),
+    String(Boolean(n.allow_insecure)),
+    (n.sni || "").trim().toLowerCase(),
+    (n.fingerprint || "").trim().toLowerCase(),
+    (n.alpn || []).map((a) => a.trim().toLowerCase()).sort().join(","),
+    (n.network || "").trim().toLowerCase(),
+    (n.host || "").trim().toLowerCase(),
+    (n.path || "").trim(),
+    (n.service_name || "").trim(),
+    (n.public_key || "").trim(),
+    (n.short_id || "").trim(),
+    (n.peer_public_key || "").trim(),
+  ].join("|");
+}
+
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  try {
+    if (window.PrismRayAndroid?.copyToClipboard?.(text)) {
+      return true;
+    }
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fallback below.
+  }
+  try {
+    const el = document.createElement("textarea");
+    el.value = text;
+    el.setAttribute("readonly", "");
+    el.style.position = "fixed";
+    el.style.opacity = "0";
+    document.body.appendChild(el);
+    el.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(el);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 export function ProxiesView() {
   const {
     tr,
     locale,
     status,
+    isProxyRunning,
     nodes,
     groups,
     subscriptions,
@@ -112,6 +170,8 @@ export function ProxiesView() {
     healthSettings,
     highLatencyMs,
     updateHighLatencyMs,
+    pendingAction,
+    consumePendingAction,
     refreshAll,
     toggleConnect,
     notify,
@@ -130,6 +190,7 @@ export function ProxiesView() {
   const [probingGroupId, setProbingGroupId] = useState<string | null>(null);
 
   const [savingTabs, setSavingTabs] = useState(false);
+  const [batchBusy, setBatchBusy] = useState(false);
 
   const isMobile = useIsMobile();
   const [inspectorMode, setInspectorMode] = useState<null | "node" | "qr" | "group">(null);
@@ -141,23 +202,46 @@ export function ProxiesView() {
     uri: "",
   });
   const [contextMenu, setContextMenu] = useState<NodeContextMenuState | null>(null);
+  const lastContextMenuAtRef = useRef<number>(0);
+  const listStageRef = useRef<HTMLDivElement | null>(null);
+  const [isNarrowList, setIsNarrowList] = useState(false);
+  const [visibleNodeLimit, setVisibleNodeLimit] = useState(80);
+  const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    const onQuickCreate = (e: Event) => {
-      if ((e as CustomEvent<string>).detail === "node") {
-        setEditingNode(null);
-        setInspectorMode("node");
-      }
-    };
-    window.addEventListener("prismray-quick-create", onQuickCreate);
-    return () => window.removeEventListener("prismray-quick-create", onQuickCreate);
-  }, []);
+    if (isMobile || nodeViewMode !== "list") return;
+    const el = listStageRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const update = () => setIsNarrowList(el.clientWidth > 0 && el.clientWidth < 640);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [isMobile, nodeViewMode]);
+
+  const openNodeContextMenu = (e: React.MouseEvent, node: NodeConfig) => {
+    e.preventDefault();
+    e.stopPropagation();
+    lastContextMenuAtRef.current = Date.now();
+    setContextMenu({ x: e.clientX, y: e.clientY, node });
+  };
+
+  useEffect(() => {
+    if (pendingAction === "quick-create:node") {
+      consumePendingAction("quick-create:node");
+      setEditingNode(null);
+      setInspectorMode("node");
+    }
+  }, [pendingAction, consumePendingAction]);
 
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [groupName, setGroupName] = useState("");
   const [groupStrategy, setGroupStrategy] = useState<GroupStrategy>("selector");
   const [groupPriorityRule, setGroupPriorityRule] = useState("");
   const [groupAutoFailover, setGroupAutoFailover] = useState<"inherit" | "on" | "off">("inherit");
+  const [groupFailoverTrigger, setGroupFailoverTrigger] = useState<"high_latency_or_unavailable" | "unavailable_only">("high_latency_or_unavailable");
+  const [groupHighLatencyInput, setGroupHighLatencyInput] = useState("");
+  const [groupLoadBalanceShardsInput, setGroupLoadBalanceShardsInput] = useState("");
   const [groupDetourId, setGroupDetourId] = useState("");
   const [groupIntervalVal, setGroupIntervalVal] = useState(5);
   const [groupIntervalUnit, setGroupIntervalUnit] = useState<DurationUnit>("m");
@@ -275,6 +359,33 @@ export function ProxiesView() {
   const displayedNodes = useMemo(
     () => sortNodesByMetric(filteredNodes, sortField, sortDir),
     [filteredNodes, sortField, sortDir],
+  );
+
+  // Progressive render window keeps large 300+ node subscriptions fast without breaking table/card layout.
+  useEffect(() => {
+    setVisibleNodeLimit(80);
+  }, [search, protoFilter, sortField, sortDir, effectiveSelectedTabIds, nodeViewMode]);
+
+  useEffect(() => {
+    const sentinel = loadMoreSentinelRef.current;
+    if (!sentinel || visibleNodeLimit >= displayedNodes.length || typeof IntersectionObserver === "undefined") {
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisibleNodeLimit((prev) => Math.min(displayedNodes.length, prev + 80));
+        }
+      },
+      { rootMargin: "320px 0px" },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [visibleNodeLimit, displayedNodes.length]);
+
+  const renderedNodes = useMemo(
+    () => (displayedNodes.length > visibleNodeLimit ? displayedNodes.slice(0, visibleNodeLimit) : displayedNodes),
+    [displayedNodes, visibleNodeLimit],
   );
 
   const nodeIdSet = useMemo(() => new Set(nodes.map((n) => n.id)), [nodes]);
@@ -403,16 +514,10 @@ export function ProxiesView() {
     try {
       const nextTabs = customNodeTabs.filter((t) => t !== clean);
       await saveCustomNodeTabs(nextTabs);
-      const affected = nodes.filter((n) => nodeHasTag(n, clean));
-      await Promise.all(
-        affected.map((n) =>
-          api.updateNode(n.id, {
-            ...n,
-            group: (n.group || "").trim() === clean ? "" : n.group,
-            tags: (n.tags || []).filter((t) => t.trim() !== clean),
-          }),
-        ),
-      );
+      const affectedIds = nodes.filter((n) => nodeHasTag(n, clean)).map((n) => n.id);
+      if (affectedIds.length > 0) {
+        await api.batchNodes({ action: "update", ids: affectedIds, remove_tag: clean });
+      }
       setSelectedTabIds((prev) => prev.filter((id) => id !== `utag:${clean}`));
       await refreshAll();
     } catch (err) {
@@ -434,22 +539,15 @@ export function ProxiesView() {
       );
       if (!nextTabs.includes(clean)) nextTabs.push(clean);
       await saveCustomNodeTabs(nextTabs);
-      const affected = nodes.filter((n) => nodeHasTag(n, oldName));
-      await Promise.all(
-        affected.map((n) => {
-          const nextNodeTags = Array.from(
-            new Set([
-              ...(n.tags || []).filter((t) => t.trim() !== oldName),
-              clean,
-            ]),
-          );
-          return api.updateNode(n.id, {
-            ...n,
-            group: (n.group || "").trim() === oldName ? clean : n.group,
-            tags: nextNodeTags,
-          });
-        }),
-      );
+      const affectedIds = nodes.filter((n) => nodeHasTag(n, oldName)).map((n) => n.id);
+      if (affectedIds.length > 0) {
+        await api.batchNodes({
+          action: "update",
+          ids: affectedIds,
+          remove_tag: oldName,
+          add_tag: clean,
+        });
+      }
       setSelectedTabIds((prev) => prev.map((id) => (id === `utag:${oldName}` ? `utag:${clean}` : id)));
       await refreshAll();
     } catch (err) {
@@ -495,17 +593,11 @@ export function ProxiesView() {
     if (!clean || selectedNodesList.length === 0) return;
     setSavingTabs(true);
     try {
-      await Promise.all(
-        selectedNodesList.map((n) => {
-          if (nextChecked) {
-            const nextTags = Array.from(new Set([...(n.tags || []), clean]));
-            return api.updateNode(n.id, { ...n, tags: nextTags });
-          }
-          const nextTags = (n.tags || []).filter((t) => t.trim() !== clean);
-          const nextGroup = (n.group || "").trim() === clean ? "" : n.group;
-          return api.updateNode(n.id, { ...n, group: nextGroup, tags: nextTags });
-        }),
-      );
+      await api.batchNodes({
+        action: "update",
+        ids: selectedNodesList.map((n) => n.id),
+        ...(nextChecked ? { add_tag: clean } : { remove_tag: clean }),
+      });
       await refreshAll();
       notify(
         nextChecked
@@ -527,18 +619,176 @@ export function ProxiesView() {
       if (!customNodeTabs.includes(clean)) {
         await saveCustomNodeTabs([...customNodeTabs, clean]);
       }
-      await Promise.all(
-        selectedNodesList.map((n) => {
-          const nextTags = Array.from(new Set([...(n.tags || []), clean]));
-          return api.updateNode(n.id, { ...n, tags: nextTags });
-        }),
-      );
+      await api.batchNodes({
+        action: "update",
+        ids: selectedNodesList.map((n) => n.id),
+        add_tag: clean,
+      });
       await refreshAll();
       notify(tr("proxies.tabAdded", { count: selectedNodesList.length, name: clean }));
     } catch (err) {
       notify(formatApiError(err), "error");
     } finally {
       setSavingTabs(false);
+    }
+  };
+
+  const timedOutNodes = useMemo(
+    () => displayedNodes.filter((n) => typeof n.latency === "number" && n.latency < 0),
+    [displayedNodes],
+  );
+
+  const duplicateNodeIds = useMemo(() => {
+    const buckets = new Map<string, NodeConfig[]>();
+    for (const n of displayedNodes) {
+      const fp = nodeDuplicateFingerprint(n);
+      const list = buckets.get(fp);
+      if (list) list.push(n);
+      else buckets.set(fp, [n]);
+    }
+    const activeId = status?.active_node_id || "";
+    const dropIds: string[] = [];
+    for (const list of buckets.values()) {
+      if (list.length <= 1) continue;
+      const ranked = [...list].sort((a, b) => {
+        const aAct = a.id === activeId ? 1 : 0;
+        const bAct = b.id === activeId ? 1 : 0;
+        if (aAct !== bAct) return bAct - aAct;
+        const aFav = a.favorite ? 1 : 0;
+        const bFav = b.favorite ? 1 : 0;
+        if (aFav !== bFav) return bFav - aFav;
+        const aLat = a.latency && a.latency > 0 ? a.latency : Number.MAX_SAFE_INTEGER;
+        const bLat = b.latency && b.latency > 0 ? b.latency : Number.MAX_SAFE_INTEGER;
+        return aLat - bLat;
+      });
+      for (let i = 1; i < ranked.length; i += 1) {
+        dropIds.push(ranked[i].id);
+      }
+    }
+    return dropIds;
+  }, [displayedNodes, status?.active_node_id]);
+
+  const handleCopyNodeUri = async (node: NodeConfig) => {
+    try {
+      const res = await api.getNodeUri(node.id);
+      const ok = await copyTextToClipboard(res.uri);
+      if (ok) {
+        notify(tr("toast.copied"));
+      } else {
+        notify(tr("proxies.copyUriFailed"), "error");
+      }
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    }
+  };
+
+  const handleCloneNode = async (node: NodeConfig) => {
+    try {
+      const {
+        id: _id,
+        sub_id: _subId,
+        latency: _lat,
+        ping_ms: _ping,
+        down_speed_mbps: _down,
+        up_speed_mbps: _up,
+        ...rest
+      } = node;
+      await api.addNode({
+        ...rest,
+        name: `${node.name} (Copy)`,
+        user_alias: node.user_alias ? `${node.user_alias} (Copy)` : undefined,
+      });
+      await refreshAll();
+      notify(tr("proxies.nodeCloned"));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    }
+  };
+
+  const handleCleanTimedOut = async () => {
+    if (timedOutNodes.length === 0) {
+      notify(tr("proxies.noTimedOutNodes"), "warning");
+      return;
+    }
+    setBatchBusy(true);
+    try {
+      const ids = timedOutNodes.map((n) => n.id);
+      const res = await api.batchNodes({ action: "delete", ids });
+      const dropSet = new Set(ids);
+      setSelectedIds((prev) => prev.filter((id) => !dropSet.has(id)));
+      await refreshAll();
+      notify(tr("proxies.cleanedTimedOut", { count: res.deleted }));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const handleDeduplicateNodes = async () => {
+    if (duplicateNodeIds.length === 0) {
+      notify(tr("proxies.noDuplicateNodes"), "warning");
+      return;
+    }
+    setBatchBusy(true);
+    try {
+      const res = await api.batchNodes({ action: "delete", ids: duplicateNodeIds });
+      const dropSet = new Set(duplicateNodeIds);
+      setSelectedIds((prev) => prev.filter((id) => !dropSet.has(id)));
+      await refreshAll();
+      notify(tr("proxies.deduplicatedNodes", { count: res.deleted }));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const handleBatchExportSelected = async () => {
+    if (selectedValidIds.length === 0) return;
+    setBatchBusy(true);
+    try {
+      const uris: string[] = [];
+      const chunkSize = 10;
+      for (let i = 0; i < selectedValidIds.length; i += chunkSize) {
+        const chunk = selectedValidIds.slice(i, i + chunkSize);
+        const results = await Promise.allSettled(chunk.map((id) => api.getNodeUri(id)));
+        for (const r of results) {
+          if (r.status === "fulfilled" && r.value.uri) {
+            uris.push(r.value.uri);
+          }
+        }
+      }
+      if (uris.length === 0) {
+        notify(tr("proxies.copyUriFailed"), "error");
+        return;
+      }
+      const ok = await copyTextToClipboard(uris.join("\n"));
+      if (ok) {
+        notify(tr("proxies.exportedSelectedUris", { count: uris.length }));
+      } else {
+        notify(tr("proxies.copyUriFailed"), "error");
+      }
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const handleBatchDeleteSelected = async () => {
+    if (selectedValidIds.length === 0) return;
+    setBatchBusy(true);
+    try {
+      const ids = [...selectedValidIds];
+      const res = await api.batchNodes({ action: "delete", ids });
+      setSelectedIds([]);
+      await refreshAll();
+      notify(tr("proxies.deletedSelected", { count: res.deleted }));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setBatchBusy(false);
     }
   };
 
@@ -591,6 +841,9 @@ export function ProxiesView() {
     setGroupStrategy("selector");
     setGroupPriorityRule("");
     setGroupAutoFailover("inherit");
+    setGroupFailoverTrigger("high_latency_or_unavailable");
+    setGroupHighLatencyInput("");
+    setGroupLoadBalanceShardsInput("");
     setGroupDetourId("");
     setGroupIntervalVal(5);
     setGroupIntervalUnit("m");
@@ -606,7 +859,7 @@ export function ProxiesView() {
   const openEditGroupForm = (g: GroupConfig) => {
     const strat = canonicalStrategy(g.strategy);
     const parsedInt = parseGoDuration(
-      g.interval || (strat === "failover" ? "1m" : strat === "loadbalance" ? "10m" : "5m"),
+      g.interval || (strat === "failover" ? "5m" : strat === "loadbalance" ? "10m" : "5m"),
       ["ms", "s", "m", "h", "d"],
       { value: strat === "failover" ? 1 : strat === "loadbalance" ? 10 : 5, unit: "m" },
     );
@@ -619,7 +872,22 @@ export function ProxiesView() {
     setGroupName(g.name);
     setGroupStrategy(strat);
     setGroupPriorityRule(g.priority_rule || "");
-    setGroupAutoFailover(g.auto_failover === true ? "on" : g.auto_failover === false ? "off" : "inherit");
+    setGroupAutoFailover(
+      strat === "selector"
+        ? g.auto_failover === true
+          ? "on"
+          : g.auto_failover === false
+            ? "off"
+            : "inherit"
+        : "inherit",
+    );
+    setGroupFailoverTrigger(
+      g.failover_trigger === "unavailable_only" ? "unavailable_only" : "high_latency_or_unavailable",
+    );
+    setGroupHighLatencyInput(g.high_latency_ms && g.high_latency_ms > 0 ? String(g.high_latency_ms) : "");
+    setGroupLoadBalanceShardsInput(
+      g.load_balance_shards && g.load_balance_shards > 0 ? String(g.load_balance_shards) : "",
+    );
     setGroupDetourId(g.detour_id || "");
     setGroupIntervalVal(parsedInt.value);
     setGroupIntervalUnit(parsedInt.unit);
@@ -655,7 +923,11 @@ export function ProxiesView() {
           nextManualPin = true;
         }
       }
-      const needsHealthTiming = groupStrategy !== "selector" || groupAutoFailover === "on";
+      const selectorFailoverActive =
+        groupStrategy === "selector" &&
+        (groupAutoFailover === "on" || (groupAutoFailover === "inherit" && Boolean(healthSettings?.failover)));
+      const supportsTrigger = groupStrategy === "failover" || groupStrategy === "urltest" || selectorFailoverActive;
+      const needsHealthTiming = groupStrategy !== "selector" || selectorFailoverActive;
       const serializedInterval =
         groupIntervalVal > 0
           ? formatGoDuration(groupIntervalVal, groupIntervalUnit)
@@ -663,13 +935,32 @@ export function ProxiesView() {
             ? "10m"
             : "5m";
       const serializedToleranceMs = Math.max(0, joinToMilliseconds(groupToleranceVal, groupToleranceUnit));
+      const parsedGroupHighLat = groupHighLatencyInput.trim() === "" ? 0 : Math.round(Number(groupHighLatencyInput));
+      const serializedHighLat =
+        supportsTrigger && groupFailoverTrigger === "high_latency_or_unavailable" && Number.isFinite(parsedGroupHighLat) && parsedGroupHighLat > 0
+          ? Math.min(10000, Math.max(100, parsedGroupHighLat))
+          : 0;
+      const parsedLBShards =
+        groupLoadBalanceShardsInput.trim() === "" ? 0 : Math.round(Number(groupLoadBalanceShardsInput));
+      const serializedLBShards =
+        groupStrategy === "loadbalance" && Number.isFinite(parsedLBShards) && parsedLBShards > 0
+          ? Math.min(36, Math.max(1, parsedLBShards))
+          : 0;
       const payload = {
         name: groupName.trim(),
         strategy: groupStrategy,
         selected_node_id: nextSelected,
         manual_pin: nextManualPin,
         priority_rule: groupPriorityRule,
-        auto_failover: groupAutoFailover === "inherit" ? null : groupAutoFailover === "on",
+        auto_failover:
+          groupStrategy === "selector"
+            ? groupAutoFailover === "inherit"
+              ? null
+              : groupAutoFailover === "on"
+            : null,
+        failover_trigger: (supportsTrigger ? groupFailoverTrigger : "") as GroupConfig["failover_trigger"],
+        high_latency_ms: serializedHighLat,
+        load_balance_shards: serializedLBShards,
         detour_id: groupDetourId.trim(),
         interval: needsHealthTiming ? serializedInterval : "",
         tolerance_ms: needsHealthTiming ? serializedToleranceMs || 50 : 0,
@@ -756,7 +1047,11 @@ export function ProxiesView() {
     void persistGroupOrder(next);
   };
 
+  const groupDragHandlersRef = useRef({ swapGroupOrderDraft, persistGroupOrder });
+  groupDragHandlersRef.current = { swapGroupOrderDraft, persistGroupOrder };
+
   useEffect(() => {
+    if (groupDragIndex === null) return;
     const onPointerMove = (e: PointerEvent) => {
       const currentIdx = activeGroupDragRef.current;
       if (currentIdx === null || !groupListRef.current) return;
@@ -771,7 +1066,7 @@ export function ProxiesView() {
           ((currentIdx < idxAttr && e.clientY > rect.top + rect.height / 2) ||
             (currentIdx > idxAttr && e.clientY < rect.top + rect.height / 2))
         ) {
-          swapGroupOrderDraft(currentIdx, idxAttr);
+          groupDragHandlersRef.current.swapGroupOrderDraft(currentIdx, idxAttr);
           activeGroupDragRef.current = idxAttr;
           setGroupDragIndex(idxAttr);
           break;
@@ -785,7 +1080,7 @@ export function ProxiesView() {
         setGroupDragIndex(null);
         const pending = groupOrderOverrideRef.current;
         if (pending && pending.length > 0) {
-          void persistGroupOrder(pending);
+          void groupDragHandlersRef.current.persistGroupOrder(pending);
         }
       }
     };
@@ -798,7 +1093,7 @@ export function ProxiesView() {
       window.removeEventListener("pointerup", endGroupDrag);
       window.removeEventListener("pointercancel", endGroupDrag);
     };
-  });
+  }, [groupDragIndex !== null]);
 
   const handleDeleteGroup = async (groupId: string) => {
     try {
@@ -953,14 +1248,14 @@ export function ProxiesView() {
   };
 
   const renderNodeActionButtons = (n: NodeConfig, compact = false) => {
-    const isActive = status?.running && status.active_node_id === n.id;
+    const isActive = isProxyRunning && !status?.active_group_id && status?.active_node_id === n.id;
     const displayName = n.user_alias || n.name;
     const connectTip = isActive ? tr("action.disconnect") : tr("action.connect");
     return (
       <div className={`flex flex-nowrap items-center gap-0.5 ${compact ? "justify-start" : "justify-end"}`}>
         <button
           type="button"
-          onClick={() => void toggleConnect({ nodeId: n.id })}
+          onClick={() => void toggleConnect(isActive ? undefined : { nodeId: n.id })}
           title={connectTip}
           aria-label={`${connectTip} ${displayName}`}
           className={[
@@ -1230,12 +1525,12 @@ export function ProxiesView() {
                           <Gauge className={`h-3.5 w-3.5 ${probingGroupId === g.id ? "animate-spin text-primary" : ""}`} aria-hidden="true" />
                         </button>
                         {(() => {
-                          const groupActive = status?.active_group_id === g.id && status.running;
+                          const groupActive = isProxyRunning && status?.active_group_id === g.id;
                           const tip = groupActive ? tr("action.disconnect") : tr("action.connect");
                           return (
                             <button
                               type="button"
-                              onClick={() => void toggleConnect({ groupId: g.id })}
+                              onClick={() => void toggleConnect(groupActive ? undefined : { groupId: g.id })}
                               title={tip}
                               aria-label={`${tip} ${g.name}`}
                               className={[
@@ -1297,7 +1592,7 @@ export function ProxiesView() {
                           {globalRuleLabel(g.priority_rule)}
                         </span>
                       ) : null}
-                      {g.auto_failover === true || g.auto_failover === false ? (
+                      {strat === "selector" && (g.auto_failover === true || g.auto_failover === false) ? (
                         <span className="inline-flex shrink-0 items-center whitespace-nowrap rounded-full border border-border bg-background px-1.5 py-0.5 text-[10px] leading-none text-muted-foreground">
                           {g.auto_failover
                             ? locale === "zh-CN"
@@ -1306,6 +1601,24 @@ export function ProxiesView() {
                             : locale === "zh-CN"
                               ? "仅排序"
                               : "Rank Only"}
+                        </span>
+                      ) : null}
+                      {strat === "failover" ||
+                      (strat === "selector" &&
+                        (g.auto_failover === true || (g.auto_failover == null && healthSettings?.failover))) ? (
+                        <span className="inline-flex shrink-0 items-center whitespace-nowrap rounded-full border border-border bg-background px-1.5 py-0.5 text-[10px] leading-none text-muted-foreground">
+                          {g.failover_trigger === "unavailable_only"
+                            ? tr("proxies.failoverTriggerBadgeUnavailable")
+                            : tr("proxies.failoverTriggerBadgeHighLat", {
+                                ms: g.high_latency_ms && g.high_latency_ms > 0 ? g.high_latency_ms : highLatencyMs,
+                              })}
+                        </span>
+                      ) : null}
+                      {strat === "loadbalance" ? (
+                        <span className="inline-flex shrink-0 items-center whitespace-nowrap rounded-full border border-emerald-500/35 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium leading-none text-emerald-700 dark:text-emerald-300 tabular-nums">
+                          {tr("proxies.loadBalanceShardsBadge", {
+                            count: g.load_balance_shards && g.load_balance_shards > 0 ? Math.min(36, g.load_balance_shards) : 4,
+                          })}
                         </span>
                       ) : null}
                       {g.detour_id ? (
@@ -1319,19 +1632,28 @@ export function ProxiesView() {
                     </div>
 
                     {strat === "loadbalance" ? (
-                      <p className="text-[11px] leading-snug text-muted-foreground">{tr("proxies.lbReadonlyHint")}</p>
+                      <p className="text-[11px] leading-snug text-muted-foreground">
+                        {tr("proxies.lbReadonlyHint", {
+                          count: Math.min(
+                            g.load_balance_shards && g.load_balance_shards > 0 ? Math.min(36, g.load_balance_shards) : 4,
+                            Math.max(1, (g.node_ids || []).length),
+                          ),
+                        })}
+                      </p>
                     ) : null}
 
                     {(() => {
-                      const liveNodeId = status?.running ? status.live_group_nodes?.[g.id] : undefined;
+                      const liveNodeId = isProxyRunning ? status?.live_group_nodes?.[g.id] : undefined;
                       const lbShardRank = new Map<string, number>();
                       if (strat === "loadbalance") {
+                        const lbLimit =
+                          g.load_balance_shards && g.load_balance_shards > 0 ? Math.min(36, g.load_balance_shards) : 4;
                         const memberIds = g.node_ids || [];
                         const healthy = memberIds.filter((id) => {
                           const nd = nodes.find((item) => item.id === id);
                           return nd && (nd.latency ?? 0) >= 0;
                         });
-                        const activeShards = (healthy.length > 0 ? healthy : memberIds).slice(0, 4);
+                        const activeShards = (healthy.length > 0 ? healthy : memberIds).slice(0, lbLimit);
                         activeShards.forEach((id, sIdx) => lbShardRank.set(id, sIdx + 1));
                       }
                       return (
@@ -1624,17 +1946,67 @@ export function ProxiesView() {
           ) : null}
 
           {selectedValidIds.length > 0 ? (
-            <NodeTabMultiSelect
-              mode="assign"
-              lockedSources={batchLockedSources}
-              customTags={allUserTags}
-              tagStates={batchTagStates}
-              onToggleTag={handleBatchToggleTag}
-              onCreateAndAssignTag={handleBatchCreateAndAssignTag}
-              triggerLabel={tr("proxies.assignTab")}
-              busy={savingTabs}
-              className="w-36 shrink-0"
-            />
+            <>
+              <NodeTabMultiSelect
+                mode="assign"
+                lockedSources={batchLockedSources}
+                customTags={allUserTags}
+                tagStates={batchTagStates}
+                onToggleTag={handleBatchToggleTag}
+                onCreateAndAssignTag={handleBatchCreateAndAssignTag}
+                triggerLabel={tr("proxies.assignTab")}
+                busy={savingTabs}
+                className="w-36 shrink-0"
+              />
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={batchBusy}
+                onClick={() => void handleBatchExportSelected()}
+              >
+                <Copy className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+                {tr("proxies.exportSelected")}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="destructive"
+                disabled={batchBusy}
+                onClick={() => void handleBatchDeleteSelected()}
+              >
+                <Trash2 className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />
+                {tr("proxies.deleteSelected", { count: selectedValidIds.length })}
+              </Button>
+            </>
+          ) : null}
+
+          {timedOutNodes.length > 0 ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={batchBusy}
+              onClick={() => void handleCleanTimedOut()}
+              title={tr("proxies.cleanTimedOutHint")}
+            >
+              <Eraser className="mr-1.5 h-3.5 w-3.5 text-destructive" aria-hidden="true" />
+              {tr("proxies.cleanTimedOut")} ({timedOutNodes.length})
+            </Button>
+          ) : null}
+
+          {duplicateNodeIds.length > 0 ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={batchBusy}
+              onClick={() => void handleDeduplicateNodes()}
+              title={tr("proxies.deduplicateHint")}
+            >
+              <Sparkles className="mr-1.5 h-3.5 w-3.5 text-primary" aria-hidden="true" />
+              {tr("proxies.deduplicate")} ({duplicateNodeIds.length})
+            </Button>
           ) : null}
 
           <div className="w-24 sm:w-28 shrink-0">
@@ -1682,26 +2054,33 @@ export function ProxiesView() {
           <CardContent className="p-8 text-center text-xs text-muted-foreground">{tr("proxies.noNodes")}</CardContent>
         </Card>
       ) : nodeViewMode === "list" ? (
-        <>
-          {/* Mobile List with SwipeActionRow & >=48px targets */}
-          <div className="space-y-2 md:hidden">
-            {displayedNodes.map((n) => {
-              const isActive = status?.running && status.active_node_id === n.id;
+        isMobile ? (
+          /* Mobile List with SwipeActionRow & >=48px targets (only mounted on mobile) */
+          <div className="space-y-2">
+            {renderedNodes.map((n) => {
+              const isActive = isProxyRunning && !status?.active_group_id && status?.active_node_id === n.id;
+              const isSelected = selectedSet.has(n.id);
               const isInspected = inspectorMode === "node" && editingNode?.id === n.id;
               const displayName = n.user_alias || n.name;
               return (
                 <SwipeActionRow
                   key={n.id}
-                  className={`rounded-[10px] border bg-card ${
-                    isInspected ? "border-primary bg-accent/30" : isActive ? "border-primary/60" : "border-border"
+                  className={`rounded-[10px] border bg-card transition-colors ${
+                    isInspected
+                      ? "border-primary bg-accent/45 ring-1 ring-primary/40"
+                      : isSelected
+                        ? "border-primary/80 bg-primary/10 ring-1 ring-primary/30"
+                        : isActive
+                          ? "border-emerald-500/60 bg-emerald-500/5"
+                          : "border-border"
                   }`}
                   actions={[
                     {
                       key: "connect",
-                      label: tr("action.connect"),
-                      icon: <Play className="h-4 w-4" />,
+                      label: isActive ? tr("action.disconnect") : tr("action.connect"),
+                      icon: isActive ? <Square className="h-3.5 w-3.5 fill-current" /> : <Play className="h-4 w-4" />,
                       tone: "primary",
-                      onClick: () => void toggleConnect({ nodeId: n.id }),
+                      onClick: () => void toggleConnect(isActive ? undefined : { nodeId: n.id }),
                     },
                     {
                       key: "probe",
@@ -1727,56 +2106,74 @@ export function ProxiesView() {
                   <div
                     role="button"
                     tabIndex={0}
-                    aria-pressed={selectedSet.has(n.id)}
-                    onClick={() => toggleSelectNode(n.id)}
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      setContextMenu({ x: e.clientX, y: e.clientY, node: n });
+                    aria-pressed={isSelected}
+                    onClick={(e) => {
+                      if (Date.now() - lastContextMenuAtRef.current < 450) return;
+                      if (!(e.target as HTMLElement).closest("button, input, select, a, label")) {
+                        toggleSelectNode(n.id);
+                      }
                     }}
+                    onContextMenu={(e) => openNodeContextMenu(e, n)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
                         toggleSelectNode(n.id);
                       }
                     }}
-                    className={`p-3 space-y-1 text-left ${selectedSet.has(n.id) ? "bg-accent/35" : ""}`}
+                    className="flex select-none items-start gap-2.5 p-3 text-left"
                   >
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex min-w-0 items-center gap-1.5">
-                        <span className="truncate text-[14px] font-semibold text-foreground">{displayName}</span>
-                        {n.detour_id ? (
-                          <span className="shrink-0 whitespace-nowrap badge-radius border border-primary/30 bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
-                            {tr("node.detourVia", { name: getDetourLabel(n.detour_id) })}
-                          </span>
-                        ) : null}
+                    <Checkbox
+                      aria-label={`${tr("proxies.colSelect")} ${displayName}`}
+                      checked={isSelected}
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={() => toggleSelectNode(n.id)}
+                      className="mt-1 shrink-0"
+                    />
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          {isActive ? (
+                            <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-500" aria-hidden="true" />
+                          ) : null}
+                          <span className="truncate text-[14px] font-semibold text-foreground">{displayName}</span>
+                          {n.favorite ? (
+                            <Star className="h-3.5 w-3.5 shrink-0 text-amber-500" fill="currentColor" aria-hidden="true" />
+                          ) : null}
+                          {n.detour_id ? (
+                            <span className="shrink-0 whitespace-nowrap badge-radius border border-primary/30 bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                              {tr("node.detourVia", { name: getDetourLabel(n.detour_id) })}
+                            </span>
+                          ) : null}
+                        </div>
+                        {(() => {
+                          const health = getNodeHealthStyles(getNodeHealthState(n.latency, highLatencyMs));
+                          return (
+                            <span
+                              className={`inline-flex items-center gap-1 badge-radius border px-1.5 py-0.5 mono-num text-[11px] font-medium shrink-0 ${health.badgeClass}`}
+                            >
+                              <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${health.dotClass}`} aria-hidden="true" />
+                              {formatLatency(n.latency)}
+                            </span>
+                          );
+                        })()}
                       </div>
-                      {(() => {
-                        const health = getNodeHealthStyles(getNodeHealthState(n.latency, highLatencyMs));
-                        return (
-                          <span
-                            className={`inline-flex items-center gap-1 badge-radius border px-1.5 py-0.5 mono-num text-[11px] font-medium shrink-0 ${health.badgeClass}`}
-                          >
-                            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${health.dotClass}`} aria-hidden="true" />
-                            {formatLatency(n.latency)}
-                          </span>
-                        );
-                      })()}
-                    </div>
-                    <div className="flex items-center justify-between gap-2 mono-num text-xs text-muted-foreground">
-                      <span className="truncate">
-                        {n.protocol.toUpperCase()} · {n.address}:{n.port}
-                      </span>
-                      <span className="shrink-0">{formatSpeedMbps(n.down_speed_mbps)}</span>
+                      <div className="flex items-center justify-between gap-2 mono-num text-xs text-muted-foreground">
+                        <span className="truncate">
+                          {n.protocol.toUpperCase()} · {n.address}:{n.port}
+                        </span>
+                        <span className="shrink-0">{formatSpeedMbps(n.down_speed_mbps)}</span>
+                      </div>
                     </div>
                   </div>
                 </SwipeActionRow>
               );
             })}
           </div>
-
-          {/* Desktop Adaptive List: wide 9-col resizable table vs ultra-compact 2-row narrow list */}
-          <div className="hidden md:block proxies-list-stage">
-            <div className="proxies-list-wide table-wrapper">
+        ) : (
+          /* Desktop Adaptive List: mounts ONLY the active wide 9-col table OR narrow 2-row list */
+          <div ref={listStageRef} className="proxies-list-stage">
+            {!isNarrowList ? (
+            <div className="table-wrapper">
               <table className="responsive-table table-resizable [&_th]:py-1.5 [&_th]:px-2 [&_td]:py-1.5 [&_td]:px-2">
                 <colgroup>
                   <col style={{ width: `${nodeColWidths.select}px` }} />
@@ -1792,10 +2189,11 @@ export function ProxiesView() {
                 <thead>
                   <tr>
                     <th scope="col" className="w-9">
-                      <input
-                        type="checkbox"
+                      <Checkbox
+                        size="sm"
                         aria-label={allFilteredSelected ? tr("proxies.clearSelection") : tr("proxies.selectAll")}
                         checked={allFilteredSelected}
+                        indeterminate={selectedValidIds.length > 0 && !allFilteredSelected}
                         onChange={toggleSelectAllFiltered}
                       />
                     </th>
@@ -1826,8 +2224,8 @@ export function ProxiesView() {
                   </tr>
                 </thead>
                 <tbody>
-                  {displayedNodes.map((n) => {
-                    const isActive = status?.running && status.active_node_id === n.id;
+                  {renderedNodes.map((n) => {
+                    const isActive = isProxyRunning && !status?.active_group_id && status?.active_node_id === n.id;
                     const isSelected = selectedSet.has(n.id);
                     const isInspected = inspectorMode === "node" && editingNode?.id === n.id;
                     const insecure = nodeHasInsecureTLS(n);
@@ -1836,28 +2234,26 @@ export function ProxiesView() {
                       <tr
                         key={n.id}
                         onClick={(e) => {
+                          if (Date.now() - lastContextMenuAtRef.current < 450) return;
                           if (!(e.target as HTMLElement).closest("button, input, select, a, label")) {
                             toggleSelectNode(n.id);
                           }
                         }}
-                        onContextMenu={(e) => {
-                          e.preventDefault();
-                          setContextMenu({ x: e.clientX, y: e.clientY, node: n });
-                        }}
+                        onContextMenu={(e) => openNodeContextMenu(e, n)}
                         className={[
                           "cursor-pointer dense-row transition-colors duration-100 select-none",
                           isInspected
                             ? "bg-accent/70"
                             : isSelected
-                              ? "bg-accent/45"
+                              ? "bg-primary/12"
                               : isActive
-                                ? "bg-primary/10"
+                                ? "bg-emerald-500/10"
                                 : "hover:bg-muted/40",
                         ].join(" ")}
                       >
                         <td data-label={tr("proxies.colSelect")}>
-                          <input
-                            type="checkbox"
+                          <Checkbox
+                            size="sm"
                             aria-label={`${tr("proxies.colSelect")} ${displayName}`}
                             checked={isSelected}
                             onChange={() => toggleSelectNode(n.id)}
@@ -1913,11 +2309,11 @@ export function ProxiesView() {
                 </tbody>
               </table>
             </div>
-
-            {/* Ultra-compact 2-row narrow list (<640px container width): replaces tall 9-row stacked cards */}
-            <div className="proxies-list-narrow">
-              {displayedNodes.map((n) => {
-                const isActive = status?.running && status.active_node_id === n.id;
+            ) : (
+            /* Ultra-compact 2-row narrow list (<640px container width): replaces tall 9-row stacked cards */
+            <div className="space-y-2">
+              {renderedNodes.map((n) => {
+                const isActive = isProxyRunning && !status?.active_group_id && status?.active_node_id === n.id;
                 const isSelected = selectedSet.has(n.id);
                 const isInspected = inspectorMode === "node" && editingNode?.id === n.id;
                 const insecure = nodeHasInsecureTLS(n);
@@ -1927,30 +2323,28 @@ export function ProxiesView() {
                     key={n.id}
                     data-narrow-node-row={n.id}
                     onClick={(e) => {
+                      if (Date.now() - lastContextMenuAtRef.current < 450) return;
                       if (!(e.target as HTMLElement).closest("button, input, select, a, label")) {
                         toggleSelectNode(n.id);
                       }
                     }}
-                    onContextMenu={(e) => {
-                      e.preventDefault();
-                      setContextMenu({ x: e.clientX, y: e.clientY, node: n });
-                    }}
+                    onContextMenu={(e) => openNodeContextMenu(e, n)}
                     className={[
                       "prism-card prism-card-interactive cursor-pointer select-none rounded-[10px] border px-3 py-2 space-y-1.5",
                       isInspected
                         ? "border-primary bg-accent/55"
                         : isSelected
-                          ? "border-primary/70 bg-accent/35"
+                          ? "border-primary/80 bg-primary/10 ring-1 ring-primary/30"
                           : isActive
-                            ? "border-primary/60 bg-primary/10"
+                            ? "border-emerald-500/60 bg-emerald-500/5"
                             : "border-border bg-card hover:border-primary/40",
                     ].join(" ")}
                   >
                     {/* Line 1: Checkbox + Truncated Name + Protocol + Hoverable 真连接 Telemetry Pill */}
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex min-w-0 flex-1 items-center gap-2">
-                        <input
-                          type="checkbox"
+                        <Checkbox
+                          size="sm"
                           aria-label={`${tr("proxies.colSelect")} ${displayName}`}
                           checked={isSelected}
                           onChange={() => toggleSelectNode(n.id)}
@@ -1988,12 +2382,13 @@ export function ProxiesView() {
                 );
               })}
             </div>
+            )}
           </div>
-        </>
+        )
       ) : (
         <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,17rem),1fr))] gap-2.5">
-          {displayedNodes.map((n, cardIdx) => {
-            const isActive = status?.running && status.active_node_id === n.id;
+          {renderedNodes.map((n, cardIdx) => {
+            const isActive = isProxyRunning && !status?.active_group_id && status?.active_node_id === n.id;
             const isSelected = selectedSet.has(n.id);
             const isInspected = inspectorMode === "node" && editingNode?.id === n.id;
             const insecure = nodeHasInsecureTLS(n);
@@ -2005,10 +2400,10 @@ export function ProxiesView() {
                 actions={[
                   {
                     key: "connect",
-                    label: tr("action.connect"),
-                    icon: <Play className="h-4 w-4" />,
+                    label: isActive ? tr("action.disconnect") : tr("action.connect"),
+                    icon: isActive ? <Square className="h-3.5 w-3.5 fill-current" /> : <Play className="h-4 w-4" />,
                     tone: "primary",
-                    onClick: () => void toggleConnect({ nodeId: n.id }),
+                    onClick: () => void toggleConnect(isActive ? undefined : { nodeId: n.id }),
                   },
                   {
                     key: "probe",
@@ -2034,23 +2429,21 @@ export function ProxiesView() {
                 <Card
                   data-node-card={n.id}
                   onClick={(e) => {
+                    if (Date.now() - lastContextMenuAtRef.current < 450) return;
                     if (!(e.target as HTMLElement).closest("button, input, select, a, label")) {
                       toggleSelectNode(n.id);
                     }
                   }}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    setContextMenu({ x: e.clientX, y: e.clientY, node: n });
-                  }}
+                  onContextMenu={(e) => openNodeContextMenu(e, n)}
                   className={[
                     "node-card-container prism-card-interactive cursor-pointer select-none",
                     cardIdx >= 12 ? "node-card-deferred" : "",
                     isInspected
                       ? "border-primary bg-accent/45"
                       : isSelected
-                        ? "border-primary/70 bg-accent/35"
+                        ? "border-primary/80 bg-primary/10 ring-1 ring-primary/30"
                         : isActive
-                          ? "border-primary/60 bg-primary/10"
+                          ? "border-emerald-500/60 bg-emerald-500/5"
                           : "hover:border-primary/40",
                   ].join(" ")}
                 >
@@ -2058,8 +2451,8 @@ export function ProxiesView() {
                     {/* Upper Tier: Checkbox + Name + Protocol + Favorite & Single-line Address */}
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex min-w-0 flex-1 items-start gap-2">
-                        <input
-                          type="checkbox"
+                        <Checkbox
+                          size="sm"
                           aria-label={`${tr("proxies.colSelect")} ${displayName}`}
                           checked={isSelected}
                           onChange={() => toggleSelectNode(n.id)}
@@ -2128,23 +2521,42 @@ export function ProxiesView() {
           })}
         </div>
       )}
+      {renderedNodes.length < displayedNodes.length ? (
+        <div ref={loadMoreSentinelRef} className="flex items-center justify-center py-3">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setVisibleNodeLimit((prev) => Math.min(displayedNodes.length, prev + 80))}
+          >
+            {locale === "zh-CN"
+              ? `显示更多节点 (${renderedNodes.length} / ${displayedNodes.length})`
+              : `Load more nodes (${renderedNodes.length} / ${displayedNodes.length})`}
+          </Button>
+        </div>
+      ) : null}
       </div>
 
       {/* Node Right-Click Context Menu */}
       <NodeContextMenu
         state={contextMenu}
-        isActive={Boolean(contextMenu && status?.running && status.active_node_id === contextMenu.node.id)}
+        isActive={Boolean(contextMenu && isProxyRunning && !status?.active_group_id && status?.active_node_id === contextMenu.node.id)}
         isSelected={Boolean(contextMenu && selectedSet.has(contextMenu.node.id))}
         selectedCount={selectedValidIds.length}
         probing={Boolean(contextMenu && probingId === contextMenu.node.id)}
         onClose={() => setContextMenu(null)}
-        onToggleConnect={(id) => void toggleConnect({ nodeId: id })}
+        onToggleConnect={(id) => {
+          const active = isProxyRunning && !status?.active_group_id && status?.active_node_id === id;
+          void toggleConnect(active ? undefined : { nodeId: id });
+        }}
         onProbeSingle={(id) => void handleProbeSingle(id)}
         onProbeSelected={() => void handleProbeBatch(selectedValidIds)}
         onToggleSelect={toggleSelectNode}
         onToggleFavorite={(node) => void handleToggleFavorite(node)}
         onEditNode={openNodeInspector}
         onShareQr={(node) => void handleOpenQR(node)}
+        onCopyUri={(node) => void handleCopyNodeUri(node)}
+        onCloneNode={(node) => void handleCloneNode(node)}
         onDeleteNode={(id) => void handleDeleteNode(id)}
       />
 
@@ -2234,9 +2646,36 @@ export function ProxiesView() {
                   <option value="loadbalance">loadbalance ({locale === "zh-CN" ? "主域名哈希负载均衡" : "Domain Hash LB"})</option>
                 </Select>
                 {groupStrategy === "loadbalance" ? (
-                  <p className="text-[11px] leading-snug text-muted-foreground">
-                    {tr("proxies.loadBalanceBatteryHint")}
-                  </p>
+                  <div className="space-y-2 pt-1">
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-1.5">
+                        <label
+                          className="text-xs font-medium text-muted-foreground"
+                          htmlFor="group-lb-shards-input"
+                        >
+                          {tr("proxies.loadBalanceShardsLabel")}
+                        </label>
+                        <HelpTip
+                          ariaLabel={tr("proxies.loadBalanceShardsLabel")}
+                          text={tr("proxies.loadBalanceShardsHint")}
+                        />
+                      </div>
+                      <Input
+                        id="group-lb-shards-input"
+                        type="number"
+                        min={1}
+                        max={36}
+                        step={1}
+                        value={groupLoadBalanceShardsInput}
+                        onChange={(e) => setGroupLoadBalanceShardsInput(e.target.value)}
+                        placeholder="4"
+                        className="font-mono text-xs"
+                      />
+                    </div>
+                    <p className="text-[11px] leading-snug text-muted-foreground">
+                      {tr("proxies.loadBalanceBatteryHint")}
+                    </p>
+                  </div>
                 ) : null}
               </div>
 
@@ -2302,26 +2741,99 @@ export function ProxiesView() {
                     <option value="hybrid_score">{tr("settings.ruleHybridScore")}</option>
                   </Select>
                 </div>
-                <div className="space-y-1">
-                  <div className="flex h-5 items-center gap-1.5">
-                    <label className="truncate text-xs font-medium text-muted-foreground">{tr("proxies.failoverShort")}</label>
-                    <HelpTip ariaLabel={tr("proxies.failoverShort")} text={tr("settings.autoFailover")} />
+                {groupStrategy === "selector" ? (
+                  <div className="space-y-1">
+                    <div className="flex h-5 items-center gap-1.5">
+                      <label className="truncate text-xs font-medium text-muted-foreground">{tr("proxies.failoverShort")}</label>
+                      <HelpTip ariaLabel={tr("proxies.failoverShort")} text={tr("settings.autoFailover")} />
+                    </div>
+                    <Select
+                      aria-label={tr("settings.autoFailover")}
+                      value={groupAutoFailover}
+                      onChange={(e) => setGroupAutoFailover(e.target.value as "inherit" | "on" | "off")}
+                    >
+                      <option value="inherit">
+                        {tr("proxies.groupFailoverInherit", { state: globalFailoverStateLabel })}
+                      </option>
+                      <option value="on">{tr("proxies.groupFailoverOn")}</option>
+                      <option value="off">{tr("proxies.groupFailoverOff")}</option>
+                    </Select>
                   </div>
-                  <Select
-                    aria-label={tr("settings.autoFailover")}
-                    value={groupAutoFailover}
-                    onChange={(e) => setGroupAutoFailover(e.target.value as "inherit" | "on" | "off")}
-                  >
-                    <option value="inherit">
-                      {tr("proxies.groupFailoverInherit", { state: globalFailoverStateLabel })}
-                    </option>
-                    <option value="on">{tr("proxies.groupFailoverOn")}</option>
-                    <option value="off">{tr("proxies.groupFailoverOff")}</option>
-                  </Select>
-                </div>
+                ) : groupStrategy === "failover" || groupStrategy === "urltest" ? (
+                  <div className="space-y-1">
+                    <div className="flex h-5 items-center gap-1.5">
+                      <label className="truncate text-xs font-medium text-muted-foreground">{tr("proxies.failoverTrigger")}</label>
+                      <HelpTip ariaLabel={tr("proxies.failoverTrigger")} text={tr("proxies.failoverTriggerHint")} />
+                    </div>
+                    <Select
+                      aria-label={tr("proxies.failoverTrigger")}
+                      value={groupFailoverTrigger}
+                      onChange={(e) =>
+                        setGroupFailoverTrigger(e.target.value as "high_latency_or_unavailable" | "unavailable_only")
+                      }
+                    >
+                      <option value="high_latency_or_unavailable">{tr("proxies.failoverTriggerHighLat")}</option>
+                      <option value="unavailable_only">{tr("proxies.failoverTriggerUnavailable")}</option>
+                    </Select>
+                  </div>
+                ) : null}
               </div>
 
-              {groupStrategy !== "selector" || groupAutoFailover === "on" ? (
+              {groupStrategy === "selector" &&
+              (groupAutoFailover === "on" || (groupAutoFailover === "inherit" && Boolean(healthSettings?.failover))) ? (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div className="space-y-1">
+                    <div className="flex h-5 items-center gap-1.5">
+                      <label className="truncate text-xs font-medium text-muted-foreground">{tr("proxies.failoverTrigger")}</label>
+                      <HelpTip ariaLabel={tr("proxies.failoverTrigger")} text={tr("proxies.failoverTriggerHint")} />
+                    </div>
+                    <Select
+                      aria-label={tr("proxies.failoverTrigger")}
+                      value={groupFailoverTrigger}
+                      onChange={(e) =>
+                        setGroupFailoverTrigger(e.target.value as "high_latency_or_unavailable" | "unavailable_only")
+                      }
+                    >
+                      <option value="high_latency_or_unavailable">{tr("proxies.failoverTriggerHighLat")}</option>
+                      <option value="unavailable_only">{tr("proxies.failoverTriggerUnavailable")}</option>
+                    </Select>
+                  </div>
+                  {groupFailoverTrigger === "high_latency_or_unavailable" ? (
+                    <div className="space-y-1">
+                      <div className="flex h-5 items-center gap-1.5">
+                        <label className="truncate text-xs font-medium text-muted-foreground">{tr("proxies.groupHighLatency")}</label>
+                      </div>
+                      <Input
+                        type="number"
+                        min={100}
+                        max={10000}
+                        step={50}
+                        placeholder={tr("proxies.groupHighLatencyInherit", { ms: highLatencyMs })}
+                        value={groupHighLatencyInput}
+                        onChange={(e) => setGroupHighLatencyInput(e.target.value)}
+                      />
+                    </div>
+                  ) : null}
+                </div>
+              ) : (groupStrategy === "failover" || groupStrategy === "urltest") &&
+                groupFailoverTrigger === "high_latency_or_unavailable" ? (
+                <div className="space-y-1">
+                  <label className="block text-xs font-medium text-muted-foreground">{tr("proxies.groupHighLatency")}</label>
+                  <Input
+                    type="number"
+                    min={100}
+                    max={10000}
+                    step={50}
+                    placeholder={tr("proxies.groupHighLatencyInherit", { ms: highLatencyMs })}
+                    value={groupHighLatencyInput}
+                    onChange={(e) => setGroupHighLatencyInput(e.target.value)}
+                  />
+                </div>
+              ) : null}
+
+              {groupStrategy !== "selector" ||
+              groupAutoFailover === "on" ||
+              (groupAutoFailover === "inherit" && Boolean(healthSettings?.failover)) ? (
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div className="space-y-1">
                     <label className="block text-xs font-medium text-muted-foreground">{tr("proxies.groupIntervalClean")}</label>
@@ -2380,15 +2892,25 @@ export function ProxiesView() {
           <div className="space-y-3">
             {inspectedNode ? (
               <div className="flex flex-wrap items-center gap-1.5 rounded-[10px] border border-border bg-muted/40 p-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={status?.running && status.active_node_id === inspectedNode.id ? "default" : "outline"}
-                  onClick={() => void toggleConnect({ nodeId: inspectedNode.id })}
-                >
-                  <Play className="mr-1 h-3.5 w-3.5" aria-hidden="true" />
-                  {tr("action.connect")}
-                </Button>
+                {(() => {
+                  const inspectedActive =
+                    isProxyRunning && !status?.active_group_id && status?.active_node_id === inspectedNode.id;
+                  return (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={inspectedActive ? "default" : "outline"}
+                      onClick={() => void toggleConnect(inspectedActive ? undefined : { nodeId: inspectedNode.id })}
+                    >
+                      {inspectedActive ? (
+                        <Square className="mr-1 h-3 w-3 fill-current" aria-hidden="true" />
+                      ) : (
+                        <Play className="mr-1 h-3.5 w-3.5" aria-hidden="true" />
+                      )}
+                      {inspectedActive ? tr("action.disconnect") : tr("action.connect")}
+                    </Button>
+                  );
+                })()}
                 <Button
                   type="button"
                   size="sm"

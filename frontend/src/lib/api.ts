@@ -19,10 +19,17 @@ export interface AndroidBridgeInterface {
   applyInsetsNow?: () => boolean;
   copyToClipboard?: (text: string) => boolean;
   getBiometricStatus?: () => string;
+  enrollBiometricKey?: (kekBase64: string, reason: string) => boolean;
+  clearBiometricKey?: () => boolean;
   authenticateBiometric?: (reason: string) => boolean;
   getBootAutostart?: () => boolean;
   setBootAutostart?: (enabled: boolean) => boolean;
   openVpnSettings?: () => boolean;
+  refreshQuickTiles?: () => boolean;
+  openExternalUrl?: (url: string) => boolean;
+  listInstalledAppsAsync?: (requestId: string) => boolean;
+  takeInstalledAppsResult?: (requestId: string) => string;
+  downloadAndInstallApk?: (url: string, expectedSha256: string) => boolean;
 }
 
 declare global {
@@ -123,6 +130,9 @@ export interface GroupConfig {
   filter?: string;
   priority_rule?: string;
   auto_failover?: boolean | null;
+  failover_trigger?: "high_latency_or_unavailable" | "unavailable_only" | "";
+  high_latency_ms?: number;
+  load_balance_shards?: number;
   detour_id?: string;
   tolerance_ms?: number;
   interval?: string;
@@ -176,6 +186,8 @@ export interface RoutingProfile {
   bypass_lan: boolean;
   allow_lan_broadcast?: boolean;
   bypass_cn: boolean;
+  bypass_system_tailscale?: boolean;
+  disable_ipv6?: boolean;
   local_dns: string;
   remote_dns: string;
   domain_strategy?: string;
@@ -189,7 +201,114 @@ export interface RoutingProfile {
   log_level?: string;
   per_app_mode?: string;
   per_app_packages?: string[];
+  custom_rules_enabled?: boolean;
   custom_rules: RoutingRule[];
+}
+
+export interface SystemTailscaleInfo {
+  detected: boolean;
+  interface?: string;
+  ipv4?: string;
+  ipv6?: string;
+  magic_dns_active?: boolean;
+  search_domains?: string[];
+}
+
+export interface TailscaleConfig {
+  enabled: boolean;
+  control_url?: string;
+  auth_key?: string;
+  has_auth_key?: boolean;
+  clear_auth_key?: boolean;
+  hostname?: string;
+  ephemeral?: boolean;
+  accept_routes: boolean;
+  exit_node?: string;
+  exit_node_allow_lan?: boolean;
+  advertise_routes?: string[];
+  advertise_exit_node?: boolean;
+  magic_dns: boolean;
+  extra_domains?: string[];
+  extra_subnets?: string[];
+  detour_id?: string;
+  udp_timeout?: string;
+}
+
+export interface TailscalePeerStatus {
+  stable_id?: string;
+  hostname: string;
+  dns_name?: string;
+  os?: string;
+  ipv4?: string;
+  ipv6?: string;
+  tailscale_ips?: string[];
+  online: boolean;
+  active?: boolean;
+  exit_node?: boolean;
+  exit_node_option?: boolean;
+  expired?: boolean;
+  last_seen?: number;
+}
+
+export interface TailscaleRuntimeStatus {
+  state: "disabled" | "stopped" | "connecting" | "needs_auth" | "connected" | "error";
+  backend_state?: string;
+  online: boolean;
+  expired?: boolean;
+  ipv4?: string;
+  ipv6?: string;
+  tailscale_ips?: string[];
+  hostname?: string;
+  dns_name?: string;
+  network_name?: string;
+  magic_dns_suffix?: string;
+  auth_url?: string;
+  peers_online?: number;
+  peers_total?: number;
+  peers?: TailscalePeerStatus[];
+  active_exit_node_id?: string;
+  active_exit_node_name?: string;
+  can_share_files?: boolean;
+  waiting_file_count?: number;
+  unread_file_count?: number;
+  control_available?: boolean;
+  last_error?: string;
+  source?: "live" | "log" | "none";
+  updated_at?: string;
+}
+
+export interface TailscalePingResult {
+  peer_ip: string;
+  latency_ms: number;
+  min_ms: number;
+  avg_ms: number;
+  is_direct: boolean;
+  endpoint?: string;
+  peer_relay?: string;
+  derp_region_id?: number;
+  derp_region_code?: string;
+  error?: string;
+}
+
+export interface TaildropFileItem {
+  name: string;
+  size: number;
+  sender_name?: string;
+  modified_at?: number;
+}
+
+export interface TaildropInboxResponse {
+  available: boolean;
+  can_share_files: boolean;
+  files: TaildropFileItem[];
+  receiving: number;
+}
+
+export interface TailscaleResponse {
+  config: TailscaleConfig;
+  state_initialized: boolean;
+  status?: TailscaleRuntimeStatus;
+  system_tailscale?: SystemTailscaleInfo;
 }
 
 export interface RuleSetSpec {
@@ -261,10 +380,21 @@ export interface SimulationResult {
   action: string;
 }
 
+export interface SubscriptionDiff {
+  added: number;
+  removed: number;
+  renamed: number;
+  filtered_out?: number;
+  added_names?: string[];
+  removed_names?: string[];
+}
+
 export interface SubscriptionRecord {
   id: string;
   name: string;
   url: string;
+  include_regex?: string;
+  exclude_regex?: string;
   upload_bytes: number;
   download_bytes: number;
   total_bytes: number;
@@ -274,6 +404,88 @@ export interface SubscriptionRecord {
   skipped_count: number;
   warnings: string[];
   last_updated_at: string;
+  diff?: SubscriptionDiff;
+}
+
+export interface SubscriptionRefreshAllResult {
+  total: number;
+  succeeded: number;
+  failed: number;
+  reloaded: boolean;
+  diff: SubscriptionDiff;
+  results: Array<{ id: string; name: string; diff?: SubscriptionDiff; error?: string }>;
+  subscriptions: SubscriptionRecord[];
+}
+
+export interface TrafficHistoryBucket {
+  bucket_unix: number;
+  granularity: "hour" | "day";
+  proxy_up: number;
+  proxy_down: number;
+  direct_up: number;
+  direct_down: number;
+}
+
+export interface TrafficHistoryResponse {
+  range: "24h" | "7d" | "30d";
+  granularity: "hour" | "day";
+  totals: {
+    proxy_up: number;
+    proxy_down: number;
+    direct_up: number;
+    direct_down: number;
+  };
+  buckets: TrafficHistoryBucket[];
+}
+
+export interface DNSProbeStep {
+  name: string;
+  server: string;
+  via_proxy: boolean;
+  latency_ms: number;
+  ips: string[];
+  error?: string;
+}
+
+export interface DNSDiagnosticsResponse {
+  domain: string;
+  checked_at: string;
+  running: boolean;
+  routing_mode: string;
+  hijack_dns: boolean;
+  fake_ip: boolean;
+  simulation: SimulationResult;
+  system_resolver: DNSProbeStep;
+  local_dns: DNSProbeStep;
+  remote_dns: DNSProbeStep;
+  tailscale_magic_note?: string;
+  leak_status: "safe" | "warning" | "info";
+  notes: string[];
+}
+
+export interface RoutingProfileSummary {
+  id: string;
+  name: string;
+  preferred_node_id?: string;
+  preferred_group_id?: string;
+  tailscale_enabled?: boolean | null;
+  created_at?: string;
+  updated_at?: string;
+  active: boolean;
+  mode: string;
+  custom_rule_count: number;
+  fake_ip: boolean;
+  kill_switch: boolean;
+  bypass_cn: boolean;
+  block_ads: boolean;
+}
+
+export interface ProfilesListResponse {
+  active_id: string;
+  created_id?: string;
+  reloaded?: boolean;
+  routing?: RoutingProfile;
+  profiles: RoutingProfileSummary[];
 }
 
 export interface SkippedEntry {
@@ -314,6 +526,7 @@ export interface ProcessStatus {
   system_proxy_enabled?: boolean;
   system_proxy_wanted?: boolean;
   android_mode: boolean;
+  android_vpn_active?: boolean;
   mixed_port: number;
   clash_api_port: number;
   uptime_seconds: number;
@@ -369,14 +582,50 @@ export async function getBiometricStatus(): Promise<BiometricStatus> {
   }
 }
 
-export async function authenticateBiometric(reason: string): Promise<void> {
+export interface BiometricAuthResult {
+  biometric_kek?: string;
+  signature?: string;
+}
+
+export async function enrollAndroidBiometricKey(kekBase64: string, reason: string): Promise<void> {
+  if (!isAndroidClient() || typeof window.PrismRayAndroid?.enrollBiometricKey !== "function") {
+    throw new Error("Android hardware biometric enrollment is unavailable");
+  }
+  return new Promise<void>((resolve, reject) => {
+    const onResult = (ev: Event) => {
+      window.removeEventListener("prismray-biometric-enroll-result", onResult);
+      const detail = (ev as CustomEvent<{ success?: boolean; error?: string }>).detail;
+      if (detail?.success) {
+        resolve();
+      } else {
+        reject(new Error(detail?.error || "Hardware biometric enrollment cancelled"));
+      }
+    };
+    window.addEventListener("prismray-biometric-enroll-result", onResult, { once: true });
+    const launched = window.PrismRayAndroid?.enrollBiometricKey?.(kekBase64, reason);
+    if (!launched) {
+      window.removeEventListener("prismray-biometric-enroll-result", onResult);
+      reject(new Error("Failed to launch Android BiometricPrompt enrollment"));
+    }
+  });
+}
+
+export function clearAndroidBiometricKey(): void {
+  try {
+    window.PrismRayAndroid?.clearBiometricKey?.();
+  } catch {
+    // Ignore cleanup errors on non-Android hosts.
+  }
+}
+
+export async function authenticateBiometric(reason: string, challenge?: string): Promise<BiometricAuthResult> {
   if (isAndroidClient() && typeof window.PrismRayAndroid?.authenticateBiometric === "function") {
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<BiometricAuthResult>((resolve, reject) => {
       const onResult = (ev: Event) => {
         window.removeEventListener("prismray-biometric-result", onResult);
-        const detail = (ev as CustomEvent<{ success?: boolean; error?: string }>).detail;
-        if (detail?.success) {
-          resolve();
+        const detail = (ev as CustomEvent<{ success?: boolean; error?: string; biometric_kek?: string }>).detail;
+        if (detail?.success && detail.biometric_kek) {
+          resolve({ biometric_kek: detail.biometric_kek });
         } else {
           reject(new Error(detail?.error || "Biometric authentication cancelled"));
         }
@@ -392,7 +641,11 @@ export async function authenticateBiometric(reason: string): Promise<void> {
   if (!isDesktop) {
     throw new Error("System biometric authentication is only available on desktop");
   }
-  await invoke("biometric_authenticate", { reason });
+  const signature = await invoke<string>("biometric_authenticate", {
+    reason,
+    challenge: challenge || null,
+  });
+  return { signature };
 }
 
 export interface ConnectionMetadata {
@@ -430,7 +683,12 @@ export interface ConnectionsSnapshot {
 export interface TrafficSample {
   up: number;
   down: number;
-  timestamp?: string;
+  proxy_up?: number;
+  proxy_down?: number;
+  direct_up?: number;
+  direct_down?: number;
+  active_connections?: number;
+  timestamp?: string | number;
 }
 
 export interface LogEntry {
@@ -455,6 +713,7 @@ export interface TUNPrivilege {
 export interface TUNState {
   enabled: boolean;
   running: boolean;
+  preferred?: boolean;
   stack: string;
   node_id: string;
   group_id: string;
@@ -466,6 +725,7 @@ export interface AppUpdateAsset {
   name: string;
   download_url: string;
   size: number;
+  sha256?: string;
 }
 
 export interface AppUpdateCheckResult {
@@ -493,6 +753,8 @@ export interface CoresStatus {
     installed: boolean;
     available: boolean;
     binary: string;
+    version?: string;
+    unified?: boolean;
     versions: string[];
     cronet_available: boolean;
   };
@@ -500,6 +762,7 @@ export interface CoresStatus {
     installed: boolean;
     available: boolean;
     binary: string;
+    version?: string;
     versions: string[];
   };
   auto_update: {
@@ -517,6 +780,7 @@ export interface AndroidAppInfo {
 export interface AndroidVPNStatus {
   active: boolean;
   running: boolean;
+  service_running?: boolean;
   protect_path?: string;
   tun_fd?: number;
   mixed_port?: number;
@@ -607,7 +871,17 @@ export function subscribeStream(
   let retry: ReturnType<typeof setTimeout> | undefined;
   let delay = 1000;
 
+  const stopOnAuthLock = () => {
+    stopped = true;
+    clearTimeout(retry);
+    socket?.close();
+  };
+  if (typeof window !== "undefined") {
+    window.addEventListener(AUTH_REQUIRED_EVENT, stopOnAuthLock);
+  }
+
   const connect = () => {
+    if (stopped) return;
     const wsUrl = buildWsUrl(API_URL, path, desktopToken, window.location.href);
     socket = new WebSocket(wsUrl);
     socket.onopen = () => {
@@ -616,7 +890,11 @@ export function subscribeStream(
     };
     socket.onmessage = onMessage;
     socket.onerror = () => socket?.close();
-    socket.onclose = () => {
+    socket.onclose = (ev) => {
+      if (ev.code === 1008 || ev.code === 4401 || ev.code === 4423) {
+        stopped = true;
+        return;
+      }
       if (!stopped) {
         retry = setTimeout(connect, delay);
         delay = Math.min(delay * 2, 15000);
@@ -628,6 +906,9 @@ export function subscribeStream(
   return () => {
     stopped = true;
     clearTimeout(retry);
+    if (typeof window !== "undefined") {
+      window.removeEventListener(AUTH_REQUIRED_EVENT, stopOnAuthLock);
+    }
     socket?.close();
   };
 }
@@ -644,6 +925,10 @@ export interface TrayUpdatePayload {
   systemProxyEnabled: boolean;
   mode: string;
   activeLabel: string;
+  locale?: string;
+  tailscaleEnabled?: boolean;
+  tailscaleState?: string;
+  speedSummary?: string;
   recentTargets: TrayTargetItem[];
 }
 
@@ -651,6 +936,15 @@ export async function updateNativeTray(payload: TrayUpdatePayload): Promise<void
   if (!isDesktop || isAndroidClient()) return;
   try {
     await invoke("update_tray", { payload });
+  } catch {
+    // Ignore unsupported platform tray calls.
+  }
+}
+
+export async function updateNativeTrayTooltip(tooltip: string): Promise<void> {
+  if (!isDesktop || isAndroidClient()) return;
+  try {
+    await invoke("update_tray_tooltip", { tooltip });
   } catch {
     // Ignore unsupported platform tray calls.
   }
@@ -707,6 +1001,37 @@ export const androidBridge = {
       return [];
     }
   },
+  listInstalledAppsAsync(requestId: string): boolean {
+    try {
+      return Boolean(window.PrismRayAndroid?.listInstalledAppsAsync?.(requestId));
+    } catch {
+      return false;
+    }
+  },
+  takeInstalledAppsResult(requestId: string): AndroidAppInfo[] | null {
+    try {
+      const raw = window.PrismRayAndroid?.takeInstalledAppsResult?.(requestId);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? (parsed as AndroidAppInfo[]) : [];
+    } catch {
+      return null;
+    }
+  },
+  copyToClipboard(text: string): boolean {
+    try {
+      return Boolean(window.PrismRayAndroid?.copyToClipboard?.(text));
+    } catch {
+      return false;
+    }
+  },
+  openExternalUrl(url: string): boolean {
+    try {
+      return Boolean(window.PrismRayAndroid?.openExternalUrl?.(url));
+    } catch {
+      return false;
+    }
+  },
   getAppIcons(packages: string[]): Record<string, string> {
     if (!packages.length) return {};
     const raw = window.PrismRayAndroid?.getAppIcons?.(JSON.stringify(packages));
@@ -738,6 +1063,20 @@ export const androidBridge = {
       return false;
     }
   },
+  refreshQuickTiles(): boolean {
+    try {
+      return Boolean(window.PrismRayAndroid?.refreshQuickTiles?.());
+    } catch {
+      return false;
+    }
+  },
+  downloadAndInstallApk(url: string, expectedSha256 = ""): boolean {
+    try {
+      return Boolean(window.PrismRayAndroid?.downloadAndInstallApk?.(url, expectedSha256));
+    } catch {
+      return false;
+    }
+  },
 };
 
 const apiUrl = (path: string) => buildApiUrl(API_URL, path);
@@ -753,11 +1092,19 @@ export const api = {
     axios
       .post<{ password_lock_enabled: boolean; biometric_enabled?: boolean }>(apiUrl("/auth/password-lock"), payload)
       .then((r) => r.data),
-  setBiometricUnlock: (payload: { enabled: boolean; current_password?: string }) =>
+  setBiometricUnlock: (payload: { enabled: boolean; current_password?: string; hardware_wrap?: boolean }) =>
     axios
-      .post<{ password_lock_enabled: boolean; biometric_enabled: boolean }>(apiUrl("/auth/biometric"), payload)
+      .post<{
+        password_lock_enabled: boolean;
+        biometric_enabled: boolean;
+        hardware_wrap?: boolean;
+        biometric_kek?: string;
+      }>(apiUrl("/auth/biometric"), payload)
       .then((r) => r.data),
-  biometricUnlock: () => axios.post<{ unlocked: boolean }>(apiUrl("/auth/biometric-unlock")).then((r) => r.data),
+  requestBiometricChallenge: () =>
+    axios.post<{ challenge: string }>(apiUrl("/auth/biometric-challenge")).then((r) => r.data),
+  biometricUnlock: (proof?: { biometric_kek?: string; challenge?: string; signature?: string }) =>
+    axios.post<{ unlocked: boolean }>(apiUrl("/auth/biometric-unlock"), proof || {}).then((r) => r.data),
   cacheSudo: (password: string) => axios.put(apiUrl("/auth/sudo-cache"), { password }).then((r) => r.data),
   clearSudo: () => axios.delete(apiUrl("/auth/sudo-cache")),
 
@@ -774,6 +1121,16 @@ export const api = {
     axios.post<NodeConfig>(apiUrl("/nodes"), node).then((r) => r.data),
   updateNode: (id: string, node: NodeConfig) =>
     axios.put<NodeConfig>(apiUrl(`/nodes/${id}`), node).then((r) => r.data),
+  batchNodes: (payload: {
+    action?: "update" | "delete";
+    ids: string[];
+    group?: string;
+    tags?: string[];
+    set_tags?: boolean;
+    add_tag?: string;
+    remove_tag?: string;
+    favorite?: boolean;
+  }) => axios.patch<{ updated: number; deleted: number }>(apiUrl("/nodes/batch"), payload).then((r) => r.data),
   deleteNode: (id: string) => axios.delete(apiUrl(`/nodes/${id}`)),
   getNodeUri: (id: string) => axios.get<{ uri: string }>(apiUrl(`/nodes/${id}/uri`)).then((r) => r.data),
   probeNodes: (payload?: { node_ids?: string[]; mode?: ProbeMode; url?: string; timeout_ms?: number }) =>
@@ -836,14 +1193,29 @@ export const api = {
   closeAllConnections: () => axios.delete(apiUrl("/connections")),
 
   listSubscriptions: () => axios.get<SubscriptionRecord[]>(apiUrl("/subscriptions")).then((r) => r.data),
-  createSubscription: (payload: { name: string; url: string; auto_update_hours: number }) =>
-    axios.post<SubscriptionRecord[]>(apiUrl("/subscriptions"), payload).then((r) => r.data),
-  updateSubscription: (id: string, payload: { name?: string; url?: string; auto_update_hours?: number }) =>
-    axios.put<SubscriptionRecord>(apiUrl(`/subscriptions/${id}`), payload).then((r) => r.data),
+  createSubscription: (payload: {
+    name: string;
+    url: string;
+    auto_update_hours: number;
+    include_regex?: string;
+    exclude_regex?: string;
+  }) => axios.post<SubscriptionRecord[]>(apiUrl("/subscriptions"), payload).then((r) => r.data),
+  updateSubscription: (
+    id: string,
+    payload: {
+      name?: string;
+      url?: string;
+      auto_update_hours?: number;
+      include_regex?: string;
+      exclude_regex?: string;
+    },
+  ) => axios.put<SubscriptionRecord>(apiUrl(`/subscriptions/${id}`), payload).then((r) => r.data),
   deleteSubscription: (id: string) =>
     axios.delete<SubscriptionRecord[]>(apiUrl(`/subscriptions/${id}`)).then((r) => r.data),
   refreshSubscription: (id: string) =>
     axios.post<SubscriptionRecord>(apiUrl(`/subscriptions/${id}/refresh`)).then((r) => r.data),
+  refreshAllSubscriptions: () =>
+    axios.post<SubscriptionRefreshAllResult>(apiUrl("/subscriptions/refresh-all")).then((r) => r.data),
   importSubscription: (payload: { url?: string; content?: string }) =>
     axios.post<SubscriptionImportResult>(apiUrl("/subscription/import"), payload).then((r) => r.data),
 
@@ -851,9 +1223,89 @@ export const api = {
   saveRouting: (profile: RoutingProfile) => axios.put<RoutingProfile>(apiUrl("/routing"), profile).then((r) => r.data),
   simulateRouting: (input: SimulationInput) =>
     axios.post<SimulationResult>(apiUrl("/routing/simulate"), input).then((r) => r.data),
+  runDnsDiagnostics: (domain: string) =>
+    axios.post<DNSDiagnosticsResponse>(apiUrl("/diagnostics/dns"), { domain }).then((r) => r.data),
+
+  getTrafficHistory: (range: "24h" | "7d" | "30d" = "24h") =>
+    axios.get<TrafficHistoryResponse>(apiUrl("/traffic/history"), { params: { range } }).then((r) => r.data),
+  clearTrafficHistory: () => axios.delete<{ cleared: boolean }>(apiUrl("/traffic/history")).then((r) => r.data),
+
+  listProfiles: () => axios.get<ProfilesListResponse>(apiUrl("/profiles")).then((r) => r.data),
+  createProfile: (payload: {
+    name: string;
+    clone_from_id?: string;
+    template?: string;
+    preferred_node_id?: string;
+    preferred_group_id?: string;
+    tailscale_enabled?: boolean | null;
+  }) => axios.post<ProfilesListResponse>(apiUrl("/profiles"), payload).then((r) => r.data),
+  updateProfile: (
+    id: string,
+    payload: {
+      name?: string;
+      preferred_node_id?: string;
+      preferred_group_id?: string;
+      tailscale_enabled?: boolean;
+      clear_tailscale_enabled?: boolean;
+    },
+  ) => axios.put<ProfilesListResponse>(apiUrl(`/profiles/${id}`), payload).then((r) => r.data),
+  deleteProfile: (id: string) =>
+    axios.delete<ProfilesListResponse>(apiUrl(`/profiles/${id}`)).then((r) => r.data),
+  activateProfile: (id: string) =>
+    axios.post<ProfilesListResponse>(apiUrl(`/profiles/${id}/activate`)).then((r) => r.data),
+
+  getTailscale: () => axios.get<TailscaleResponse>(apiUrl("/tailscale")).then((r) => r.data),
+  saveTailscale: (cfg: TailscaleConfig) => axios.put<TailscaleResponse>(apiUrl("/tailscale"), cfg).then((r) => r.data),
+  resetTailscaleState: () =>
+    axios
+      .post<{ reset: boolean; state_initialized: boolean; status?: TailscaleRuntimeStatus }>(
+        apiUrl("/tailscale/reset-state"),
+      )
+      .then((r) => r.data),
+  setTailscaleExitNode: (payload: { stable_id: string; exit_node?: string }) =>
+    axios
+      .post<{ ok: boolean; hot_switched: boolean; config: TailscaleConfig; status?: TailscaleRuntimeStatus }>(
+        apiUrl("/tailscale/exit-node"),
+        payload,
+      )
+      .then((r) => r.data),
+  pingTailscalePeer: (peer_ip: string, count = 3) =>
+    axios.post<TailscalePingResult>(apiUrl("/tailscale/ping"), { peer_ip, count }).then((r) => r.data),
+  logoutTailscale: () =>
+    axios
+      .post<{ logged_out: boolean; status?: TailscaleRuntimeStatus }>(apiUrl("/tailscale/logout"))
+      .then((r) => r.data),
+  getTaildropInbox: () => axios.get<TaildropInboxResponse>(apiUrl("/tailscale/taildrop/inbox")).then((r) => r.data),
+  sendTaildropFile: (peerStableId: string, file: File) => {
+    const form = new FormData();
+    form.append("peer_stable_id", peerStableId);
+    form.append("file", file);
+    return axios
+      .post<{ sent: boolean; file_name: string; size: number }>(apiUrl("/tailscale/taildrop/send"), form)
+      .then((r) => r.data);
+  },
+  downloadTaildropFile: async (name: string) => {
+    const res = await axios.get<Blob>(apiUrl(`/tailscale/taildrop/file/${encodeURIComponent(name)}`), {
+      responseType: "blob",
+    });
+    return res.data;
+  },
+  deleteTaildropFile: (name: string) =>
+    axios.delete(apiUrl(`/tailscale/taildrop/file/${encodeURIComponent(name)}`)),
+
+  getSecurityPolicy: () =>
+    axios.get<{ allow_lan_subscription_fetch: boolean }>(apiUrl("/security/policy")).then((r) => r.data),
+  saveSecurityPolicy: (allow_lan_subscription_fetch: boolean) =>
+    axios
+      .put<{ allow_lan_subscription_fetch: boolean }>(apiUrl("/security/policy"), { allow_lan_subscription_fetch })
+      .then((r) => r.data),
 
   listRuleSets: () => axios.get<RuleSetSpec[]>(apiUrl("/rulesets")).then((r) => r.data),
-  saveRuleSet: (spec: RuleSetSpec) => axios.post<RuleSetSpec[]>(apiUrl("/rulesets"), spec).then((r) => r.data),
+  saveRuleSet: (spec: Partial<RuleSetSpec> & { tag: string }) =>
+    axios.post<RuleSetSpec[]>(apiUrl("/rulesets"), spec).then((r) => r.data),
+  deleteRuleSet: (id: string) => axios.delete<RuleSetSpec[]>(apiUrl(`/rulesets/${id}`)).then((r) => r.data),
+  restoreBuiltinRuleSets: () =>
+    axios.post<RuleSetSpec[]>(apiUrl("/rulesets/restore-builtins")).then((r) => r.data),
   syncRuleSets: (ids?: string[]) =>
     axios
       .post<{
@@ -898,10 +1350,14 @@ export const api = {
 
   getCores: () => axios.get<CoresStatus>(apiUrl("/cores")).then((r) => r.data),
   ensureCores: () => axios.post<Record<string, unknown>>(apiUrl("/cores/ensure")).then((r) => r.data),
-  installCore: (payload: { core: string; version?: string; download?: boolean }) =>
+  installCore: (payload: { core: string; version?: string; download?: boolean; force_upstream?: boolean }) =>
     axios.post(apiUrl("/cores"), payload).then((r) => r.data),
   updateCoreAutoUpdate: (auto_update: { xray: boolean; sing_box: boolean }) =>
     axios.post(apiUrl("/cores"), { auto_update }).then((r) => r.data),
+  getCompiledConfig: () =>
+    axios
+      .get<{ engine: string; active_tag: string; redacted: boolean; config: string }>(apiUrl("/config/compiled"))
+      .then((r) => r.data),
 
   getSettings: () => axios.get<AppSettings>(apiUrl("/settings")).then((r) => r.data),
   saveSettings: (cfg: AppSettings) =>
@@ -913,12 +1369,24 @@ export const api = {
         params: include && include.length > 0 ? { include: include.join(",") } : undefined,
       })
       .then((r) => r.data),
-  restoreBackup: (backup: Record<string, unknown>) => axios.post(apiUrl("/backup"), backup).then((r) => r.data),
-  mergeBackup: (bundle: Record<string, unknown>) =>
+  exportEncryptedBackup: (payload: { passphrase: string; include?: string[]; allow_plaintext?: boolean }) =>
+    axios.post<Record<string, unknown>>(apiUrl("/backup/export"), payload).then((r) => r.data),
+  restoreBackup: (backup: Record<string, unknown>, passphrase?: string) =>
+    axios
+      .post(
+        apiUrl("/backup"),
+        passphrase && backup.format === "prismray-encrypted-backup"
+          ? { passphrase, envelope: backup }
+          : backup,
+      )
+      .then((r) => r.data),
+  mergeBackup: (bundle: Record<string, unknown>, passphrase?: string) =>
     axios
       .post<{ mode: string; nodes: number; groups: number; custom_rules: number }>(
         apiUrl("/backup?mode=merge"),
-        bundle,
+        passphrase && bundle.format === "prismray-encrypted-backup"
+          ? { passphrase, envelope: bundle }
+          : bundle,
       )
       .then((r) => r.data),
   fetchLogsText: () => axios.get<string>(apiUrl("/logs/export"), { responseType: "text" }).then((r) => r.data),

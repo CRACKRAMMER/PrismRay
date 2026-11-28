@@ -12,6 +12,7 @@ import {
   type NodeConfig,
   type ProcessStatus,
   type RoutingProfile,
+  type RoutingProfileSummary,
   type RuleSetSpec,
   type SubscriptionImportResult,
   type SubscriptionRecord,
@@ -21,11 +22,14 @@ import {
   androidBridge,
   api,
   formatApiError,
+  isAndroidClient,
+  isDesktop,
   subscribeStream,
   updateNativeTray,
+  updateNativeTrayTooltip,
 } from "../lib/api.ts";
 import { type Locale, getStoredLocale, setStoredLocale, t, type TranslationKey } from "../lib/i18n.ts";
-import { DEFAULT_HIGH_LATENCY_MS } from "../lib/helpers.ts";
+import { DEFAULT_HIGH_LATENCY_MS, formatRate } from "../lib/helpers.ts";
 import {
   type ThemeMode,
   applyThemeMode,
@@ -136,6 +140,10 @@ export interface TrafficPoint {
   time: string;
   upKB: number;
   downKB: number;
+  proxyUpKB: number;
+  proxyDownKB: number;
+  directUpKB: number;
+  directDownKB: number;
 }
 
 export interface UnsavedTabGuard {
@@ -146,6 +154,12 @@ export interface UnsavedTabGuard {
 export interface AppStoreValue {
   activeTab: NavTab;
   setActiveTab: (tab: NavTab) => void;
+  pendingAnchor: string | null;
+  navigateTo: (tab: NavTab, anchorId?: string) => void;
+  consumePendingAnchor: (expectedAnchor?: string) => string | null;
+  pendingAction: string | null;
+  dispatchTabAction: (tab: NavTab, action: string, anchorId?: string) => void;
+  consumePendingAction: (expectedPrefix?: string) => string | null;
   registerUnsavedGuard: (tab: NavTab, guard: UnsavedTabGuard | null) => void;
   pendingTabSwitch: NavTab | null;
   savingPendingTabSwitch: boolean;
@@ -174,10 +188,14 @@ export interface AppStoreValue {
 
   authStatus: AuthStatus | null;
   status: ProcessStatus | null;
+  isProxyRunning: boolean;
+  isTunActive: boolean;
   nodes: NodeConfig[];
   groups: GroupConfig[];
   listeners: ListenConfig[];
   routing: RoutingProfile | null;
+  profiles: RoutingProfileSummary[];
+  activeProfileId: string;
   ruleSets: RuleSetSpec[];
   subscriptions: SubscriptionRecord[];
   tunState: TUNState | null;
@@ -186,6 +204,9 @@ export interface AppStoreValue {
   highLatencyMs: number;
   updateHighLatencyMs: (ms: number) => Promise<void>;
   systemProxyEnabled: boolean;
+  tailscaleEnabled: boolean;
+  tailscaleState: string;
+  storeRevision: number;
   lastImportDiagnostic: SubscriptionImportResult | null;
   setLastImportDiagnostic: (res: SubscriptionImportResult | null) => void;
 
@@ -222,31 +243,116 @@ const TrafficTelemetryContext = createContext<TrafficTelemetryValue | null>(null
 const ConnectionsTelemetryContext = createContext<ConnectionsTelemetryValue | null>(null);
 const LogsTelemetryContext = createContext<LogsTelemetryValue | null>(null);
 
-function AppTelemetryProvider({ unlocked, children }: { unlocked: boolean; children?: React.ReactNode }) {
+function AppTelemetryProvider({
+  unlocked,
+  activeTab,
+  trayTooltipBase,
+  isRunning,
+  locale,
+  children,
+}: {
+  unlocked: boolean;
+  activeTab: NavTab;
+  trayTooltipBase: string;
+  isRunning: boolean;
+  locale: Locale;
+  children?: React.ReactNode;
+}) {
   const [connections, setConnections] = useState<ConnectionsSnapshot>({
     downloadTotal: 0,
     uploadTotal: 0,
     connections: [],
   });
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [trafficNow, setTrafficNow] = useState<TrafficSample>({ up: 0, down: 0 });
+  const [trafficNow, setTrafficNow] = useState<TrafficSample>({
+    up: 0,
+    down: 0,
+    proxy_up: 0,
+    proxy_down: 0,
+    direct_up: 0,
+    direct_down: 0,
+    active_connections: 0,
+  });
+  const lastTrayTooltipAtRef = useRef(0);
+  const trayTooltipBaseRef = useRef(trayTooltipBase);
+  trayTooltipBaseRef.current = trayTooltipBase;
+  const isRunningRef = useRef(isRunning);
+  isRunningRef.current = isRunning;
+  const localeRef = useRef(locale);
+  localeRef.current = locale;
   const [trafficHistory, setTrafficHistory] = useState<TrafficPoint[]>([]);
-  const initializedStreams = useRef(false);
+  const [isForeground, setIsForeground] = useState<boolean>(() =>
+    typeof document === "undefined" ? true : document.visibilityState !== "hidden",
+  );
 
   useEffect(() => {
-    if (!unlocked) {
-      initializedStreams.current = false;
-      return;
-    }
-    if (initializedStreams.current) return;
-    initializedStreams.current = true;
+    if (typeof document === "undefined" || typeof window === "undefined") return;
+    const syncVisibility = () => setIsForeground(document.visibilityState !== "hidden");
+    const onLifecycle = (evt: Event) => {
+      const detail = (evt as CustomEvent<{ foreground?: boolean }>).detail;
+      if (typeof detail?.foreground === "boolean") {
+        setIsForeground(detail.foreground);
+      }
+    };
+    const onPageHide = () => setIsForeground(false);
+    const onPageShow = () => setIsForeground(document.visibilityState !== "hidden");
 
+    document.addEventListener("visibilitychange", syncVisibility);
+    window.addEventListener("prismray-app-lifecycle", onLifecycle as EventListener);
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
+    return () => {
+      document.removeEventListener("visibilitychange", syncVisibility);
+      window.removeEventListener("prismray-app-lifecycle", onLifecycle as EventListener);
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
+    };
+  }, []);
+
+  const mobileMode = isAndroidClient();
+  const wantTraffic = unlocked && isForeground && (!mobileMode || activeTab === "overview");
+  // Only keep the full /api/connections snapshot WebSocket open while viewing the Connections tab;
+  // the sidebar active-connection count badge reads compact `active_connections` from /api/traffic.
+  const wantConnections = unlocked && isForeground && activeTab === "connections";
+  const wantLogs = unlocked && isForeground && activeTab === "settings";
+
+  useEffect(() => {
+    if (!wantTraffic) return;
     const unsubTraffic = subscribeStream("traffic", (evt) => {
       try {
         const frame = JSON.parse(evt.data) as TrafficSample;
+        const hasSplit =
+          frame.proxy_up !== undefined ||
+          frame.proxy_down !== undefined ||
+          frame.direct_up !== undefined ||
+          frame.direct_down !== undefined;
         const up = Math.max(0, Number(frame.up) || 0);
         const down = Math.max(0, Number(frame.down) || 0);
-        setTrafficNow({ up, down, timestamp: frame.timestamp });
+        const proxyUp = hasSplit ? Math.max(0, Number(frame.proxy_up) || 0) : up;
+        const proxyDown = hasSplit ? Math.max(0, Number(frame.proxy_down) || 0) : down;
+        const directUp = hasSplit ? Math.max(0, Number(frame.direct_up) || 0) : 0;
+        const directDown = hasSplit ? Math.max(0, Number(frame.direct_down) || 0) : 0;
+        setTrafficNow({
+          up,
+          down,
+          proxy_up: proxyUp,
+          proxy_down: proxyDown,
+          direct_up: directUp,
+          direct_down: directDown,
+          active_connections: Math.max(0, Number(frame.active_connections) || 0),
+          timestamp: frame.timestamp,
+        });
+        if (isDesktop && !isAndroidClient() && isRunningRef.current) {
+          const nowMs = Date.now();
+          if (nowMs - lastTrayTooltipAtRef.current >= 3000) {
+            lastTrayTooltipAtRef.current = nowMs;
+            const isEn = localeRef.current === "en-US";
+            const speedLine = isEn
+              ? `Proxy ↑${formatRate(proxyUp)} ↓${formatRate(proxyDown)} · Direct ↑${formatRate(directUp)} ↓${formatRate(directDown)}`
+              : `代理 ↑${formatRate(proxyUp)} ↓${formatRate(proxyDown)} · 直连 ↑${formatRate(directUp)} ↓${formatRate(directDown)}`;
+            void updateNativeTrayTooltip(`${trayTooltipBaseRef.current}\n${speedLine}`);
+          }
+        }
         const nowLabel = new Date().toLocaleTimeString([], {
           hour: "2-digit",
           minute: "2-digit",
@@ -259,6 +365,10 @@ function AppTelemetryProvider({ unlocked, children }: { unlocked: boolean; child
               time: nowLabel,
               upKB: Number((up / 1024).toFixed(1)),
               downKB: Number((down / 1024).toFixed(1)),
+              proxyUpKB: Number((proxyUp / 1024).toFixed(1)),
+              proxyDownKB: Number((proxyDown / 1024).toFixed(1)),
+              directUpKB: Number((directUp / 1024).toFixed(1)),
+              directDownKB: Number((directDown / 1024).toFixed(1)),
             },
           ];
           return next.length > 36 ? next.slice(next.length - 36) : next;
@@ -267,7 +377,11 @@ function AppTelemetryProvider({ unlocked, children }: { unlocked: boolean; child
         // Ignore malformed telemetry frame.
       }
     });
+    return () => unsubTraffic();
+  }, [wantTraffic]);
 
+  useEffect(() => {
+    if (!wantConnections) return;
     const unsubConnections = subscribeStream("connections", (evt) => {
       try {
         const snap = JSON.parse(evt.data) as ConnectionsSnapshot;
@@ -281,7 +395,11 @@ function AppTelemetryProvider({ unlocked, children }: { unlocked: boolean; child
         // Ignore malformed snapshot.
       }
     });
+    return () => unsubConnections();
+  }, [wantConnections]);
 
+  useEffect(() => {
+    if (!wantLogs) return;
     // Batch rapid log WebSocket bursts (150ms flush window) so log floods never stall UI frame budget.
     let pendingLogs: LogEntry[] = [];
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -319,17 +437,14 @@ function AppTelemetryProvider({ unlocked, children }: { unlocked: boolean; child
     });
 
     return () => {
-      initializedStreams.current = false;
       if (flushTimer !== null) {
         clearTimeout(flushTimer);
         flushTimer = null;
       }
       pendingLogs = [];
-      unsubTraffic();
-      unsubConnections();
       unsubLogs();
     };
-  }, [unlocked]);
+  }, [wantLogs]);
 
   const trafficValue = useMemo<TrafficTelemetryValue>(
     () => ({ trafficNow, trafficHistory }),
@@ -357,6 +472,8 @@ function AppTelemetryProvider({ unlocked, children }: { unlocked: boolean; child
 
 export function AppStoreProvider({ children }: { children: React.ReactNode }) {
   const [activeTab, setActiveTabState] = useState<NavTab>("overview");
+  const [pendingAnchor, setPendingAnchor] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
   const unsavedGuardsRef = useRef<Partial<Record<NavTab, UnsavedTabGuard>>>({});
   const [pendingTabSwitch, setPendingTabSwitch] = useState<NavTab | null>(null);
   const [savingPendingTabSwitch, setSavingPendingTabSwitch] = useState(false);
@@ -383,6 +500,63 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
     [activeTab],
   );
 
+  const navigateTo = useCallback(
+    (tab: NavTab, anchorId?: string) => {
+      if (anchorId) {
+        setPendingAnchor(anchorId);
+      }
+      if (tab === activeTab) return;
+      const guard = unsavedGuardsRef.current[activeTab];
+      if (guard && guard.isDirty()) {
+        setPendingTabSwitch(tab);
+        return;
+      }
+      setPendingTabSwitch(null);
+      setActiveTabState(tab);
+    },
+    [activeTab],
+  );
+
+  const consumePendingAnchor = useCallback(
+    (expectedAnchor?: string) => {
+      if (!pendingAnchor) return null;
+      if (expectedAnchor && pendingAnchor !== expectedAnchor) return null;
+      const value = pendingAnchor;
+      setPendingAnchor(null);
+      return value;
+    },
+    [pendingAnchor],
+  );
+
+  const dispatchTabAction = useCallback(
+    (tab: NavTab, action: string, anchorId?: string) => {
+      setPendingAction(action);
+      if (anchorId) {
+        setPendingAnchor(anchorId);
+      }
+      if (tab === activeTab) return;
+      const guard = unsavedGuardsRef.current[activeTab];
+      if (guard && guard.isDirty()) {
+        setPendingTabSwitch(tab);
+        return;
+      }
+      setPendingTabSwitch(null);
+      setActiveTabState(tab);
+    },
+    [activeTab],
+  );
+
+  const consumePendingAction = useCallback(
+    (expectedPrefix?: string) => {
+      if (!pendingAction) return null;
+      if (expectedPrefix && !pendingAction.startsWith(expectedPrefix)) return null;
+      const value = pendingAction;
+      setPendingAction(null);
+      return value;
+    },
+    [pendingAction],
+  );
+
   const confirmTabSwitchDiscard = useCallback(() => {
     setPendingTabSwitch((target) => {
       if (target) {
@@ -395,6 +569,8 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
   const cancelTabSwitch = useCallback(() => {
     if (savingPendingTabSwitch) return;
     setPendingTabSwitch(null);
+    setPendingAnchor(null);
+    setPendingAction(null);
   }, [savingPendingTabSwitch]);
 
   const confirmTabSwitchSave = useCallback(async () => {
@@ -435,16 +611,24 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
 
   const [status, setStatus] = useState<ProcessStatus | null>(null);
+  const [androidVpnActive, setAndroidVpnActive] = useState<boolean>(() =>
+    androidBridge.available() ? Boolean(androidBridge.getVpnStatus()?.active) : false,
+  );
   const [nodes, setNodes] = useState<NodeConfig[]>([]);
   const [groups, setGroups] = useState<GroupConfig[]>([]);
   const [listeners, setListeners] = useState<ListenConfig[]>([]);
   const [routing, setRouting] = useState<RoutingProfile | null>(null);
+  const [profiles, setProfiles] = useState<RoutingProfileSummary[]>([]);
+  const [activeProfileId, setActiveProfileId] = useState("default");
   const [ruleSets, setRuleSets] = useState<RuleSetSpec[]>([]);
   const [subscriptions, setSubscriptions] = useState<SubscriptionRecord[]>([]);
   const [tunState, setTunState] = useState<TUNState | null>(null);
   const [cores, setCores] = useState<CoresStatus | null>(null);
   const [healthSettings, setHealthSettings] = useState<HealthSettings | null>(null);
   const [systemProxyEnabled, setSystemProxyEnabled] = useState(false);
+  const [tailscaleEnabled, setTailscaleEnabled] = useState(false);
+  const [tailscaleState, setTailscaleState] = useState("");
+  const [storeRevision, setStoreRevision] = useState(0);
   const [lastImportDiagnostic, setLastImportDiagnostic] = useState<SubscriptionImportResult | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -567,9 +751,11 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
       api.getSystemProxy(),
       api.getNodeTabs(),
       api.getHealthSettings(),
+      api.getTailscale(),
+      api.listProfiles(),
     ]);
 
-    const [stRes, ndRes, grRes, lsRes, rtRes, rsRes, sbRes, tunRes, coreRes, spRes, tabsRes, hsRes] = results;
+    const [stRes, ndRes, grRes, lsRes, rtRes, rsRes, sbRes, tunRes, coreRes, spRes, tabsRes, hsRes, tsRes, profRes] = results;
     if (stRes.status === "fulfilled") {
       setStatus(stRes.value);
       if (typeof stRes.value.system_proxy_enabled === "boolean") {
@@ -597,7 +783,24 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
     if (hsRes.status === "fulfilled") {
       setHealthSettings(hsRes.value);
     }
+    if (tsRes.status === "fulfilled") {
+      setTailscaleEnabled(Boolean(tsRes.value?.config?.enabled));
+      setTailscaleState(tsRes.value?.status?.state || "");
+    }
+    if (profRes.status === "fulfilled") {
+      setProfiles(profRes.value?.profiles || []);
+      setActiveProfileId(profRes.value?.active_id || "default");
+    }
+    if (androidBridge.available()) {
+      setAndroidVpnActive(Boolean(androidBridge.getVpnStatus()?.active));
+    }
+    setStoreRevision((r) => r + 1);
   }, []);
+
+  const isProxyRunning = androidBridge.available()
+    ? Boolean(status?.running && status?.android_vpn_active && androidVpnActive)
+    : Boolean(status?.running);
+  const isTunActive = androidBridge.available() ? isProxyRunning : Boolean(tunState?.enabled);
 
   const highLatencyMs =
     healthSettings?.high_latency_ms && healthSettings.high_latency_ms > 0
@@ -636,40 +839,81 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
     authStatus && (!authStatus.authentication || (authStatus.authenticated && authStatus.unlocked)),
   );
 
+  const syncRuntimeStatus = useCallback(async () => {
+    const [stRes, tunRes, spRes] = await Promise.allSettled([
+      api.getStatus(),
+      api.getTUN(),
+      api.getSystemProxy(),
+    ]);
+    if (stRes.status === "fulfilled") {
+      setStatus(stRes.value);
+      if (typeof stRes.value.system_proxy_enabled === "boolean") {
+        setSystemProxyEnabled(stRes.value.system_proxy_enabled);
+      }
+    }
+    if (tunRes.status === "fulfilled") setTunState(tunRes.value);
+    if (spRes.status === "fulfilled") {
+      setSystemProxyEnabled(
+        stRes.status === "fulfilled" && typeof stRes.value.system_proxy_enabled === "boolean"
+          ? stRes.value.system_proxy_enabled
+          : Boolean(spRes.value.enabled),
+      );
+    }
+    if (androidBridge.available()) {
+      setAndroidVpnActive(Boolean(androidBridge.getVpnStatus()?.active));
+    }
+  }, []);
+
   useEffect(() => {
     if (!unlocked) return;
     void refreshAll();
-    // Sync again shortly after boot so async backend RestoreLastSession (runtime/TUN/system proxy)
-    // is reflected in UI switches without needing a manual interaction.
-    const t1 = window.setTimeout(() => void refreshAll(), 900);
-    const t2 = window.setTimeout(() => void refreshAll(), 2200);
+    // On desktop, sync lightweight runtime/TUN/system-proxy state once after boot so async
+    // RestoreLastSession is reflected without re-fetching nodes/groups/rulesets multiple times.
+    // On Android, RestoreLastSession does not auto-start VPN, so no redundant boot timer is needed.
+    let bootTimer: number | undefined;
+    if (!androidBridge.available()) {
+      bootTimer = window.setTimeout(() => void syncRuntimeStatus(), 1200);
+    }
 
     const onAndroidChanged = (ev: Event) => {
       const detail = (ev as CustomEvent<{ running?: boolean; approved?: boolean; error?: string }>).detail;
       if (detail?.error) {
         notify(detail.error, "error");
       }
-      void refreshAll();
+      if (typeof detail?.running === "boolean") {
+        setAndroidVpnActive(detail.running);
+      } else if (androidBridge.available()) {
+        setAndroidVpnActive(Boolean(androidBridge.getVpnStatus()?.active));
+      }
+      void syncRuntimeStatus();
       window.setTimeout(() => {
-        void refreshAll();
+        void syncRuntimeStatus();
       }, 600);
     };
+    const onAppLifecycle = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ foreground?: boolean }>).detail;
+      if (detail?.foreground) {
+        void syncRuntimeStatus();
+      }
+    };
     window.addEventListener("prismray-vpn-changed", onAndroidChanged);
+    window.addEventListener("prismray-app-lifecycle", onAppLifecycle);
 
     return () => {
-      window.clearTimeout(t1);
-      window.clearTimeout(t2);
+      if (bootTimer !== undefined) window.clearTimeout(bootTimer);
       window.removeEventListener("prismray-vpn-changed", onAndroidChanged);
+      window.removeEventListener("prismray-app-lifecycle", onAppLifecycle);
     };
-  }, [unlocked, refreshAll, notify]);
+  }, [unlocked, refreshAll, syncRuntimeStatus, notify]);
 
   const toggleConnect = useCallback(
     async (target?: { nodeId?: string; groupId?: string }) => {
       setBusy(true);
       try {
         if (androidBridge.available()) {
-          if (status?.running && !target) {
+          if (isProxyRunning && !target) {
             androidBridge.stopVpn();
+            setAndroidVpnActive(false);
             await api.stopAndroidVPN().catch(() => {});
             await api.stopProcess().catch(() => {});
             await refreshAll();
@@ -679,6 +923,18 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
           const nodeId =
             target?.nodeId ??
             (target?.groupId ? "" : status?.active_node_id ?? (groupId ? "" : nodes[0]?.id ?? ""));
+          // If Android VpnService (tun0) is already active and the user is switching nodes/groups,
+          // hot-switch sing-box's Clash API selector directly instead of tearing down tun0!
+          if (isProxyRunning && (target?.nodeId || target?.groupId)) {
+            if (groupId) recordRecentTarget(`group:${groupId}`);
+            else if (nodeId) recordRecentTarget(`node:${nodeId}`);
+            await api.connectProcess({
+              node_id: nodeId || undefined,
+              group_id: groupId || undefined,
+            });
+            await refreshAll();
+            return;
+          }
           const res = androidBridge.prepareAndStartVpn({
             per_app_mode: routing?.per_app_mode || "all",
             per_app_packages: routing?.per_app_packages || [],
@@ -727,7 +983,7 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
         setBusy(false);
       }
     },
-    [status, nodes, routing, locale, refreshAll, notify, recordRecentTarget],
+    [status, isProxyRunning, nodes, routing, locale, refreshAll, notify, recordRecentTarget],
   );
 
   const toggleTUN = useCallback(
@@ -754,6 +1010,7 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
             }
           } else {
             androidBridge.stopVpn();
+            setAndroidVpnActive(false);
             await api.stopAndroidVPN().catch(() => {});
           }
           window.setTimeout(() => void refreshAll(), 700);
@@ -835,14 +1092,30 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
       .filter(Boolean);
 
     void updateNativeTray({
-      running: Boolean(status?.running),
-      tunEnabled: Boolean(tunState?.enabled),
+      running: isProxyRunning,
+      tunEnabled: isTunActive,
       systemProxyEnabled,
       mode: routing?.mode || "rule",
       activeLabel,
+      locale,
+      tailscaleEnabled,
+      tailscaleState,
       recentTargets,
     });
-  }, [unlocked, status, tunState, systemProxyEnabled, routing, groups, nodes, recentTargetKeys, locale]);
+  }, [
+    unlocked,
+    status,
+    isProxyRunning,
+    isTunActive,
+    systemProxyEnabled,
+    tailscaleEnabled,
+    tailscaleState,
+    routing,
+    groups,
+    nodes,
+    recentTargetKeys,
+    locale,
+  ]);
 
   useEffect(() => {
     syncNativeTray();
@@ -852,19 +1125,32 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
   trayActionHandlerRef.current = async (action: string) => {
     try {
       if (action === "connect") {
-        if (!status?.running) await toggleConnect();
+        if (!isProxyRunning) await toggleConnect();
         return;
       }
       if (action === "disconnect") {
-        if (status?.running) await toggleConnect();
+        if (isProxyRunning) await toggleConnect();
         return;
       }
       if (action === "toggle:tun") {
-        await toggleTUN(!Boolean(tunState?.enabled));
+        await toggleTUN(!isTunActive);
         return;
       }
       if (action === "toggle:sysproxy") {
         await toggleSystemProxy(!systemProxyEnabled);
+        return;
+      }
+      if (action === "toggle:tailscale") {
+        const current = await api.getTailscale();
+        const nextEnabled = !current.config.enabled;
+        const payload = { ...current.config, enabled: nextEnabled };
+        delete payload.auth_key;
+        delete payload.has_auth_key;
+        delete payload.clear_auth_key;
+        const saved = await api.saveTailscale(payload);
+        setTailscaleEnabled(Boolean(saved.config?.enabled));
+        setTailscaleState(saved.status?.state || "");
+        await refreshAll();
         return;
       }
       if (action.startsWith("mode:") && routing) {
@@ -942,6 +1228,12 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
     () => ({
       activeTab,
       setActiveTab,
+      pendingAnchor,
+      navigateTo,
+      consumePendingAnchor,
+      pendingAction,
+      dispatchTabAction,
+      consumePendingAction,
       registerUnsavedGuard,
       pendingTabSwitch,
       savingPendingTabSwitch,
@@ -969,10 +1261,14 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
       clearNotice,
       authStatus,
       status,
+      isProxyRunning,
+      isTunActive,
       nodes,
       groups,
       listeners,
       routing,
+      profiles,
+      activeProfileId,
       ruleSets,
       subscriptions,
       tunState,
@@ -981,6 +1277,9 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
       highLatencyMs,
       updateHighLatencyMs,
       systemProxyEnabled,
+      tailscaleEnabled,
+      tailscaleState,
+      storeRevision,
       lastImportDiagnostic,
       setLastImportDiagnostic,
       busy,
@@ -993,6 +1292,12 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
     [
       activeTab,
       setActiveTab,
+      pendingAnchor,
+      navigateTo,
+      consumePendingAnchor,
+      pendingAction,
+      dispatchTabAction,
+      consumePendingAction,
       registerUnsavedGuard,
       pendingTabSwitch,
       savingPendingTabSwitch,
@@ -1020,10 +1325,14 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
       clearNotice,
       authStatus,
       status,
+      isProxyRunning,
+      isTunActive,
       nodes,
       groups,
       listeners,
       routing,
+      profiles,
+      activeProfileId,
       ruleSets,
       subscriptions,
       tunState,
@@ -1032,6 +1341,9 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
       highLatencyMs,
       updateHighLatencyMs,
       systemProxyEnabled,
+      tailscaleEnabled,
+      tailscaleState,
+      storeRevision,
       lastImportDiagnostic,
       busy,
       refreshAll,
@@ -1041,10 +1353,34 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
     ],
   );
 
+  const trayTooltipBase = useMemo(() => {
+    const isEn = locale === "en-US";
+    if (!isProxyRunning) return isEn ? "PrismRay · Disconnected" : "PrismRay · 已断开";
+    const channels: string[] = [];
+    if (isTunActive) channels.push("TUN");
+    if (systemProxyEnabled) channels.push(isEn ? "System Proxy" : "系统代理");
+    if (tailscaleEnabled) channels.push("Tailscale");
+    if (channels.length === 0) channels.push(isEn ? "Proxy Port" : "端口监听");
+    const activeGroup = groups.find((g) => g.id === status?.active_group_id);
+    const activeNode = nodes.find((n) => n.id === status?.active_node_id);
+    const target = activeGroup
+      ? activeGroup.name
+      : activeNode
+        ? activeNode.user_alias || activeNode.name
+        : isEn
+          ? "Connected"
+          : "已连接";
+    return `PrismRay · ${channels.join(" + ")} · ${target}`;
+  }, [isProxyRunning, isTunActive, systemProxyEnabled, tailscaleEnabled, groups, nodes, status, locale]);
+
   return React.createElement(
     AppStoreContext.Provider,
     { value },
-    React.createElement(AppTelemetryProvider, { unlocked }, children),
+    React.createElement(
+      AppTelemetryProvider,
+      { unlocked, activeTab, trayTooltipBase, isRunning: isProxyRunning, locale },
+      children,
+    ),
   );
 }
 

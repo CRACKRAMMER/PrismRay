@@ -2,7 +2,7 @@
 
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { CheckSquare, Gauge, Pencil, Play, QrCode, Square, Star, Trash2 } from "lucide-react";
+import { CheckSquare, Copy, CopyPlus, Gauge, Pencil, Play, QrCode, Square, Star, Trash2 } from "lucide-react";
 import { type NodeConfig } from "../lib/api.ts";
 import { useAppStore } from "../store/appStore.ts";
 import { BottomSheetDialog, useIsMobile } from "./ContextInspector.tsx";
@@ -27,6 +27,8 @@ interface NodeContextMenuProps {
   onToggleFavorite: (node: NodeConfig) => void;
   onEditNode: (node: NodeConfig) => void;
   onShareQr: (node: NodeConfig) => void;
+  onCopyUri?: (node: NodeConfig) => void;
+  onCloneNode?: (node: NodeConfig) => void;
   onDeleteNode: (nodeId: string) => void;
 }
 
@@ -44,14 +46,25 @@ export function NodeContextMenu({
   onToggleFavorite,
   onEditNode,
   onShareQr,
+  onCopyUri,
+  onCloneNode,
   onDeleteNode,
 }: NodeContextMenuProps) {
   const { tr } = useAppStore();
   const isMobile = useIsMobile();
   const menuRef = useRef<HTMLDivElement>(null);
+  const openedAtRef = useRef<number>(0);
+  const pointerDownInsideRef = useRef<boolean>(false);
   const [coords, setCoords] = useState<{ left: number; top: number }>({ left: 0, top: 0 });
   const supportsFocusgroup =
     typeof HTMLElement !== "undefined" && "focusGroup" in HTMLElement.prototype;
+
+  useEffect(() => {
+    if (state) {
+      openedAtRef.current = Date.now();
+      pointerDownInsideRef.current = false;
+    }
+  }, [state]);
 
   useLayoutEffect(() => {
     if (!state || isMobile) return;
@@ -148,7 +161,11 @@ export function NodeContextMenu({
     items[next]?.focus({ preventScroll: true });
   };
 
-  const runAction = (fn: () => void) => {
+  const runAction = (fn: () => void, e?: React.MouseEvent<HTMLButtonElement>) => {
+    // Ignore trailing ghost click emitted on finger-release right after mobile long-press opens the sheet.
+    if (isMobile && (!e || e.detail > 0) && !pointerDownInsideRef.current && Date.now() - openedAtRef.current < 450) {
+      return;
+    }
     onClose();
     fn();
   };
@@ -172,7 +189,7 @@ export function NodeContextMenu({
         type="button"
         {...itemRoleProps}
         onPointerMove={(e) => focusHoverItem(e.currentTarget)}
-        onClick={() => runAction(() => onToggleConnect(node.id))}
+        onClick={(e) => runAction(() => onToggleConnect(node.id), e)}
         className={itemClass}
       >
         <Play className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-primary" aria-hidden="true" />
@@ -184,7 +201,7 @@ export function NodeContextMenu({
         {...itemRoleProps}
         disabled={probing}
         onPointerMove={(e) => focusHoverItem(e.currentTarget)}
-        onClick={() => runAction(() => onProbeSingle(node.id))}
+        onClick={(e) => runAction(() => onProbeSingle(node.id), e)}
         className={itemClass}
       >
         <Gauge className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
@@ -196,7 +213,7 @@ export function NodeContextMenu({
           type="button"
           {...itemRoleProps}
           onPointerMove={(e) => focusHoverItem(e.currentTarget)}
-          onClick={() => runAction(() => onProbeSelected())}
+          onClick={(e) => runAction(() => onProbeSelected(), e)}
           className={itemClass}
         >
           <Gauge className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-primary" aria-hidden="true" />
@@ -210,7 +227,7 @@ export function NodeContextMenu({
         type="button"
         {...itemRoleProps}
         onPointerMove={(e) => focusHoverItem(e.currentTarget)}
-        onClick={() => runAction(() => onToggleSelect(node.id))}
+        onClick={(e) => runAction(() => onToggleSelect(node.id), e)}
         className={itemClass}
       >
         {isSelected ? (
@@ -225,7 +242,7 @@ export function NodeContextMenu({
         type="button"
         {...itemRoleProps}
         onPointerMove={(e) => focusHoverItem(e.currentTarget)}
-        onClick={() => runAction(() => onToggleFavorite(node))}
+        onClick={(e) => runAction(() => onToggleFavorite(node), e)}
         className={itemClass}
       >
         <Star
@@ -240,7 +257,7 @@ export function NodeContextMenu({
         type="button"
         {...itemRoleProps}
         onPointerMove={(e) => focusHoverItem(e.currentTarget)}
-        onClick={() => runAction(() => onEditNode(node))}
+        onClick={(e) => runAction(() => onEditNode(node), e)}
         className={itemClass}
       >
         <Pencil className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
@@ -251,12 +268,38 @@ export function NodeContextMenu({
         type="button"
         {...itemRoleProps}
         onPointerMove={(e) => focusHoverItem(e.currentTarget)}
-        onClick={() => runAction(() => onShareQr(node))}
+        onClick={(e) => runAction(() => onShareQr(node), e)}
         className={itemClass}
       >
         <QrCode className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
         <span className="flex-1 truncate">{tr("ctx.shareQr")}</span>
       </button>
+
+      {onCopyUri ? (
+        <button
+          type="button"
+          {...itemRoleProps}
+          onPointerMove={(e) => focusHoverItem(e.currentTarget)}
+          onClick={(e) => runAction(() => onCopyUri(node), e)}
+          className={itemClass}
+        >
+          <Copy className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+          <span className="flex-1 truncate">{tr("ctx.copyUri")}</span>
+        </button>
+      ) : null}
+
+      {onCloneNode ? (
+        <button
+          type="button"
+          {...itemRoleProps}
+          onPointerMove={(e) => focusHoverItem(e.currentTarget)}
+          onClick={(e) => runAction(() => onCloneNode(node), e)}
+          className={itemClass}
+        >
+          <CopyPlus className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+          <span className="flex-1 truncate">{tr("ctx.cloneNode")}</span>
+        </button>
+      ) : null}
 
       <hr className="my-1 border-border" />
 
@@ -264,7 +307,7 @@ export function NodeContextMenu({
         type="button"
         {...itemRoleProps}
         onPointerMove={(e) => focusHoverItem(e.currentTarget)}
-        onClick={() => runAction(() => onDeleteNode(node.id))}
+        onClick={(e) => runAction(() => onDeleteNode(node.id), e)}
         className={deleteClass}
       >
         <Trash2 className="h-4 w-4 md:h-3.5 md:w-3.5 shrink-0" aria-hidden="true" />
@@ -276,7 +319,14 @@ export function NodeContextMenu({
   if (isMobile) {
     return (
       <BottomSheetDialog open={Boolean(state)} title={displayName} onClose={onClose}>
-        <div className="space-y-0.5 pb-1">{menuActions}</div>
+        <div
+          className="space-y-0.5 pb-1"
+          onPointerDown={() => {
+            pointerDownInsideRef.current = true;
+          }}
+        >
+          {menuActions}
+        </div>
       </BottomSheetDialog>
     );
   }

@@ -25,6 +25,7 @@ import {
 import { clampColumnWidth } from "./useResizableColumns.ts";
 import { classifyQrPayload } from "./qrImport.ts";
 import {
+  MAX_DECOMPRESSED_SHARE_BYTES,
   ROUTING_SHARE_GZIP_PREFIX,
   decodeRoutingShareInput,
   encodeRoutingShareString,
@@ -220,8 +221,10 @@ describe("v1.0.0 frontend modules", () => {
       }),
       true,
     );
-    // Toggling field or reordering rules marks dirty
+    // Toggling field, custom rules master switch, or reordering rules marks dirty
     assert.equal(isRoutingProfileEqual(baseProfile, { ...baseProfile, bypass_cn: false }), false);
+    assert.equal(isRoutingProfileEqual(baseProfile, { ...baseProfile, custom_rules_enabled: false }), false);
+    assert.equal(isRoutingProfileEqual(baseProfile, { ...baseProfile, custom_rules_enabled: true }), true);
     assert.equal(
       isRoutingProfileEqual(baseProfile, {
         ...baseProfile,
@@ -239,6 +242,7 @@ describe("v1.0.0 frontend modules", () => {
       bypass_cn: true,
       local_dns: "223.5.5.5",
       remote_dns: "https://dns.google/dns-query",
+      custom_rules_enabled: false,
       custom_rules: [
         {
           id: "r-google",
@@ -254,6 +258,7 @@ describe("v1.0.0 frontend modules", () => {
     const decoded = await decodeRoutingShareInput(encoded);
     assert.equal(decoded.mode, "rule");
     assert.equal(decoded.local_dns, "223.5.5.5");
+    assert.equal(decoded.custom_rules_enabled, false);
     assert.equal(decoded.custom_rules.length, 1);
     assert.deepEqual(decoded.custom_rules[0].domain_suffix, ["google.com", "youtube.com", "googleapis.com"]);
 
@@ -402,5 +407,46 @@ describe("v1.0.0 frontend modules", () => {
     assert.equal(nodeMatchesFilterTabs(nodes[0], ["sub:sub-a", "utag:AI"]), true);
     assert.equal(nodeMatchesFilterTabs(nodes[1], ["sub:sub-a", "utag:AI"]), true);
     assert.equal(nodeMatchesFilterTabs(nodes[2], ["sub:sub-a", "utag:AI"]), false);
+  });
+
+  it("resolves connection routes identically with O(1) lookup Maps", () => {
+    const sampleNodes = [
+      { id: "n-sb", name: "Tokyo", protocol: "vless", network: "tcp" },
+      { id: "n-xr", name: "US XHTTP", user_alias: "US Fast", protocol: "vless", network: "xhttp" },
+    ];
+    const sampleGroups = [{ id: "g-auto", name: "Auto Pool" }];
+    const nodeMap = new Map(sampleNodes.map((n) => [n.id, n]));
+    const groupMap = new Map(sampleGroups.map((g) => [g.id, g]));
+
+    const viaScan = resolveConnectionRoute(["node-n-xr", "group-g-auto"], sampleNodes, sampleGroups);
+    const viaMap = resolveConnectionRoute(["node-n-xr", "group-g-auto"], sampleNodes, sampleGroups, nodeMap, groupMap);
+    assert.deepEqual(viaMap, viaScan);
+    assert.equal(viaMap.nodeName, "US Fast");
+    assert.equal(viaMap.groupName, "Auto Pool");
+    assert.equal(viaMap.engine, "xray");
+
+    assert.equal(resolveConnectionRoute(["direct"], sampleNodes, sampleGroups, nodeMap, groupMap).outboundKind, "direct");
+    assert.equal(resolveConnectionRoute(["block-out"], sampleNodes, sampleGroups, nodeMap, groupMap).outboundKind, "block");
+  });
+
+  it("rejects oversized routing share gzip payloads exceeding 2 MiB limit", async () => {
+    const oversized = new Uint8Array(MAX_DECOMPRESSED_SHARE_BYTES + 4096);
+    oversized.fill(0x20);
+    const cs = new CompressionStream("gzip");
+    const writer = cs.writable.getWriter();
+    const writePromise = (async () => {
+      await writer.write(oversized);
+      await writer.close();
+    })();
+    const compressedBuf = await new Response(cs.readable).arrayBuffer();
+    await writePromise;
+    const bytes = new Uint8Array(compressedBuf);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    const b64url = btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    await assert.rejects(
+      decodeRoutingShareInput(ROUTING_SHARE_GZIP_PREFIX + b64url),
+      /safety limit/i,
+    );
   });
 });

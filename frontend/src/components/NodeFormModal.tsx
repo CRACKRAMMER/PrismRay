@@ -165,7 +165,7 @@ export function NodeEditorForm({ initialNode, onClose, onSaved, embedded = false
       name: form.name.trim(),
       user_alias: form.user_alias?.trim() || "",
       group: form.group?.trim() || "",
-      detour_id: form.detour_id?.trim() || "",
+      detour_id: isXrayExclusive ? "" : form.detour_id?.trim() || "",
       address: form.address.trim(),
       port: Number(form.port),
       alpn,

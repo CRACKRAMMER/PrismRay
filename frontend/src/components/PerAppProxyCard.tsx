@@ -78,6 +78,12 @@ export function PerAppProxyCard({
 
         <p className="text-xs leading-relaxed text-muted-foreground">{modeDesc}</p>
 
+        {normalizedMode === "whitelist" ? (
+          <div className="rounded-[8px] border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs leading-relaxed text-amber-700 dark:text-amber-300">
+            {tr("routing.perAppWhitelistPlayHint")}
+          </div>
+        ) : null}
+
         {normalizedMode !== "all" ? (
           <AndroidAppPicker
             packages={packages}

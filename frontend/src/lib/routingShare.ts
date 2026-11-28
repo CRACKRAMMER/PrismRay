@@ -5,6 +5,7 @@ import type { RoutingProfile } from "./api.ts";
 export const ROUTING_SHARE_GZIP_PREFIX = "prismray-route://v1/";
 export const ROUTING_SHARE_PLAIN_PREFIX = "prismray-route://v1-plain/";
 export const QR_MAX_SAFE_CHARS = 2900;
+export const MAX_DECOMPRESSED_SHARE_BYTES = 2 * 1024 * 1024;
 
 function bytesToBase64Url(bytes: Uint8Array): string {
   let binary = "";
@@ -41,17 +42,45 @@ async function gzipBytes(data: Uint8Array): Promise<Uint8Array | null> {
   }
 }
 
-async function gunzipBytes(data: Uint8Array): Promise<Uint8Array> {
+async function gunzipBytes(data: Uint8Array, maxBytes = MAX_DECOMPRESSED_SHARE_BYTES): Promise<Uint8Array> {
   if (typeof DecompressionStream === "undefined") {
     throw new Error("DecompressionStream is unavailable in this runtime");
   }
   const ds = new DecompressionStream("gzip");
-  const outPromise = new Response(ds.readable).arrayBuffer();
   const writer = ds.writable.getWriter();
-  await writer.write(new Uint8Array(data));
-  await writer.close();
-  const buf = await outPromise;
-  return new Uint8Array(buf);
+  const writePromise = (async () => {
+    await writer.write(new Uint8Array(data));
+    await writer.close();
+  })();
+
+  const reader = ds.readable.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.byteLength > 0) {
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          await reader.cancel().catch(() => {});
+          throw new Error(`Routing share payload exceeds ${maxBytes} byte safety limit`);
+        }
+        chunks.push(value);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+    await writePromise.catch(() => {});
+  }
+
+  const out = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 /**
@@ -69,7 +98,7 @@ export async function encodeRoutingShareString(profile: RoutingProfile): Promise
 
 function extractRoutingProfile(parsed: unknown): RoutingProfile {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("无效的路由配置 JSON 对象");
+    throw new Error("Invalid routing profile JSON object");
   }
   const obj = parsed as Record<string, unknown>;
   const candidate =
@@ -85,7 +114,7 @@ function extractRoutingProfile(parsed: unknown): RoutingProfile {
     "bypass_cn" in candidate ||
     "block_ads" in candidate;
   if (!hasKnownKey) {
-    throw new Error("未检测到有效的路由与 DNS 策略字段");
+    throw new Error("No valid routing or DNS policy fields detected");
   }
 
   const modeRaw = typeof candidate.mode === "string" ? candidate.mode.trim() : "rule";
@@ -107,6 +136,8 @@ function extractRoutingProfile(parsed: unknown): RoutingProfile {
       typeof candidate.remote_dns === "string" && candidate.remote_dns.trim()
         ? candidate.remote_dns.trim()
         : "https://1.1.1.1/dns-query",
+    custom_rules_enabled:
+      typeof candidate.custom_rules_enabled === "boolean" ? candidate.custom_rules_enabled : true,
     custom_rules: customRules as RoutingProfile["custom_rules"],
   };
 }
@@ -118,7 +149,7 @@ function extractRoutingProfile(parsed: unknown): RoutingProfile {
 export async function decodeRoutingShareInput(rawInput: string): Promise<RoutingProfile> {
   const trimmed = rawInput.trim();
   if (!trimmed) {
-    throw new Error("请输入或扫描有效的路由配置内容");
+    throw new Error("Please enter or scan valid routing configuration content");
   }
   let jsonText = trimmed;
   if (trimmed.startsWith(ROUTING_SHARE_GZIP_PREFIX)) {
@@ -127,13 +158,17 @@ export async function decodeRoutingShareInput(rawInput: string): Promise<Routing
     jsonText = new TextDecoder().decode(inflated);
   } else if (trimmed.startsWith(ROUTING_SHARE_PLAIN_PREFIX)) {
     const payload = trimmed.slice(ROUTING_SHARE_PLAIN_PREFIX.length).trim();
-    jsonText = new TextDecoder().decode(base64UrlToBytes(payload));
+    const rawBytes = base64UrlToBytes(payload);
+    if (rawBytes.byteLength > MAX_DECOMPRESSED_SHARE_BYTES) {
+      throw new Error(`Routing share payload exceeds ${MAX_DECOMPRESSED_SHARE_BYTES} byte safety limit`);
+    }
+    jsonText = new TextDecoder().decode(rawBytes);
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(jsonText);
   } catch {
-    throw new Error("无法解析为有效的 JSON 或 PrismRay 路由分享串");
+    throw new Error("Unable to parse as valid JSON or PrismRay routing share string");
   }
   return extractRoutingProfile(parsed);
 }

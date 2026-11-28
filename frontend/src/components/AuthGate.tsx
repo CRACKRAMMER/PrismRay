@@ -64,10 +64,16 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
     setFormError("");
     setBioUnlocking(true);
     try {
-      await authenticateBiometric(
-        locale === "zh-CN" ? "验证系统生物信息以解锁 PrismRay 配置库" : "Authenticate to unlock PrismRay",
-      );
-      await api.biometricUnlock();
+      const reason =
+        locale === "zh-CN" ? "验证系统生物信息以解锁 PrismRay 配置库" : "Authenticate to unlock PrismRay";
+      if (isAndroidClient()) {
+        const res = await authenticateBiometric(reason);
+        await api.biometricUnlock({ biometric_kek: res.biometric_kek });
+      } else {
+        const { challenge } = await api.requestBiometricChallenge();
+        const res = await authenticateBiometric(reason, challenge);
+        await api.biometricUnlock({ challenge, signature: res.signature });
+      }
       const next = await api.getAuthStatus();
       setAuthStatus(next);
     } catch (err) {

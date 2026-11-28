@@ -24,7 +24,6 @@ import {
 import {
   APP_UPDATE_BADGE_EVENT,
   LAST_UPDATE_CHECK_TS_KEY,
-  TRIGGER_UPDATE_CHECK_EVENT,
   isAutoUpdateCheckEnabled,
   loadCachedUpdateResult,
   saveCachedUpdateResult,
@@ -62,38 +61,59 @@ const SubscriptionsView = lazy(() => import("./views/SubscriptionsView.tsx").the
 const RoutingView = lazy(() => import("./views/RoutingView.tsx").then((m) => ({ default: m.RoutingView })));
 const SettingsLogsView = lazy(() => import("./views/SettingsLogsView.tsx").then((m) => ({ default: m.SettingsLogsView })));
 
-function SidebarConnectionsBadge() {
+function ConnectionsCountBadge({ mobile = false }: { mobile?: boolean }) {
+  const { activeTab } = useAppStore();
   const { connections } = useConnectionsTelemetry();
-  if (connections.connections.length <= 0) return null;
+  const { trafficNow } = useTrafficTelemetry();
+  const count =
+    activeTab === "connections"
+      ? connections.connections.length
+      : (trafficNow.active_connections ?? 0);
+  if (count <= 0) return null;
   return (
-    <span className="shrink-0 badge-radius border border-primary/30 bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold text-primary mono-num">
-      {connections.connections.length}
-    </span>
-  );
-}
-
-function MobileConnectionsBadge() {
-  const { connections } = useConnectionsTelemetry();
-  if (connections.connections.length <= 0) return null;
-  return (
-    <span className="badge-radius bg-primary/15 text-primary px-2 py-0.5 text-xs mono-num">
-      {connections.connections.length}
+    <span
+      className={
+        mobile
+          ? "badge-radius bg-primary/15 text-primary px-2 py-0.5 text-xs mono-num"
+          : "shrink-0 badge-radius border border-primary/30 bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold text-primary mono-num"
+      }
+    >
+      {count}
     </span>
   );
 }
 
 function SidebarTrafficRates() {
+  const { tr } = useAppStore();
   const { trafficNow } = useTrafficTelemetry();
   return (
-    <div className="flex items-center justify-between gap-2 mono-num text-[11px]">
-      <span className="inline-flex items-center gap-1 text-emerald-500">
-        <ArrowDown className="h-3 w-3" aria-hidden="true" />
-        {formatRate(trafficNow.down)}
-      </span>
-      <span className="inline-flex items-center gap-1 text-sky-500">
-        <ArrowUp className="h-3 w-3" aria-hidden="true" />
-        {formatRate(trafficNow.up)}
-      </span>
+    <div className="space-y-1 mono-num text-[11px]">
+      <div className="flex items-center justify-between gap-1.5">
+        <span className="shrink-0 text-[10px] font-medium text-primary/90">{tr("overview.proxyTraffic")}</span>
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="inline-flex items-center gap-0.5 text-primary">
+            <ArrowDown className="h-3 w-3 shrink-0" aria-hidden="true" />
+            {formatRate(trafficNow.proxy_down ?? 0)}
+          </span>
+          <span className="inline-flex items-center gap-0.5 text-primary/70">
+            <ArrowUp className="h-3 w-3 shrink-0" aria-hidden="true" />
+            {formatRate(trafficNow.proxy_up ?? 0)}
+          </span>
+        </div>
+      </div>
+      <div className="flex items-center justify-between gap-1.5">
+        <span className="shrink-0 text-[10px] font-medium text-emerald-500/90">{tr("overview.directTraffic")}</span>
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="inline-flex items-center gap-0.5 text-emerald-500">
+            <ArrowDown className="h-3 w-3 shrink-0" aria-hidden="true" />
+            {formatRate(trafficNow.direct_down ?? 0)}
+          </span>
+          <span className="inline-flex items-center gap-0.5 text-emerald-500/70">
+            <ArrowUp className="h-3 w-3 shrink-0" aria-hidden="true" />
+            {formatRate(trafficNow.direct_up ?? 0)}
+          </span>
+        </div>
+      </div>
     </div>
   );
 }
@@ -159,6 +179,7 @@ function Shell() {
   const {
     activeTab,
     setActiveTab,
+    dispatchTabAction,
     pendingTabSwitch,
     savingPendingTabSwitch,
     confirmTabSwitchSave,
@@ -173,11 +194,12 @@ function Shell() {
     setSidebarCollapsed,
     setCommandPaletteOpen,
     status,
+    isProxyRunning,
+    isTunActive,
     busy,
     nodes,
     groups,
     routing,
-    tunState,
     systemProxyEnabled,
     toggleConnect,
     toggleTUN,
@@ -322,11 +344,7 @@ function Shell() {
   }, []);
 
   const openUpdateSection = () => {
-    setActiveTab("settings");
-    window.setTimeout(() => {
-      document.getElementById("settings-cores")?.scrollIntoView({ behavior: "smooth", block: "start" });
-      window.dispatchEvent(new CustomEvent(TRIGGER_UPDATE_CHECK_EVENT));
-    }, 180);
+    dispatchTabAction("settings", "update-check", "settings-cores");
   };
 
   useEffect(() => {
@@ -443,10 +461,7 @@ function Shell() {
 
   const triggerQuickCreate = (targetTab: NavTab, action: "node" | "subscription" | "rule") => {
     setQuickCreateOpen(false);
-    setActiveTab(targetTab);
-    window.setTimeout(() => {
-      window.dispatchEvent(new CustomEvent("prismray-quick-create", { detail: action }));
-    }, 40);
+    dispatchTabAction(targetTab, `quick-create:${action}`);
   };
 
   const themeLabel =
@@ -456,20 +471,20 @@ function Shell() {
         ? tr("sidebar.themeDark")
         : tr("sidebar.themeSystem");
 
-  const renderTabComponent = (tab: NavTab) => {
+  const renderTabComponent = (tab: NavTab, isActive: boolean) => {
     switch (tab) {
       case "overview":
-        return <OverviewView />;
+        return <OverviewView isActive={isActive} />;
       case "proxies":
         return <ProxiesView />;
       case "connections":
-        return <ConnectionsView />;
+        return <ConnectionsView isActive={isActive} />;
       case "subscriptions":
         return <SubscriptionsView />;
       case "routing":
-        return <RoutingView />;
+        return <RoutingView isActive={isActive} />;
       case "settings":
-        return <SettingsLogsView />;
+        return <SettingsLogsView isActive={isActive} />;
     }
   };
 
@@ -544,30 +559,26 @@ function Shell() {
           <div className={`flex items-center ${sidebarCollapsed ? "justify-center" : "justify-between gap-2"}`}>
             {!sidebarCollapsed ? (
               <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
-                <PrismRayLogo className="h-7 w-7 shrink-0 rounded-[7px]" />
-                <div className="min-w-0 flex-1 overflow-hidden">
-                  <div className="flex min-w-0 items-baseline gap-1 overflow-hidden">
-                    <span className="truncate text-[13px] font-bold tracking-tight text-foreground">
-                      {tr("app.name")}
-                    </span>
-                    {sidebarWidth >= 215 ? (
-                      <button
-                        type="button"
-                        onClick={openUpdateSection}
-                        title={
-                          updateBadge.hasUpdate
-                            ? tr("update.badgeTooltip", { version: updateBadge.latestVersion })
-                            : tr("update.versionTooltip", { version: tr("app.version") })
-                        }
-                        className="inline-flex shrink-0 items-center gap-1 rounded px-1 py-0.5 text-[10px] tabular-nums text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                      >
-                        <span>{tr("app.version")}</span>
-                        {updateBadge.hasUpdate ? (
-                          <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden="true" />
-                        ) : null}
-                      </button>
+                <PrismRayLogo className="h-6 w-6 shrink-0 rounded-[6px]" />
+                <div className="flex min-w-0 flex-1 flex-col items-start gap-0.5 leading-none overflow-hidden">
+                  <span className="truncate max-w-full text-[13px] font-bold tracking-tight text-foreground">
+                    {tr("app.name")}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={openUpdateSection}
+                    title={
+                      updateBadge.hasUpdate
+                        ? tr("update.badgeTooltip", { version: updateBadge.latestVersion })
+                        : tr("update.versionTooltip", { version: tr("app.version") })
+                    }
+                    className="inline-flex shrink-0 items-center gap-1 rounded px-0.5 py-0.5 text-[10px] tabular-nums text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                  >
+                    <span>{tr("app.version")}</span>
+                    {updateBadge.hasUpdate ? (
+                      <span className="h-1.5 w-1.5 rounded-full bg-primary" aria-hidden="true" />
                     ) : null}
-                  </div>
+                  </button>
                 </div>
               </div>
             ) : (
@@ -587,18 +598,18 @@ function Shell() {
                 <span
                   className={[
                     "inline-flex items-center gap-1.5 overflow-hidden badge-radius border px-1.5 py-0.5 text-[10px] font-semibold leading-none tabular-nums",
-                    status?.running
+                    isProxyRunning
                       ? "border-primary/30 bg-primary/15 text-primary"
                       : "border-border bg-muted text-muted-foreground",
                   ].join(" ")}
                 >
                   <span
                     className={`h-1.5 w-1.5 rounded-full ${
-                      status?.running ? "bg-primary status-radar-dot" : "bg-muted-foreground/70"
+                      isProxyRunning ? "bg-primary status-radar-dot" : "bg-muted-foreground/70"
                     }`}
                     aria-hidden="true"
                   />
-                  {status?.running ? "ON" : "OFF"}
+                  {isProxyRunning ? "ON" : "OFF"}
                 </span>
                 <button
                   type="button"
@@ -673,7 +684,7 @@ function Shell() {
                 ) : null}
                 <Icon className="h-4 w-4 shrink-0 transition-transform duration-150 group-hover:scale-105" />
                 {!sidebarCollapsed && <span className="truncate flex-1">{tr(labelKey)}</span>}
-                {!sidebarCollapsed && id === "connections" ? <SidebarConnectionsBadge /> : null}
+                {!sidebarCollapsed && id === "connections" ? <ConnectionsCountBadge /> : null}
               </button>
             );
           })}
@@ -727,7 +738,7 @@ function Shell() {
                       <span
                         className={[
                           "h-1.5 w-1.5 shrink-0 rounded-full",
-                          status?.running ? "bg-emerald-500" : "bg-muted-foreground/50",
+                          isProxyRunning ? "bg-emerald-500" : "bg-muted-foreground/50",
                         ].join(" ")}
                         aria-hidden="true"
                       />
@@ -744,11 +755,11 @@ function Shell() {
                     type="button"
                     disabled={busy}
                     onClick={() => void toggleConnect()}
-                    title={status?.running ? tr("action.disconnect") : tr("action.connect")}
-                    aria-label={status?.running ? tr("action.disconnect") : tr("action.connect")}
+                    title={isProxyRunning ? tr("action.disconnect") : tr("action.connect")}
+                    aria-label={isProxyRunning ? tr("action.disconnect") : tr("action.connect")}
                     className={[
                       "inline-flex h-7 w-7 min-h-0 shrink-0 items-center justify-center rounded-lg transition-all active:scale-[0.94] disabled:opacity-50",
-                      status?.running
+                      isProxyRunning
                         ? "bg-primary text-primary-foreground shadow-xs hover:bg-primary/90"
                         : "bg-background/80 text-primary ring-1 ring-border/70 hover:bg-primary/10",
                     ].join(" ")}
@@ -801,16 +812,16 @@ function Shell() {
                   <button
                     type="button"
                     disabled={busy}
-                    onClick={() => void toggleTUN(!Boolean(tunState?.enabled))}
-                    title={tunState?.enabled ? tr("sidebar.tunOn") : tr("sidebar.tunOff")}
+                    onClick={() => void toggleTUN(!isTunActive)}
+                    title={isTunActive ? tr("sidebar.tunOn") : tr("sidebar.tunOff")}
                     className={[
                       "min-h-0 truncate rounded-lg px-1.5 py-1.5 text-center font-medium leading-none transition-all active:scale-[0.97] disabled:opacity-50",
-                      tunState?.enabled
+                      isTunActive
                         ? "bg-primary/15 text-primary ring-1 ring-primary/30 hover:bg-primary/20"
                         : "bg-background/75 text-muted-foreground hover:bg-background hover:text-foreground",
                     ].join(" ")}
                   >
-                    {tunState?.enabled ? tr("sidebar.tunOn") : tr("sidebar.tunOff")}
+                    {isTunActive ? tr("sidebar.tunOn") : tr("sidebar.tunOff")}
                   </button>
                   <button
                     type="button"
@@ -879,12 +890,12 @@ function Shell() {
             <span
               className={[
                 "shrink-0 badge-radius border px-1.5 py-0.5 text-[10px] font-semibold mono-num",
-                status?.running
+                isProxyRunning
                   ? "border-primary/30 bg-primary/15 text-primary"
                   : "border-border bg-muted text-muted-foreground",
               ].join(" ")}
             >
-              {status?.running ? "ON" : "OFF"}
+              {isProxyRunning ? "ON" : "OFF"}
             </span>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
@@ -929,7 +940,7 @@ function Shell() {
                     </div>
                   }
                 >
-                  {renderTabComponent(tab)}
+                  {renderTabComponent(tab, isActive)}
                 </Suspense>
               </div>
             );
@@ -1076,7 +1087,7 @@ function Shell() {
                   <Icon className="h-4 w-4 shrink-0" />
                   <span>{tr(`nav.${id}`)}</span>
                 </span>
-                {id === "connections" ? <MobileConnectionsBadge /> : null}
+                {id === "connections" ? <ConnectionsCountBadge mobile /> : null}
               </button>
             ))}
             <div className="pt-2 border-t border-border grid grid-cols-2 gap-2">

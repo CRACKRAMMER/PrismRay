@@ -154,7 +154,10 @@ export function RuleEditorForm({
   };
 
   const isBuiltinOutbound =
-    form.outbound === "proxy" || form.outbound === "direct" || form.outbound === "block";
+    form.outbound === "proxy" ||
+    form.outbound === "direct" ||
+    form.outbound === "block" ||
+    form.outbound === "tailscale-ep";
   const hasMatchingTarget =
     isBuiltinOutbound ||
     groups.some((g) => g.id === form.outbound) ||
@@ -193,6 +196,7 @@ export function RuleEditorForm({
                 <option value="proxy">{tr("routing.outboundMainProxy")}</option>
                 <option value="direct">{tr("routing.outboundDirect")}</option>
                 <option value="block">{tr("routing.outboundBlock")}</option>
+                <option value="tailscale-ep">{tr("routing.outboundTailscale")}</option>
                 {groups.length > 0 ? (
                   <optgroup label={tr("routing.outboundGroups")}>
                     {groups.map((g) => (

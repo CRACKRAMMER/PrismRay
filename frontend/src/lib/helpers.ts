@@ -184,6 +184,8 @@ export function resolveConnectionRoute(
   chains: string[] | undefined,
   nodes: NodeLike[],
   groups: GroupLike[],
+  nodeMap?: ReadonlyMap<string, NodeLike>,
+  groupMap?: ReadonlyMap<string, GroupLike>,
 ): ResolvedConnectionRoute {
   const list = chains || [];
   let nodeId = "";
@@ -201,7 +203,7 @@ export function resolveConnectionRoute(
     }
   }
 
-  const groupObj = groupId ? groups.find((g) => g.id === groupId) : undefined;
+  const groupObj = groupId ? (groupMap ? groupMap.get(groupId) : groups.find((g) => g.id === groupId)) : undefined;
   const groupName = groupObj?.name || (groupId ? groupId : "");
 
   if (list.some((c) => c === "block-out" || c === "REJECT" || c === "reject")) {
@@ -226,7 +228,7 @@ export function resolveConnectionRoute(
   }
 
   if (nodeId) {
-    const found = nodes.find((n) => n.id === nodeId);
+    const found = nodeMap ? nodeMap.get(nodeId) : nodes.find((n) => n.id === nodeId);
     const engine: "sing-box" | "xray" = found && nodeNeedsXray(found) ? "xray" : "sing-box";
     return {
       outboundKind: "node",
@@ -411,16 +413,22 @@ export interface RoutingProfileLike {
   bypass_lan: boolean;
   allow_lan_broadcast?: boolean;
   bypass_cn: boolean;
+  bypass_system_tailscale?: boolean;
+  disable_ipv6?: boolean;
   local_dns: string;
   remote_dns: string;
   domain_strategy?: string;
   hijack_dns?: boolean;
   fake_ip?: boolean;
+  fake_ip_v4_range?: string;
+  fake_ip_v6_range?: string;
   fake_ip_filter?: string[];
   kill_switch?: boolean;
   webrtc_mode?: string;
+  log_level?: string;
   per_app_mode?: string;
   per_app_packages?: string[];
+  custom_rules_enabled?: boolean;
   custom_rules: RoutingRuleLike[];
 }
 
@@ -466,16 +474,22 @@ export function isRoutingProfileEqual(a: RoutingProfileLike, b: RoutingProfileLi
     bypass_lan: Boolean(p.bypass_lan),
     allow_lan_broadcast: Boolean(p.bypass_lan && p.allow_lan_broadcast),
     bypass_cn: Boolean(p.bypass_cn),
+    bypass_system_tailscale: p.bypass_system_tailscale ?? true,
+    disable_ipv6: p.disable_ipv6 ?? !(p.domain_strategy === "prefer_ipv6" || p.domain_strategy === "ipv6_only" || p.domain_strategy === "as_is"),
     local_dns: (p.local_dns || "").trim(),
     remote_dns: (p.remote_dns || "").trim(),
     domain_strategy: (p.domain_strategy || "prefer_ipv4").trim(),
     hijack_dns: p.hijack_dns ?? true,
     fake_ip: Boolean(p.fake_ip),
+    fake_ip_v4_range: (p.fake_ip_v4_range || "198.18.0.0/15").trim(),
+    fake_ip_v6_range: (p.fake_ip_v6_range || "fc00::/18").trim(),
     fake_ip_filter: normStrList(p.fake_ip_filter),
     kill_switch: p.kill_switch ?? true,
     webrtc_mode: (p.webrtc_mode || "block").trim(),
+    log_level: (p.log_level || "info").trim().toLowerCase(),
     per_app_mode: (p.per_app_mode || "all").trim(),
     per_app_packages: normStrList(p.per_app_packages),
+    custom_rules_enabled: p.custom_rules_enabled ?? true,
     custom_rules: (p.custom_rules || []).map(normRule),
   });
   return JSON.stringify(norm(a)) === JSON.stringify(norm(b));

@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: MPL-2.0
 
-import { useState } from "react";
+import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
   ArrowDown,
   ArrowUp,
+  Copy,
   Globe,
   Network,
   Power,
+  RefreshCw,
+  Send,
   Shield,
   ShieldAlert,
   ShieldBan,
@@ -16,21 +19,29 @@ import {
   SlidersHorizontal,
 } from "lucide-react";
 import {
-  Area,
-  AreaChart,
-  CartesianGrid,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
-import { api, formatApiError, isAndroidClient, type ListenConfig, type RoutingProfile } from "../lib/api.ts";
-import { formatRate } from "../lib/helpers.ts";
+  androidBridge,
+  api,
+  formatApiError,
+  isAndroidClient,
+  type ListenConfig,
+  type RoutingProfile,
+  type SystemTailscaleInfo,
+  type TailscaleConfig,
+  type TailscalePeerStatus,
+  type TailscalePingResult,
+  type TailscaleRuntimeStatus,
+  type TrafficHistoryResponse,
+} from "../lib/api.ts";
+import { formatBytes, formatRate } from "../lib/helpers.ts";
 import { useAppStore, useTrafficTelemetry } from "../store/appStore.ts";
+import { ProfileSwitcher } from "../components/ProfileSwitcher.tsx";
 import { Button } from "../components/ui/button.tsx";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card.tsx";
 import { Select } from "../components/ui/select.tsx";
 import { Switch } from "../components/ui/switch.tsx";
+
+const LiveTrafficChart = lazy(() => import("../components/LiveTrafficChart.tsx"));
+const TrafficHistoryChart = lazy(() => import("../components/TrafficHistoryChart.tsx"));
 
 const DEFAULT_ROUTING_BASE: RoutingProfile = {
   mode: "rule",
@@ -41,14 +52,17 @@ const DEFAULT_ROUTING_BASE: RoutingProfile = {
   webrtc_mode: "block",
   local_dns: "223.5.5.5",
   remote_dns: "https://1.1.1.1/dns-query",
+  custom_rules_enabled: true,
   custom_rules: [],
 };
 
-export function OverviewView() {
+export function OverviewView({ isActive = true }: { isActive?: boolean } = {}) {
   const {
     tr,
     locale,
     status,
+    isProxyRunning,
+    isTunActive,
     nodes,
     groups,
     listeners,
@@ -61,11 +75,267 @@ export function OverviewView() {
     toggleSystemProxy,
     refreshAll,
     notify,
-    setActiveTab,
+    navigateTo,
   } = useAppStore();
   const { trafficNow, trafficHistory } = useTrafficTelemetry();
 
   const [authorizing, setAuthorizing] = useState(false);
+  const [tsConfig, setTsConfig] = useState<TailscaleConfig | null>(null);
+  const [tsStateInit, setTsStateInit] = useState(false);
+  const [tsStatus, setTsStatus] = useState<TailscaleRuntimeStatus | null>(null);
+  const [sysTailscale, setSysTailscale] = useState<SystemTailscaleInfo | null>(null);
+  const [tsBusy, setTsBusy] = useState(false);
+  const [tsRefreshing, setTsRefreshing] = useState(false);
+  const [exitNodeBusyId, setExitNodeBusyId] = useState<string | null>(null);
+  const [taildropBusyId, setTaildropBusyId] = useState<string | null>(null);
+  const taildropPeerRef = useRef<string>("");
+  const taildropInputRef = useRef<HTMLInputElement | null>(null);
+  const [peerPings, setPeerPings] = useState<Record<string, { busy?: boolean; result?: TailscalePingResult; err?: string }>>({});
+  const [trafficFilter, setTrafficFilter] = useState<"all" | "proxy" | "direct">("all");
+  const [trafficRange, setTrafficRange] = useState<"live" | "24h" | "7d" | "30d">("live");
+  const [historyData, setHistoryData] = useState<TrafficHistoryResponse | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  useEffect(() => {
+    if (!isActive || trafficRange === "live") return;
+    let cancelled = false;
+    setHistoryLoading(true);
+    api
+      .getTrafficHistory(trafficRange)
+      .then((res) => {
+        if (!cancelled) setHistoryData(res);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setHistoryLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isActive, trafficRange]);
+
+  const handleClearTrafficHistory = async () => {
+    try {
+      await api.clearTrafficHistory();
+      if (trafficRange !== "live") {
+        const res = await api.getTrafficHistory(trafficRange);
+        setHistoryData(res);
+      }
+      notify(tr("overview.trafficHistoryCleared"));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    }
+  };
+
+  const handlePingTailscalePeer = async (ip: string) => {
+    if (!ip) return;
+    setPeerPings((prev) => ({ ...prev, [ip]: { busy: true } }));
+    try {
+      const res = await api.pingTailscalePeer(ip, 3);
+      setPeerPings((prev) => ({ ...prev, [ip]: { busy: false, result: res, err: res.error || undefined } }));
+    } catch (err) {
+      setPeerPings((prev) => ({ ...prev, [ip]: { busy: false, err: formatApiError(err) } }));
+    }
+  };
+
+  const copyText = async (value: string) => {
+    const clean = value.trim();
+    if (!clean) return;
+    try {
+      if (window.PrismRayAndroid?.copyToClipboard?.(clean)) {
+        notify(tr("toast.copied"));
+        return;
+      }
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(clean);
+        notify(tr("toast.copied"));
+      }
+    } catch {
+      // Ignore clipboard errors.
+    }
+  };
+
+  const refreshTailscaleNow = async () => {
+    setTsRefreshing(true);
+    try {
+      const res = await api.getTailscale();
+      setTsConfig(res.config);
+      setTsStateInit(Boolean(res.state_initialized));
+      setTsStatus(res.status || null);
+      setSysTailscale(res.system_tailscale || null);
+    } catch {
+      // Ignore transient errors.
+    } finally {
+      setTsRefreshing(false);
+    }
+  };
+
+  const handleQuickTogglePeerExitNode = async (peer: TailscalePeerStatus) => {
+    const stableId = peer.stable_id || "";
+    if (!stableId) return;
+    const isCurrentExit = Boolean(peer.exit_node || (tsStatus?.active_exit_node_id && tsStatus.active_exit_node_id === stableId));
+    setExitNodeBusyId(stableId);
+    try {
+      const nextId = isCurrentExit ? "" : stableId;
+      const nextVal = isCurrentExit ? "" : peer.ipv4 || peer.dns_name || peer.hostname || "";
+      const res = await api.setTailscaleExitNode({ stable_id: nextId, exit_node: nextVal });
+      setTsConfig(res.config);
+      if (res.status) setTsStatus(res.status);
+      notify(isCurrentExit ? tr("tailscale.exitNodeCleared") : tr("tailscale.exitNodeSwitched"));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setExitNodeBusyId(null);
+    }
+  };
+
+  const handleOpenPeerTaildrop = (peerStableId: string) => {
+    if (!peerStableId) return;
+    taildropPeerRef.current = peerStableId;
+    if (taildropInputRef.current) {
+      taildropInputRef.current.value = "";
+      taildropInputRef.current.click();
+    }
+  };
+
+  const handlePeerTaildropFileSelected = async (file: File | undefined) => {
+    const peerId = taildropPeerRef.current;
+    if (!file || !peerId) return;
+    setTaildropBusyId(peerId);
+    try {
+      const res = await api.sendTaildropFile(peerId, file);
+      notify(tr("tailscale.taildropSent", { name: res.file_name || file.name }));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setTaildropBusyId(null);
+      taildropPeerRef.current = "";
+    }
+  };
+
+  useEffect(() => {
+    if (!isActive) return;
+    let cancelled = false;
+    const fetchTs = () => {
+      api
+        .getTailscale()
+        .then((res) => {
+          if (cancelled) return;
+          setTsConfig(res.config);
+          setTsStateInit(Boolean(res.state_initialized));
+          setTsStatus(res.status || null);
+          setSysTailscale(res.system_tailscale || null);
+        })
+        .catch(() => {
+          // Ignore transient fetch errors while locked.
+        });
+    };
+    fetchTs();
+    if (!tsConfig?.enabled) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const pollMs =
+      tsStatus?.state === "connecting" || tsStatus?.state === "needs_auth" ? 3000 : 10000;
+    const timer = window.setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      fetchTs();
+    }, pollMs);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [isActive, status?.running, tsConfig?.enabled, tsStatus?.state]);
+
+  const handleToggleTailscale = async (enabled: boolean) => {
+    const base: TailscaleConfig = tsConfig || {
+      enabled: false,
+      accept_routes: true,
+      magic_dns: true,
+      udp_timeout: "5m",
+    };
+    if (enabled && !base.has_auth_key && !tsStateInit) {
+      notify(tr("overview.tailscaleNeedSetup"), "warning");
+      navigateTo("routing", "routing-tailscale");
+      return;
+    }
+    setTsBusy(true);
+    try {
+      const payload: TailscaleConfig = { ...base, enabled };
+      delete payload.auth_key;
+      delete payload.has_auth_key;
+      delete payload.clear_auth_key;
+      const res = await api.saveTailscale(payload);
+      setTsConfig(res.config);
+      setTsStateInit(Boolean(res.state_initialized));
+      setTsStatus(res.status || null);
+      if (androidBridge.available()) {
+        androidBridge.refreshQuickTiles();
+        if (androidBridge.getVpnStatus()?.active && routing?.allow_lan_broadcast) {
+          androidBridge.prepareAndStartVpn({
+            per_app_mode: routing?.per_app_mode || "all",
+            per_app_packages: routing?.per_app_packages || [],
+            bypass_lan: routing?.bypass_lan,
+            allow_lan_broadcast: routing?.allow_lan_broadcast,
+          });
+        }
+      }
+      await refreshAll();
+      notify(enabled ? tr("overview.tailscaleEnabledToast") : tr("overview.tailscaleDisabledToast"));
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setTsBusy(false);
+    }
+  };
+
+  const tsDotClass = (() => {
+    if (!tsConfig?.enabled) return "bg-muted-foreground/50";
+    switch (tsStatus?.state) {
+      case "connected":
+        return "bg-emerald-500 status-radar-dot";
+      case "connecting":
+      case "needs_auth":
+        return "bg-amber-500 animate-pulse";
+      case "error":
+        return "bg-destructive";
+      default:
+        return "bg-muted-foreground";
+    }
+  })();
+
+  const tsSummaryText = (() => {
+    if (!tsConfig?.enabled) return tr("overview.tailscaleOff");
+    switch (tsStatus?.state) {
+      case "connected":
+        if (tsStatus.ipv4 && (tsStatus.peers_total ?? 0) > 0) {
+          return tr("overview.tailscaleConnectedPeers", {
+            ip: tsStatus.ipv4,
+            online: tsStatus.peers_online ?? 0,
+            total: tsStatus.peers_total ?? 0,
+          });
+        }
+        if (tsStatus.ipv4) {
+          return `${tr("tailscale.statusConnected")} · ${tsStatus.ipv4}`;
+        }
+        return tsStatus.hostname?.trim()
+          ? tr("overview.tailscaleOn", { name: tsStatus.hostname.trim() })
+          : tr("tailscale.statusConnected");
+      case "connecting":
+        return tr("overview.tailscaleConnecting");
+      case "needs_auth":
+        return tr("overview.tailscaleNeedsAuth");
+      case "error":
+        return tr("overview.tailscaleError");
+      case "stopped":
+        return tr("overview.tailscaleStandby");
+      default:
+        return tsConfig.hostname?.trim()
+          ? tr("overview.tailscaleOn", { name: tsConfig.hostname.trim() })
+          : tr("overview.tailscaleOnDefault");
+    }
+  })();
 
   const isAndroid = isAndroidClient();
   const activeGroup = groups.find((g) => g.id === status?.active_group_id);
@@ -159,14 +429,14 @@ export function OverviewView() {
   return (
     <div className="space-y-6">
       {/* Hero Control Card */}
-      <Card className={`prism-hero-surface border-border ${status?.running ? "is-running" : ""}`}>
-        <CardContent className="flex flex-col gap-4 p-4 lg:flex-row lg:items-center lg:justify-between">
+      <Card className={`prism-hero-surface border-border ${isProxyRunning ? "is-running" : ""}`}>
+        <CardContent className="flex flex-col gap-4 p-5 lg:flex-row lg:items-center lg:justify-between">
           <div className="min-w-0 space-y-2">
             <div className="flex flex-wrap items-center gap-2">
               <span
                 className={[
                   "inline-flex min-h-8 items-center gap-1.5 overflow-hidden badge-radius border px-2.5 py-1 text-xs font-semibold leading-normal tabular-nums",
-                  status?.running
+                  isProxyRunning
                     ? "border-primary/30 bg-primary/15 text-primary"
                     : "border-border bg-muted text-muted-foreground",
                 ].join(" ")}
@@ -174,11 +444,11 @@ export function OverviewView() {
                 <span
                   className={[
                     "h-1.5 w-1.5 shrink-0 rounded-full",
-                    status?.running ? "bg-primary status-radar-dot" : "bg-muted-foreground",
+                    isProxyRunning ? "bg-primary status-radar-dot" : "bg-muted-foreground",
                   ].join(" ")}
                   aria-hidden="true"
                 />
-                <span className="inline-flex items-center">{busy ? tr("status.connecting") : status?.running ? tr("status.running") : tr("status.stopped")}</span>
+                <span className="inline-flex items-center">{busy ? tr("status.connecting") : isProxyRunning ? tr("status.running") : tr("status.stopped")}</span>
               </span>
 
               <span className="badge-radius inline-flex min-h-8 flex-wrap items-center gap-1.5 border border-border bg-muted/40 px-2.5 py-1 text-xs leading-normal text-muted-foreground tabular-nums">
@@ -191,7 +461,15 @@ export function OverviewView() {
                     <strong className="inline-flex items-center font-semibold text-foreground">{activeGroup.name}</strong>
                     {isLoadBalanceGroup(activeGroup.strategy) ? (
                       <span className="inline-flex items-center text-xs text-muted-foreground">
-                        → {tr("overview.lbShardsSummary", { count: Math.min(4, activeGroup.node_ids.length) })}
+                        →{" "}
+                        {tr("overview.lbShardsSummary", {
+                          count: Math.min(
+                            activeGroup.load_balance_shards && activeGroup.load_balance_shards > 0
+                              ? activeGroup.load_balance_shards
+                              : 4,
+                            activeGroup.node_ids.length,
+                          ),
+                        })}
                       </span>
                     ) : status?.active_resolved_node_name || resolvedGroupMember ? (
                       <span className="inline-flex items-center text-xs text-muted-foreground">
@@ -219,6 +497,7 @@ export function OverviewView() {
           </div>
 
           <div className="flex min-w-0 max-w-full flex-col gap-2.5 sm:flex-row sm:flex-wrap sm:items-center">
+            <ProfileSwitcher compact />
             <div
               role="group"
               aria-label={tr("overview.mode")}
@@ -263,13 +542,13 @@ export function OverviewView() {
             <Button
               type="button"
               size="lg"
-              variant={status?.running ? "destructive" : "default"}
+              variant={isProxyRunning ? "destructive" : "default"}
               disabled={busy}
               onClick={() => void toggleConnect()}
               className="min-w-32 shrink-0 rounded-[6px]"
             >
               <Power className="mr-2 h-4 w-4" aria-hidden="true" />
-              {status?.running ? tr("action.disconnect") : tr("action.connect")}
+              {isProxyRunning ? tr("action.disconnect") : tr("action.connect")}
             </Button>
           </div>
         </CardContent>
@@ -309,71 +588,73 @@ export function OverviewView() {
         </div>
       ) : null}
 
-      {/* Quick Toggles Row */}
-      <div className={`grid grid-cols-1 gap-4 ${isAndroid ? "md:grid-cols-3" : "md:grid-cols-2 xl:grid-cols-4"}`}>
-        <Card className="prism-surface">
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between gap-3">
-              <div className="flex min-w-0 items-center gap-2.5">
-                <Shield className="h-5 w-5 shrink-0 text-primary" aria-hidden="true" />
-                <div className="min-w-0">
-                  <CardTitle className="text-sm font-semibold">{tr("overview.tunVpn")}</CardTitle>
-                  <CardDescription className="text-xs">
-                    {isAndroid
-                      ? "Android VpnService · Full TUN"
-                      : tunState?.privilege?.os === "darwin"
-                        ? `macOS utun · ${tunState?.stack || "mixed"}`
-                        : `prismray0 · ${tunState?.stack || "mixed"}`}
-                  </CardDescription>
+      {/* Quick Toggles Row: 3+2 balanced two-row layout on PC, 4-card grid on Android */}
+      {(() => {
+        const tunCard = (
+          <Card className="prism-surface h-full">
+            <CardHeader className="pb-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <Shield className="h-5 w-5 shrink-0 text-primary" aria-hidden="true" />
+                  <div className="min-w-0">
+                    <CardTitle className="text-sm font-semibold">{tr("overview.tunVpn")}</CardTitle>
+                    <CardDescription className="text-xs">
+                      {isAndroid
+                        ? "Android VpnService · Full TUN"
+                        : tunState?.privilege?.os === "darwin"
+                          ? `macOS utun · ${tunState?.stack || "mixed"}`
+                          : `prismray0 · ${tunState?.stack || "mixed"}`}
+                    </CardDescription>
+                  </div>
                 </div>
+                <Switch
+                  aria-label={tr("overview.tunVpn")}
+                  checked={isTunActive}
+                  disabled={busy}
+                  onCheckedChange={(checked) => void toggleTUN(checked)}
+                />
               </div>
-              <Switch
-                aria-label={tr("overview.tunVpn")}
-                checked={isAndroid ? Boolean(status?.running && status?.android_mode) : Boolean(tunState?.enabled)}
-                disabled={busy}
-                onCheckedChange={(checked) => void toggleTUN(checked)}
-              />
-            </div>
-          </CardHeader>
-          {!isAndroid &&
-          (tunState?.privilege?.os === "linux" || tunState?.privilege?.os === "darwin") &&
-          !tunState.privilege.ready_without_password ? (
-            <CardContent className="space-y-2 pt-0">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={authorizing}
-                onClick={() => void handleAuthorizeTun()}
-              >
-                <ShieldCheck className="mr-2 h-4 w-4" aria-hidden="true" />
-                {tr("overview.authorizeTun")}
-              </Button>
-              {tunState.privilege.os === "darwin" ? (
+            </CardHeader>
+            {!isAndroid &&
+            (tunState?.privilege?.os === "linux" || tunState?.privilege?.os === "darwin") &&
+            !tunState.privilege.ready_without_password ? (
+              <CardContent className="space-y-2 pt-0">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={authorizing}
+                  onClick={() => void handleAuthorizeTun()}
+                >
+                  <ShieldCheck className="mr-2 h-4 w-4" aria-hidden="true" />
+                  {tr("overview.authorizeTun")}
+                </Button>
+                {tunState.privilege.os === "darwin" ? (
+                  <p className="text-[11px] leading-snug text-muted-foreground">
+                    {tr("overview.macosUtunHint")}
+                  </p>
+                ) : null}
+              </CardContent>
+            ) : !isAndroid && tunState?.privilege?.os === "darwin" ? (
+              <CardContent className="pt-0">
                 <p className="text-[11px] leading-snug text-muted-foreground">
                   {tr("overview.macosUtunHint")}
                 </p>
-              ) : null}
-            </CardContent>
-          ) : !isAndroid && tunState?.privilege?.os === "darwin" ? (
-            <CardContent className="pt-0">
-              <p className="text-[11px] leading-snug text-muted-foreground">
-                {tr("overview.macosUtunHint")}
-              </p>
-            </CardContent>
-          ) : !isAndroid &&
-            tunState?.privilege?.os === "windows" &&
-            !tunState.privilege.ready_without_password ? (
-            <CardContent className="pt-0">
-              <p className="text-[11px] leading-snug text-amber-600 dark:text-amber-400">
-                {tr("overview.windowsAdminTunHint")}
-              </p>
-            </CardContent>
-          ) : null}
-        </Card>
+              </CardContent>
+            ) : !isAndroid &&
+              tunState?.privilege?.os === "windows" &&
+              !tunState.privilege.ready_without_password ? (
+              <CardContent className="pt-0">
+                <p className="text-[11px] leading-snug text-amber-600 dark:text-amber-400">
+                  {tr("overview.windowsAdminTunHint")}
+                </p>
+              </CardContent>
+            ) : null}
+          </Card>
+        );
 
-        {!isAndroid ? (
-          <Card className="prism-surface">
+        const sysProxyCard = (
+          <Card className="prism-surface h-full">
             <CardHeader className="pb-3">
               <div className="flex items-center justify-between gap-3">
                 <div className="flex min-w-0 items-center gap-2.5">
@@ -393,7 +674,7 @@ export function OverviewView() {
                 />
               </div>
             </CardHeader>
-            {tunState?.enabled && systemProxyEnabled ? (
+            {isTunActive && systemProxyEnabled ? (
               <CardContent className="pt-0">
                 <p className="text-[11px] leading-snug text-muted-foreground">
                   {tr("overview.tunAndSysProxyHint")}
@@ -401,111 +682,518 @@ export function OverviewView() {
               </CardContent>
             ) : null}
           </Card>
-        ) : null}
+        );
 
-        <Card className={`prism-surface ${status?.kill_switch_tripped ? "border-destructive/50" : ""}`}>
-          <CardHeader className="pb-3">
-            <div className="flex items-center justify-between gap-3">
-              <div className="flex min-w-0 items-center gap-2.5">
-                <ShieldAlert
-                  className={`h-5 w-5 shrink-0 ${status?.kill_switch_tripped ? "text-destructive" : "text-primary"}`}
-                  aria-hidden="true"
+        const killSwitchCard = (
+          <Card className={`prism-surface h-full ${status?.kill_switch_tripped ? "border-destructive/50" : ""}`}>
+            <CardHeader className="pb-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <ShieldAlert
+                    className={`h-5 w-5 shrink-0 ${status?.kill_switch_tripped ? "text-destructive" : "text-primary"}`}
+                    aria-hidden="true"
+                  />
+                  <div className="min-w-0">
+                    <CardTitle className="text-sm font-semibold">{tr("overview.killSwitch")}</CardTitle>
+                    <CardDescription className="text-xs">{tr("overview.killSwitchDesc")}</CardDescription>
+                  </div>
+                </div>
+                <Switch
+                  aria-label={tr("overview.killSwitch")}
+                  checked={killSwitchEnabled}
+                  disabled={busy}
+                  onCheckedChange={(checked) => void handleToggleKillSwitch(checked)}
                 />
-                <div className="min-w-0">
-                  <CardTitle className="text-sm font-semibold">{tr("overview.killSwitch")}</CardTitle>
-                  <CardDescription className="text-xs">{tr("overview.killSwitchDesc")}</CardDescription>
+              </div>
+            </CardHeader>
+          </Card>
+        );
+
+        const webrtcCard = (
+          <Card className="prism-surface h-full">
+            <CardHeader className="space-y-2.5 pb-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <ShieldBan className="h-5 w-5 shrink-0 text-primary" aria-hidden="true" />
+                  <CardTitle className="text-sm font-semibold">{tr("overview.webrtcTitle")}</CardTitle>
+                </div>
+                <div className="w-44 shrink-0">
+                  <Select
+                    aria-label={tr("overview.webrtcTitle")}
+                    size="sm"
+                    value={currentWebRTC}
+                    disabled={busy}
+                    onChange={(e) => void updateRoutingPatch({ webrtc_mode: e.target.value as "block" | "proxy" | "direct" }, tr("overview.webrtcUpdated"))}
+                  >
+                    <option value="block">{tr("overview.webrtcBlock")}</option>
+                    <option value="proxy">{tr("overview.webrtcProxy")}</option>
+                    <option value="direct">{tr("overview.webrtcDirect")}</option>
+                  </Select>
                 </div>
               </div>
-              <Switch
-                aria-label={tr("overview.killSwitch")}
-                checked={killSwitchEnabled}
-                disabled={busy}
-                onCheckedChange={(checked) => void handleToggleKillSwitch(checked)}
-              />
-            </div>
-          </CardHeader>
-        </Card>
+              {!isAndroid && !isTunActive ? (
+                <div className="flex items-start gap-2 rounded-[8px] border border-amber-500/25 bg-amber-500/8 px-2.5 py-1.5 text-[11px] leading-snug text-amber-700 dark:text-amber-300">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                  <span>{tr("overview.webrtcNonTunCaveat")}</span>
+                </div>
+              ) : (
+                <CardDescription className="text-xs">{tr("routing.webrtcDesc")}</CardDescription>
+              )}
+            </CardHeader>
+          </Card>
+        );
 
-        <Card className="prism-surface">
-          <CardHeader className="space-y-2.5 pb-3">
-            <div className="flex items-center gap-2.5">
-              <ShieldBan className="h-5 w-5 shrink-0 text-primary" aria-hidden="true" />
-              <CardTitle className="text-sm font-semibold">{tr("overview.webrtcTitle")}</CardTitle>
-            </div>
-            <Select
-              aria-label={tr("overview.webrtcTitle")}
-              size="sm"
-              value={currentWebRTC}
-              disabled={busy}
-              onChange={(e) => void updateRoutingPatch({ webrtc_mode: e.target.value as "block" | "proxy" | "direct" }, tr("overview.webrtcUpdated"))}
-            >
-              <option value="block">{tr("overview.webrtcBlock")}</option>
-              <option value="proxy">{tr("overview.webrtcProxy")}</option>
-              <option value="direct">{tr("overview.webrtcDirect")}</option>
-            </Select>
-          </CardHeader>
-        </Card>
-      </div>
+        const tailscaleCard = (
+          <Card className={`prism-surface h-full ${tsStatus?.state === "error" ? "border-destructive/50" : tsStatus?.state === "connected" ? "border-emerald-500/35" : ""}`}>
+            <CardHeader className="pb-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <Network className="h-5 w-5 shrink-0 text-primary" aria-hidden="true" />
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className={`h-2 w-2 shrink-0 rounded-full ${tsDotClass}`} aria-hidden="true" />
+                      <CardTitle className="text-sm font-semibold">{tr("overview.tailscaleTitle")}</CardTitle>
+                      <button
+                        type="button"
+                        onClick={() => navigateTo("routing", "routing-tailscale")}
+                        className="text-[11px] font-medium text-primary hover:underline"
+                      >
+                        {tr("overview.tailscaleConfigure")}
+                      </button>
+                    </div>
+                    <CardDescription
+                      className={`truncate text-xs ${tsStatus?.state === "error" ? "cursor-pointer text-destructive" : tsStatus?.state === "needs_auth" ? "cursor-pointer text-amber-600 dark:text-amber-400" : tsStatus?.ipv4 ? "font-mono" : ""}`}
+                      onClick={
+                        tsStatus?.state === "error" || tsStatus?.state === "needs_auth"
+                          ? () => navigateTo("routing", "routing-tailscale")
+                          : undefined
+                      }
+                    >
+                      {!tsConfig?.enabled && sysTailscale?.detected && routing?.bypass_system_tailscale !== false
+                        ? tr("overview.systemTailscaleBypassed", { iface: sysTailscale.interface || "tailscale0" })
+                        : tsSummaryText}
+                    </CardDescription>
+                  </div>
+                </div>
+                <Switch
+                  aria-label={tr("overview.tailscaleTitle")}
+                  checked={Boolean(tsConfig?.enabled)}
+                  disabled={busy || tsBusy}
+                  onCheckedChange={(checked) => void handleToggleTailscale(checked)}
+                />
+              </div>
+            </CardHeader>
+          </Card>
+        );
 
-      {/* Live Traffic + Chart */}
+        if (isAndroid) {
+          return (
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
+              {tunCard}
+              {killSwitchCard}
+              {webrtcCard}
+              {tailscaleCard}
+            </div>
+          );
+        }
+        return (
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+              {tunCard}
+              {sysProxyCard}
+              {killSwitchCard}
+            </div>
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              {webrtcCard}
+              {tailscaleCard}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Tailscale Network Devices Card */}
+      {tsConfig?.enabled ? (
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <Network className="h-4 w-4 shrink-0 text-primary" aria-hidden="true" />
+                <CardTitle className="text-base">{tr("overview.tailscalePeersTitle")}</CardTitle>
+                {(tsStatus?.peers_total ?? 0) > 0 ? (
+                  <span className="badge-radius border border-border bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground tabular-nums">
+                    {tr("overview.tailscalePeersCount", {
+                      online: tsStatus?.peers_online ?? 0,
+                      total: tsStatus?.peers_total ?? 0,
+                    })}
+                  </span>
+                ) : null}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-xs"
+                  disabled={tsRefreshing}
+                  onClick={() => void refreshTailscaleNow()}
+                  aria-label={tr("action.refresh")}
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${tsRefreshing ? "animate-spin" : ""}`} aria-hidden="true" />
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-2.5 text-xs"
+                  onClick={() => navigateTo("routing", "routing-tailscale")}
+                >
+                  {tr("overview.tailscaleConfigure")}
+                </Button>
+              </div>
+            </div>
+
+            {tsStatus?.ipv4 || tsStatus?.dns_name ? (
+              <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 overflow-hidden rounded-[8px] border border-primary/25 bg-primary/5 px-2.5 py-2 text-xs">
+                <span className="badge-radius inline-flex shrink-0 items-center gap-1.5 border border-primary/30 bg-primary/15 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
+                  <span className={`h-1.5 w-1.5 rounded-full ${tsDotClass}`} aria-hidden="true" />
+                  {tr("overview.tailscalePeerSelf")}
+                </span>
+                {tsStatus.hostname ? (
+                  <span className="min-w-0 truncate font-medium text-foreground">{tsStatus.hostname}</span>
+                ) : null}
+                {tsStatus.ipv4 ? (
+                  <button
+                    type="button"
+                    onClick={() => void copyText(tsStatus.ipv4 || "")}
+                    title={tr("toast.clickToCopy")}
+                    className="inline-flex max-w-full min-w-0 items-center gap-1 font-mono text-foreground hover:text-primary"
+                  >
+                    <strong className="truncate">{tsStatus.ipv4}</strong>
+                    <Copy className="h-3 w-3 shrink-0 opacity-60" aria-hidden="true" />
+                  </button>
+                ) : null}
+                {tsStatus.dns_name ? (
+                  <button
+                    type="button"
+                    onClick={() => void copyText(tsStatus.dns_name || "")}
+                    title={`${tsStatus.dns_name} (${tr("toast.clickToCopy")})`}
+                    className="flex max-w-full min-w-0 items-center gap-1 overflow-hidden font-mono text-muted-foreground hover:text-primary"
+                  >
+                    <span className="min-w-0 flex-1 truncate text-left">{tsStatus.dns_name}</span>
+                    <Copy className="h-3 w-3 shrink-0 opacity-60" aria-hidden="true" />
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+          </CardHeader>
+
+          <CardContent className="pt-0">
+            <input
+              ref={taildropInputRef}
+              type="file"
+              className="hidden"
+              onChange={(e) => void handlePeerTaildropFileSelected(e.target.files?.[0])}
+            />
+            {tsStatus?.peers && tsStatus.peers.length > 0 ? (
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {tsStatus.peers.map((peer, idx) => {
+                  const ip = peer.ipv4 || peer.tailscale_ips?.[0] || "";
+                  const name = peer.hostname || peer.dns_name || ip || `Peer #${idx + 1}`;
+                  return (
+                    <div
+                      key={peer.stable_id || ip || `${name}-${idx}`}
+                      className={[
+                        "flex min-w-0 items-center justify-between gap-2 rounded-[8px] border px-3 py-2 text-xs transition-colors",
+                        peer.online
+                          ? "border-emerald-500/30 bg-emerald-500/5"
+                          : "border-border/70 bg-muted/20 opacity-80",
+                      ].join(" ")}
+                    >
+                      <div className="min-w-0 flex-1 space-y-0.5">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <span
+                            className={`h-2 w-2 shrink-0 rounded-full ${peer.online ? "bg-emerald-500" : "bg-muted-foreground/50"}`}
+                            aria-hidden="true"
+                          />
+                          <span className="min-w-0 truncate font-semibold text-foreground" title={peer.dns_name || name}>
+                            {name}
+                          </span>
+                          {peer.os ? (
+                            <span className="shrink-0 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">
+                              {peer.os}
+                            </span>
+                          ) : null}
+                          {peer.exit_node ? (
+                            <span className="shrink-0 rounded border border-primary/30 bg-primary/10 px-1 py-0.5 text-[10px] font-medium text-primary">
+                              {tr("overview.tailscalePeerExitNode")}
+                            </span>
+                          ) : null}
+                        </div>
+                        <div className="flex min-w-0 items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span className={peer.online ? "font-medium text-emerald-600 dark:text-emerald-400" : ""}>
+                              {peer.online ? tr("overview.tailscalePeerOnline") : tr("overview.tailscalePeerOffline")}
+                            </span>
+                            {ip ? (
+                              <button
+                                type="button"
+                                onClick={() => void copyText(ip)}
+                                title={tr("toast.clickToCopy")}
+                                className="inline-flex max-w-full min-w-0 items-center gap-1 font-mono text-foreground/90 hover:text-primary"
+                              >
+                                <span className="truncate">{ip}</span>
+                                <Copy className="h-3 w-3 shrink-0 opacity-60" aria-hidden="true" />
+                              </button>
+                            ) : null}
+                          </div>
+                          <div className="flex shrink-0 items-center gap-1">
+                            {peer.online && ip && tsStatus?.control_available ? (
+                              <button
+                                type="button"
+                                disabled={peerPings[ip]?.busy}
+                                onClick={() => void handlePingTailscalePeer(ip)}
+                                className="shrink-0 rounded border border-border bg-background/80 px-1.5 py-0.5 text-[10px] font-medium text-foreground hover:border-primary/50 hover:text-primary disabled:opacity-50"
+                              >
+                                {peerPings[ip]?.busy ? "…" : tr("tailscale.pingBtn")}
+                              </button>
+                            ) : null}
+                            {peer.stable_id && (peer.exit_node_option || peer.exit_node) && tsStatus?.control_available ? (
+                              <button
+                                type="button"
+                                disabled={exitNodeBusyId === peer.stable_id}
+                                onClick={() => void handleQuickTogglePeerExitNode(peer)}
+                                className={[
+                                  "shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium transition-colors disabled:opacity-50",
+                                  peer.exit_node
+                                    ? "border-primary/50 bg-primary/15 text-primary hover:bg-primary/25"
+                                    : "border-border bg-background/80 text-foreground hover:border-primary/50 hover:text-primary",
+                                ].join(" ")}
+                              >
+                                {exitNodeBusyId === peer.stable_id
+                                  ? "…"
+                                  : peer.exit_node
+                                    ? tr("tailscale.clearExitNodeShort")
+                                    : tr("tailscale.useExitNodeShort")}
+                              </button>
+                            ) : null}
+                            {peer.online && peer.stable_id && tsStatus?.can_share_files && tsStatus?.control_available ? (
+                              <button
+                                type="button"
+                                disabled={taildropBusyId === peer.stable_id}
+                                onClick={() => handleOpenPeerTaildrop(peer.stable_id!)}
+                                title={tr("tailscale.taildropSend")}
+                                className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border bg-background/80 px-1.5 py-0.5 text-[10px] font-medium text-foreground hover:border-primary/50 hover:text-primary disabled:opacity-50"
+                              >
+                                <Send className="h-2.5 w-2.5" aria-hidden="true" />
+                                {taildropBusyId === peer.stable_id ? "…" : tr("tailscale.sendShort")}
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                        {ip && peerPings[ip] && !peerPings[ip].busy ? (
+                          <div className="pt-0.5 text-[10px] mono-num">
+                            {peerPings[ip].err ? (
+                              <span className="text-destructive">{peerPings[ip].err}</span>
+                            ) : peerPings[ip].result ? (
+                              <span
+                                className={
+                                  peerPings[ip].result.is_direct
+                                    ? "text-emerald-600 dark:text-emerald-400"
+                                    : "text-amber-600 dark:text-amber-400"
+                                }
+                              >
+                                {Math.round(peerPings[ip].result.avg_ms || peerPings[ip].result.latency_ms)} ms ·{" "}
+                                {peerPings[ip].result.is_direct
+                                  ? tr("tailscale.pingDirect")
+                                  : `${tr("tailscale.pingDerp")}${
+                                      peerPings[ip].result.derp_region_code
+                                        ? `(${peerPings[ip].result.derp_region_code})`
+                                        : ""
+                                    }`}
+                              </span>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                {tsStatus?.source === "log" && tsStatus.state === "connected"
+                  ? tr("overview.tailscalePeersDesktopNote")
+                  : tr("overview.tailscalePeersEmpty")}
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {/* Live Traffic + History Chart */}
       <Card>
-        <CardHeader className="pb-2">
-          <div className="flex flex-wrap items-center justify-between gap-4">
+        <CardHeader className="space-y-3 pb-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <Activity className="h-5 w-5 text-primary" aria-hidden="true" />
               <CardTitle className="text-base">{tr("overview.trafficChart")}</CardTitle>
             </div>
-            <div className="flex items-center gap-5 text-sm mono-num">
-              <span className="inline-flex items-center gap-1.5">
-                <ArrowUp className="h-4 w-4 text-primary" aria-hidden="true" />
-                <span className="text-xs text-muted-foreground">{tr("overview.upload")}:</span>
-                <strong className="text-foreground">{formatRate(trafficNow.up)}</strong>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="inline-flex items-center rounded-[8px] border border-border bg-muted/40 p-0.5 text-xs">
+                {(
+                  [
+                    { id: "live", label: tr("overview.trafficLive") },
+                    { id: "24h", label: tr("overview.traffic24h") },
+                    { id: "7d", label: tr("overview.traffic7d") },
+                    { id: "30d", label: tr("overview.traffic30d") },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setTrafficRange(opt.id)}
+                    className={[
+                      "rounded-[6px] px-2 py-1 text-[11px] font-medium transition-colors",
+                      trafficRange === opt.id
+                        ? "bg-background text-foreground shadow-xs"
+                        : "text-muted-foreground hover:text-foreground",
+                    ].join(" ")}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              <div className="inline-flex items-center rounded-[8px] border border-border bg-muted/40 p-0.5 text-xs">
+                {(
+                  [
+                    { id: "all", label: tr("overview.trafficFilterAll") },
+                    { id: "proxy", label: tr("overview.trafficFilterProxy") },
+                    { id: "direct", label: tr("overview.trafficFilterDirect") },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setTrafficFilter(opt.id)}
+                    className={[
+                      "rounded-[6px] px-2.5 py-1 text-[11px] font-medium transition-colors",
+                      trafficFilter === opt.id
+                        ? "bg-background text-foreground shadow-xs"
+                        : "text-muted-foreground hover:text-foreground",
+                    ].join(" ")}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              {trafficRange !== "live" ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-[11px] text-muted-foreground hover:text-destructive"
+                  onClick={() => void handleClearTrafficHistory()}
+                >
+                  {tr("overview.trafficClearHistory")}
+                </Button>
+              ) : null}
+            </div>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-[10px] border border-primary/20 bg-primary/5 px-3 py-2 text-xs mono-num">
+              <span className="inline-flex items-center gap-1.5 font-semibold text-primary">
+                <span className="h-2 w-2 rounded-full bg-primary" aria-hidden="true" />
+                {tr("overview.proxyTraffic")}
+                {trafficRange !== "live" ? (
+                  <span className="text-[10px] font-normal text-muted-foreground">({tr("overview.trafficHistoryTotal")})</span>
+                ) : null}
               </span>
-              <span className="inline-flex items-center gap-1.5">
-                <ArrowDown className="h-4 w-4 text-sky-400" aria-hidden="true" />
-                <span className="text-xs text-muted-foreground">{tr("overview.download")}:</span>
-                <strong className="text-foreground">{formatRate(trafficNow.down)}</strong>
+              <div className="flex items-center gap-3.5">
+                <span className="inline-flex items-center gap-1" title={tr("overview.proxyUpload")}>
+                  <ArrowUp className="h-3.5 w-3.5 text-primary/70" aria-hidden="true" />
+                  <strong className="text-foreground">
+                    {trafficRange === "live"
+                      ? formatRate(trafficNow.proxy_up ?? 0)
+                      : formatBytes(historyData?.totals?.proxy_up ?? 0)}
+                  </strong>
+                </span>
+                <span className="inline-flex items-center gap-1" title={tr("overview.proxyDownload")}>
+                  <ArrowDown className="h-3.5 w-3.5 text-primary" aria-hidden="true" />
+                  <strong className="text-foreground">
+                    {trafficRange === "live"
+                      ? formatRate(trafficNow.proxy_down ?? 0)
+                      : formatBytes(historyData?.totals?.proxy_down ?? 0)}
+                  </strong>
+                </span>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-[10px] border border-emerald-500/20 bg-emerald-500/5 px-3 py-2 text-xs mono-num">
+              <span className="inline-flex items-center gap-1.5 font-semibold text-emerald-500">
+                <span className="h-2 w-2 rounded-full bg-emerald-500" aria-hidden="true" />
+                {tr("overview.directTraffic")}
+                {trafficRange !== "live" ? (
+                  <span className="text-[10px] font-normal text-muted-foreground">({tr("overview.trafficHistoryTotal")})</span>
+                ) : null}
               </span>
+              <div className="flex items-center gap-3.5">
+                <span className="inline-flex items-center gap-1" title={tr("overview.directUpload")}>
+                  <ArrowUp className="h-3.5 w-3.5 text-emerald-500/70" aria-hidden="true" />
+                  <strong className="text-foreground">
+                    {trafficRange === "live"
+                      ? formatRate(trafficNow.direct_up ?? 0)
+                      : formatBytes(historyData?.totals?.direct_up ?? 0)}
+                  </strong>
+                </span>
+                <span className="inline-flex items-center gap-1" title={tr("overview.directDownload")}>
+                  <ArrowDown className="h-3.5 w-3.5 text-emerald-500" aria-hidden="true" />
+                  <strong className="text-foreground">
+                    {trafficRange === "live"
+                      ? formatRate(trafficNow.direct_down ?? 0)
+                      : formatBytes(historyData?.totals?.direct_down ?? 0)}
+                  </strong>
+                </span>
+              </div>
             </div>
           </div>
         </CardHeader>
         <CardContent>
           <div className="h-52 w-full min-w-0">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart accessibilityLayer={false} data={trafficHistory} margin={{ top: 8, right: 12, left: 4, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                <XAxis dataKey="time" tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} minTickGap={24} />
-                <YAxis tick={{ fontSize: 11, fill: "var(--muted-foreground)" }} unit=" KB" width={74} />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: "var(--popover)",
-                    borderColor: "var(--border)",
-                    borderRadius: "10px",
-                    fontSize: "12px",
-                  }}
-                />
-                <Area
-                  type="monotone"
-                  dataKey="downKB"
-                  name={`${tr("overview.download")} (KB/s)`}
-                  stroke="#38bdf8"
-                  fill="#38bdf8"
-                  fillOpacity={0.12}
-                  strokeWidth={1.75}
-                  isAnimationActive={false}
-                />
-                <Area
-                  type="monotone"
-                  dataKey="upKB"
-                  name={`${tr("overview.upload")} (KB/s)`}
-                  stroke="var(--primary)"
-                  fill="var(--primary)"
-                  fillOpacity={0.15}
-                  strokeWidth={2}
-                  isAnimationActive={false}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
+            {isActive ? (
+              <Suspense
+                fallback={
+                  <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
+                    …
+                  </div>
+                }
+              >
+                {trafficRange === "live" ? (
+                  <LiveTrafficChart
+                    data={trafficHistory}
+                    trafficFilter={trafficFilter}
+                    labels={{
+                      proxyDownload: tr("overview.proxyDownload"),
+                      proxyUpload: tr("overview.proxyUpload"),
+                      directDownload: tr("overview.directDownload"),
+                      directUpload: tr("overview.directUpload"),
+                    }}
+                  />
+                ) : historyLoading ? (
+                  <div className="flex h-full items-center justify-center text-xs text-muted-foreground">…</div>
+                ) : (
+                  <TrafficHistoryChart
+                    buckets={historyData?.buckets || []}
+                    granularity={historyData?.granularity || "hour"}
+                    trafficFilter={trafficFilter}
+                    labels={{
+                      proxyDownload: tr("overview.proxyDownload"),
+                      proxyUpload: tr("overview.proxyUpload"),
+                      directDownload: tr("overview.directDownload"),
+                      directUpload: tr("overview.directUpload"),
+                    }}
+                  />
+                )}
+              </Suspense>
+            ) : null}
           </div>
         </CardContent>
       </Card>
@@ -520,7 +1208,7 @@ export function OverviewView() {
             </CardTitle>
             <CardDescription className="text-xs">{tr("overview.inboundMatrixDesc")}</CardDescription>
           </div>
-          <Button type="button" variant="outline" size="sm" onClick={() => setActiveTab("settings")}>
+          <Button type="button" variant="outline" size="sm" onClick={() => navigateTo("settings", "settings-listeners")}>
             <SlidersHorizontal className="mr-1.5 h-4 w-4" aria-hidden="true" />
             {tr("overview.manageInbounds")}
           </Button>
@@ -534,12 +1222,12 @@ export function OverviewView() {
                 <span
                   className={[
                     "shrink-0 whitespace-nowrap badge-radius border px-2 py-0.5 text-[11px] font-medium mono-num",
-                    status?.running
+                    isProxyRunning
                       ? "border-primary/30 bg-primary/15 text-primary"
                       : "border-border bg-muted text-muted-foreground",
                   ].join(" ")}
                 >
-                  {status?.running ? tr("status.running") : tr("status.stopped")}
+                  {isProxyRunning ? tr("status.running") : tr("status.stopped")}
                 </span>
               </div>
               <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-t border-border/60 pt-2">
@@ -618,12 +1306,12 @@ export function OverviewView() {
                     <span
                       className={[
                         "badge-radius border px-2 py-0.5 text-[11px] font-medium mono-num whitespace-nowrap",
-                        status?.running
+                        isProxyRunning
                           ? "border-primary/30 bg-primary/15 text-primary"
                           : "border-border bg-muted text-muted-foreground",
                       ].join(" ")}
                     >
-                      {status?.running ? tr("status.running") : tr("status.stopped")}
+                      {isProxyRunning ? tr("status.running") : tr("status.stopped")}
                     </span>
                   </td>
                 </tr>

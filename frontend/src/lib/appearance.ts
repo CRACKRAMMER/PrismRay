@@ -349,9 +349,15 @@ export function applyAppearanceToDocument(
 
 /* ---------- IndexedDB storage for compressed local wallpaper images ---------- */
 
+let cachedWallpaperDBPromise: Promise<IDBDatabase> | null = null;
+
 function openWallpaperDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (cachedWallpaperDBPromise) {
+    return cachedWallpaperDBPromise;
+  }
+  cachedWallpaperDBPromise = new Promise((resolve, reject) => {
     if (typeof indexedDB === "undefined") {
+      cachedWallpaperDBPromise = null;
       reject(new Error("IndexedDB unavailable"));
       return;
     }
@@ -362,9 +368,23 @@ function openWallpaperDB(): Promise<IDBDatabase> {
         db.createObjectStore(WALLPAPER_STORE);
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error ?? new Error("IndexedDB open failed"));
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onclose = () => {
+        cachedWallpaperDBPromise = null;
+      };
+      db.onversionchange = () => {
+        db.close();
+        cachedWallpaperDBPromise = null;
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      cachedWallpaperDBPromise = null;
+      reject(req.error ?? new Error("IndexedDB open failed"));
+    };
   });
+  return cachedWallpaperDBPromise;
 }
 
 export async function loadWallpaperDataUrl(): Promise<string | null> {

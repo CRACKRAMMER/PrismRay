@@ -86,6 +86,7 @@ export function ContextInspector({
     const dlg = dlgRef.current;
     if (!dlg) return;
     if (open) {
+      pointerDownOutsideRef.current = false;
       if (!dlg.open) {
         dlg.showModal();
         // Focus the dialog surface itself instead of auto-focusing the Close button
@@ -93,6 +94,7 @@ export function ContextInspector({
         dlg.focus({ preventScroll: true });
       }
     } else if (dlg.open) {
+      pointerDownOutsideRef.current = false;
       dlg.close();
     }
   }, [open]);
@@ -155,7 +157,7 @@ export function ContextInspector({
           : undefined
       }
       aria-labelledby={headingId}
-      {...({ closedby: "any" } as Record<string, string>)}
+      {...({ closedby: "closerequest" } as Record<string, string>)}
       onCancel={(e) => {
         e.stopPropagation();
       }}
@@ -167,7 +169,6 @@ export function ContextInspector({
       }}
       onPointerDown={(e) => {
         e.stopPropagation();
-        if (typeof HTMLDialogElement !== "undefined" && "closedBy" in HTMLDialogElement.prototype) return;
         const dlg = dlgRef.current;
         if (e.target !== dlg) {
           pointerDownOutsideRef.current = false;
@@ -177,7 +178,6 @@ export function ContextInspector({
       }}
       onPointerUp={(e) => {
         e.stopPropagation();
-        if (typeof HTMLDialogElement !== "undefined" && "closedBy" in HTMLDialogElement.prototype) return;
         const dlg = dlgRef.current;
         if (e.target === dlg && pointerDownOutsideRef.current && dlg && isPointerOutside(e, dlg)) {
           pointerDownOutsideRef.current = false;
@@ -275,11 +275,13 @@ export function BottomSheetDialog({
     const dlg = dlgRef.current;
     if (!dlg) return;
     if (open) {
+      pointerDownOutsideRef.current = false;
       if (!dlg.open) {
         dlg.showModal();
         dlg.focus({ preventScroll: true });
       }
     } else if (dlg.open) {
+      pointerDownOutsideRef.current = false;
       dlg.close();
     }
   }, [open]);
@@ -292,7 +294,7 @@ export function BottomSheetDialog({
       tabIndex={-1}
       className="bottom-sheet outline-none"
       aria-labelledby={headingId}
-      {...({ closedby: "any" } as Record<string, string>)}
+      {...({ closedby: "closerequest" } as Record<string, string>)}
       onCancel={(e) => {
         e.stopPropagation();
       }}
@@ -304,7 +306,6 @@ export function BottomSheetDialog({
       }}
       onPointerDown={(e) => {
         e.stopPropagation();
-        if (typeof HTMLDialogElement !== "undefined" && "closedBy" in HTMLDialogElement.prototype) return;
         const dlg = dlgRef.current;
         if (!dlg || e.target !== dlg) {
           pointerDownOutsideRef.current = false;
@@ -315,7 +316,6 @@ export function BottomSheetDialog({
       }}
       onPointerUp={(e) => {
         e.stopPropagation();
-        if (typeof HTMLDialogElement !== "undefined" && "closedBy" in HTMLDialogElement.prototype) return;
         const dlg = dlgRef.current;
         if (!dlg || e.target !== dlg) {
           pointerDownOutsideRef.current = false;

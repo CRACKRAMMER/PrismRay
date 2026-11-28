@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CheckSquare, ChevronDown, RefreshCw, Search, Square, Trash2 } from "lucide-react";
 import { type AndroidAppInfo, androidBridge } from "../lib/api.ts";
 import { useAppStore } from "../store/appStore.ts";
@@ -9,6 +9,146 @@ import { Input } from "./ui/input.tsx";
 import { Switch } from "./ui/switch.tsx";
 
 type AppFilterTab = "user" | "all" | "system" | "selected";
+
+interface AppCategoryPreset {
+  id: string;
+  labelKey: "routing.perAppPresetCn" | "routing.perAppPresetGoogle" | "routing.perAppPresetBrowser" | "routing.perAppPresetChat";
+  packages: string[];
+}
+
+const APP_CATEGORY_PRESETS: AppCategoryPreset[] = [
+  {
+    id: "cn",
+    labelKey: "routing.perAppPresetCn",
+    packages: [
+      "com.tencent.mm",
+      "com.tencent.mobileqq",
+      "com.eg.android.AlipayGphone",
+      "com.taobao.taobao",
+      "com.jingdong.app.mall",
+      "com.xunmeng.pinduoduo",
+      "com.ss.android.ugc.aweme",
+      "tv.danmaku.bili",
+      "com.xingin.xhs",
+      "com.sina.weibo",
+      "com.autonavi.minimap",
+      "com.baidu.BaiduMap",
+      "com.sankuai.meituan",
+      "com.netease.cloudmusic",
+      "com.tencent.qqmusic",
+    ],
+  },
+  {
+    id: "google",
+    labelKey: "routing.perAppPresetGoogle",
+    packages: [
+      "com.android.vending",
+      "com.google.android.gms",
+      "com.google.android.gsf",
+      "com.google.android.googlequicksearchbox",
+      "com.google.android.youtube",
+      "com.google.android.gm",
+      "com.google.android.apps.maps",
+      "com.google.android.apps.docs",
+      "com.google.android.apps.photos",
+      "com.google.android.apps.bard",
+    ],
+  },
+  {
+    id: "browser",
+    labelKey: "routing.perAppPresetBrowser",
+    packages: [
+      "com.android.chrome",
+      "com.chrome.beta",
+      "org.mozilla.firefox",
+      "com.microsoft.emmx",
+      "com.brave.browser",
+      "com.opera.browser",
+      "com.kiwibrowser.browser",
+      "com.vivaldi.browser",
+      "mark.via.gp",
+      "com.sec.android.app.sbrowser",
+    ],
+  },
+  {
+    id: "chat",
+    labelKey: "routing.perAppPresetChat",
+    packages: [
+      "org.telegram.messenger",
+      "org.telegram.messenger.web",
+      "tw.nekomimi.nekogram",
+      "com.whatsapp",
+      "com.discord",
+      "org.thoughtcrime.securesms",
+      "jp.naver.line.android",
+      "com.Slack",
+      "com.twitter.android",
+    ],
+  },
+];
+
+interface AppRowProps {
+  app: AndroidAppInfo;
+  checked: boolean;
+  iconSrc?: string;
+  systemTagLabel: string;
+  onToggle: (pkg: string) => void;
+}
+
+const AppPickerRow = memo(function AppPickerRow({
+  app,
+  checked,
+  iconSrc,
+  systemTagLabel,
+  onToggle,
+}: AppRowProps) {
+  const initial = (app.label || app.packageName).trim().slice(0, 1).toUpperCase() || "?";
+  return (
+    <div
+      onClick={() => onToggle(app.packageName)}
+      className={[
+        "flex cursor-pointer items-center justify-between gap-2.5 px-2.5 py-2 transition-colors",
+        checked ? "bg-primary/5" : "hover:bg-muted/40",
+      ].join(" ")}
+    >
+      <div className="flex min-w-0 flex-1 items-center gap-2.5">
+        {iconSrc ? (
+          <img
+            src={iconSrc}
+            alt=""
+            loading="lazy"
+            className="h-8 w-8 shrink-0 rounded-[8px] object-cover shadow-xs"
+          />
+        ) : (
+          <span
+            aria-hidden="true"
+            className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-[8px] border text-xs font-semibold ${toneForPackage(app.packageName)}`}
+          >
+            {initial}
+          </span>
+        )}
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <span className="truncate text-[13px] font-medium text-foreground">{app.label}</span>
+            {app.system ? (
+              <span className="shrink-0 rounded border border-border bg-muted px-1 py-0 text-[10px] text-muted-foreground">
+                {systemTagLabel}
+              </span>
+            ) : null}
+          </div>
+          <div className="truncate font-mono text-[11px] text-muted-foreground">{app.packageName}</div>
+        </div>
+      </div>
+      <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
+        <Switch
+          checked={checked}
+          onCheckedChange={() => onToggle(app.packageName)}
+          aria-label={app.label}
+        />
+      </div>
+    </div>
+  );
+});
 
 const AVATAR_TONES = [
   "bg-indigo-500/15 text-indigo-600 dark:text-indigo-300 border-indigo-500/25",
@@ -67,6 +207,22 @@ export function AndroidAppPicker({
   const [iconMap, setIconMap] = useState<Record<string, string>>(() => ({ ...cachedAppIcons }));
   const [manualOpen, setManualOpen] = useState(false);
   const requestedIconsRef = useRef<Set<string>>(new Set(Object.keys(cachedAppIcons)));
+  // Freeze "selected-first" sort order while toggling checkboxes so Android WebView never jumps scroll position.
+  // Only re-snapshot when opening, switching tabs, or clicking Refresh.
+  const [sortPinnedSnapshot, setSortPinnedSnapshot] = useState<Set<string>>(() => new Set(packages));
+  const packagesRef = useRef(packages);
+  packagesRef.current = packages;
+  const mountedRef = useRef(true);
+  const pendingLoadCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      pendingLoadCleanupRef.current?.();
+      pendingLoadCleanupRef.current = null;
+    };
+  }, []);
 
   const selectedSet = useMemo(() => new Set(packages), [packages]);
 
@@ -76,15 +232,82 @@ export function AndroidAppPicker({
       setInstalledApps(cachedInstalledApps);
       return;
     }
+    pendingLoadCleanupRef.current?.();
+    pendingLoadCleanupRef.current = null;
     setLoadingApps(true);
-    try {
-      const apps = androidBridge.listInstalledApps();
+
+    const finishWithApps = (apps: AndroidAppInfo[]) => {
       cachedInstalledApps = apps;
+      if (!mountedRef.current) return;
       setInstalledApps(apps);
-    } finally {
+      setSortPinnedSnapshot(new Set(packagesRef.current));
       setLoadingApps(false);
+    };
+
+    const runSyncFallback = () => {
+      try {
+        const apps = androidBridge.listInstalledApps();
+        finishWithApps(apps);
+      } catch {
+        if (mountedRef.current) {
+          setLoadingApps(false);
+        }
+      }
+    };
+
+    const reqId = `apps-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let settled = false;
+    let fallbackTimer = 0;
+
+    const cleanup = () => {
+      window.removeEventListener("prismray-android-apps", onResult as EventListener);
+      if (fallbackTimer) {
+        window.clearTimeout(fallbackTimer);
+        fallbackTimer = 0;
+      }
+    };
+
+    const onResult = (evt: Event) => {
+      const detail = (evt as CustomEvent<{ requestId?: string; apps?: AndroidAppInfo[] }>).detail;
+      if (detail?.requestId !== reqId || settled) return;
+      settled = true;
+      cleanup();
+      if (pendingLoadCleanupRef.current === cleanup) {
+        pendingLoadCleanupRef.current = null;
+      }
+      const taken = androidBridge.takeInstalledAppsResult(reqId);
+      const apps = taken !== null ? taken : Array.isArray(detail.apps) ? detail.apps : [];
+      finishWithApps(apps);
+    };
+
+    window.addEventListener("prismray-android-apps", onResult as EventListener);
+    fallbackTimer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (pendingLoadCleanupRef.current === cleanup) {
+        pendingLoadCleanupRef.current = null;
+      }
+      runSyncFallback();
+    }, 5000);
+    pendingLoadCleanupRef.current = cleanup;
+
+    // Invoke via androidBridge wrapper so window.PrismRayAndroid remains bound as receiver (`this`).
+    if (androidBridge.listInstalledAppsAsync(reqId)) {
+      return;
     }
+    settled = true;
+    cleanup();
+    pendingLoadCleanupRef.current = null;
+    runSyncFallback();
   }, []);
+
+  // Re-snapshot pinned sort order when becoming visible again.
+  useEffect(() => {
+    if (active) {
+      setSortPinnedSnapshot(new Set(packagesRef.current));
+    }
+  }, [active]);
 
   // Defer synchronous JNI listInstalledApps() until picker is actually visible/active.
   useEffect(() => {
@@ -114,20 +337,36 @@ export function AndroidAppPicker({
     };
   }, [installedApps, packages.length]);
 
-  const filteredApps = useMemo(() => {
-    const q = search.trim().toLowerCase();
+  // Base catalog merges installed apps with any manually-entered unknown package names from snapshot/selection.
+  const baseCatalog = useMemo(() => {
     const byPkg = new Map<string, AndroidAppInfo>();
     for (const app of installedApps) {
       byPkg.set(app.packageName, app);
     }
     const merged: AndroidAppInfo[] = [...installedApps];
-    for (const pkg of packages) {
+    for (const pkg of sortPinnedSnapshot) {
       if (!byPkg.has(pkg)) {
-        merged.push({ packageName: pkg, label: pkg, system: false });
+        const custom = { packageName: pkg, label: pkg, system: false };
+        byPkg.set(pkg, custom);
+        merged.push(custom);
       }
     }
+    return merged;
+  }, [installedApps, sortPinnedSnapshot]);
 
-    const list = merged.filter((app) => {
+  const filteredApps = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    let pool = baseCatalog;
+    if (filterTab === "selected") {
+      // Include any newly selected unknown packages when explicitly viewing the Selected tab.
+      const existing = new Set(baseCatalog.map((a) => a.packageName));
+      const extras = packages
+        .filter((pkg) => !existing.has(pkg))
+        .map((pkg) => ({ packageName: pkg, label: pkg, system: false }));
+      pool = extras.length > 0 ? [...baseCatalog, ...extras] : baseCatalog;
+    }
+
+    const list = pool.filter((app) => {
       if (filterTab === "user" && app.system) return false;
       if (filterTab === "system" && !app.system) return false;
       if (filterTab === "selected" && !selectedSet.has(app.packageName)) return false;
@@ -139,48 +378,61 @@ export function AndroidAppPicker({
     });
 
     list.sort((a, b) => {
-      const aSel = selectedSet.has(a.packageName) ? 0 : 1;
-      const bSel = selectedSet.has(b.packageName) ? 0 : 1;
+      const aSel = sortPinnedSnapshot.has(a.packageName) ? 0 : 1;
+      const bSel = sortPinnedSnapshot.has(b.packageName) ? 0 : 1;
       if (aSel !== bSel) return aSel - bSel;
       return a.label.localeCompare(b.label);
     });
     return list;
-  }, [installedApps, packages, filterTab, search, selectedSet]);
+  }, [baseCatalog, filterTab, search, sortPinnedSnapshot, filterTab === "selected" ? selectedSet : null, filterTab === "selected" ? packages : null]);
 
-  // Lazily fetch real Android app icons in small chunks so scroll stays responsive.
+  // Lazily fetch real Android app icons in rolling chunks across the entire filtered list
+  // (never truncating after the first 36 apps and never re-running on checkbox toggles).
+  const iconBatchKey = useMemo(() => filteredApps.map((a) => a.packageName).join(","), [filteredApps]);
   useEffect(() => {
-    if (!active || !androidBridge.available() || filteredApps.length === 0) {
+    if (!active || !androidBridge.available() || !iconBatchKey) {
       return;
     }
-    const missing = filteredApps
-      .map((a) => a.packageName)
-      .filter((pkg) => !requestedIconsRef.current.has(pkg))
-      .slice(0, 36);
-    if (missing.length === 0) return;
+    const queue = iconBatchKey
+      .split(",")
+      .filter((pkg) => pkg && !requestedIconsRef.current.has(pkg));
+    if (queue.length === 0) return;
 
     let cancelled = false;
-    const timer = window.setTimeout(() => {
-      if (cancelled) return;
-      for (const pkg of missing) requestedIconsRef.current.add(pkg);
-      const fetched = androidBridge.getAppIcons(missing);
+    let offset = 0;
+    let timer = 0;
+
+    const pumpBatch = () => {
+      if (cancelled || offset >= queue.length) return;
+      const chunk = queue.slice(offset, offset + 24);
+      offset += chunk.length;
+      for (const pkg of chunk) requestedIconsRef.current.add(pkg);
+      const fetched = androidBridge.getAppIcons(chunk);
       if (!cancelled && Object.keys(fetched).length > 0) {
         Object.assign(cachedAppIcons, fetched);
         setIconMap((prev) => ({ ...prev, ...fetched }));
       }
-    }, 40);
+      if (!cancelled && offset < queue.length) {
+        timer = window.setTimeout(pumpBatch, 60);
+      }
+    };
 
+    timer = window.setTimeout(pumpBatch, 40);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [filteredApps, active]);
+  }, [iconBatchKey, active]);
 
-  const togglePackage = (pkg: string) => {
-    const next = new Set(packages);
-    if (next.has(pkg)) next.delete(pkg);
-    else next.add(pkg);
-    onChangePackages(Array.from(next));
-  };
+  const togglePackage = useCallback(
+    (pkg: string) => {
+      const next = new Set(packagesRef.current);
+      if (next.has(pkg)) next.delete(pkg);
+      else next.add(pkg);
+      onChangePackages(Array.from(next));
+    },
+    [onChangePackages],
+  );
 
   const selectAllFiltered = () => {
     const next = new Set(packages);
@@ -199,6 +451,32 @@ export function AndroidAppPicker({
 
   const clearAll = () => {
     onChangePackages([]);
+  };
+
+  const installedSet = useMemo(() => new Set(installedApps.map((a) => a.packageName)), [installedApps]);
+
+  const presetMatches = useMemo(
+    () =>
+      APP_CATEGORY_PRESETS.map((preset) => {
+        const matched = preset.packages.filter((pkg) => installedSet.has(pkg));
+        const selectedCount = matched.filter((pkg) => selectedSet.has(pkg)).length;
+        return {
+          ...preset,
+          matched,
+          allSelected: matched.length > 0 && selectedCount === matched.length,
+        };
+      }).filter((p) => p.matched.length > 0),
+    [installedSet, selectedSet],
+  );
+
+  const togglePreset = (matched: string[], allSelected: boolean) => {
+    const next = new Set(packagesRef.current);
+    if (allSelected) {
+      for (const pkg of matched) next.delete(pkg);
+    } else {
+      for (const pkg of matched) next.add(pkg);
+    }
+    onChangePackages(Array.from(next));
   };
 
   return (
@@ -246,7 +524,10 @@ export function AndroidAppPicker({
               key={tab.id}
               type="button"
               aria-pressed={isTabActive}
-              onClick={() => setFilterTab(tab.id)}
+              onClick={() => {
+                setSortPinnedSnapshot(new Set(packagesRef.current));
+                setFilterTab(tab.id);
+              }}
               className={[
                 "inline-flex shrink-0 items-center gap-1 rounded-[6px] border px-2.5 py-1 text-xs font-medium whitespace-nowrap transition-colors",
                 isTabActive
@@ -260,6 +541,28 @@ export function AndroidAppPicker({
           );
         })}
       </div>
+
+      {/* Quick Category Presets (only shows presets matching installed apps) */}
+      {presetMatches.length > 0 ? (
+        <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+          <span className="text-muted-foreground">{tr("routing.perAppPresets")}:</span>
+          {presetMatches.map((preset) => (
+            <button
+              key={preset.id}
+              type="button"
+              onClick={() => togglePreset(preset.matched, preset.allSelected)}
+              className={`inline-flex items-center gap-1 rounded-[6px] border px-2 py-0.5 font-medium transition-colors ${
+                preset.allSelected
+                  ? "border-primary/45 bg-primary/15 text-primary"
+                  : "border-border bg-muted/30 text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <span>{tr(preset.labelKey)}</span>
+              <span className="mono-num text-[10px] opacity-80">({preset.matched.length})</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
 
       {/* Batch Actions Bar */}
       <div className="flex flex-wrap items-center justify-between gap-1.5 text-xs">
@@ -301,7 +604,7 @@ export function AndroidAppPicker({
 
       {/* Installed App List */}
       <div
-        className={`${maxListHeightClass} divide-y divide-border/70 overflow-y-auto rounded-[8px] border border-border bg-background/50`}
+        className={`${maxListHeightClass} divide-y divide-border/70 overflow-y-auto [overflow-anchor:none] rounded-[8px] border border-border bg-background/50`}
       >
         {loadingApps && filteredApps.length === 0 ? (
           <div className="px-3 py-8 text-center text-xs text-muted-foreground">
@@ -312,61 +615,16 @@ export function AndroidAppPicker({
             {tr("routing.perAppEmpty")}
           </div>
         ) : (
-          filteredApps.map((app) => {
-            const checked = selectedSet.has(app.packageName);
-            const iconSrc = iconMap[app.packageName];
-            const initial = (app.label || app.packageName).trim().slice(0, 1).toUpperCase() || "?";
-            return (
-              <div
-                key={app.packageName}
-                onClick={() => togglePackage(app.packageName)}
-                className={[
-                  "flex cursor-pointer items-center justify-between gap-2.5 px-2.5 py-2 transition-colors",
-                  checked ? "bg-primary/5" : "hover:bg-muted/40",
-                ].join(" ")}
-              >
-                <div className="flex min-w-0 flex-1 items-center gap-2.5">
-                  {iconSrc ? (
-                    <img
-                      src={iconSrc}
-                      alt=""
-                      loading="lazy"
-                      className="h-8 w-8 shrink-0 rounded-[8px] object-cover shadow-xs"
-                    />
-                  ) : (
-                    <span
-                      aria-hidden="true"
-                      className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-[8px] border text-xs font-semibold ${toneForPackage(app.packageName)}`}
-                    >
-                      {initial}
-                    </span>
-                  )}
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5">
-                      <span className="truncate text-[13px] font-medium text-foreground">
-                        {app.label}
-                      </span>
-                      {app.system ? (
-                        <span className="shrink-0 rounded border border-border bg-muted px-1 py-0 text-[10px] text-muted-foreground">
-                          {tr("routing.perAppSystemTag")}
-                        </span>
-                      ) : null}
-                    </div>
-                    <div className="truncate font-mono text-[11px] text-muted-foreground">
-                      {app.packageName}
-                    </div>
-                  </div>
-                </div>
-                <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
-                  <Switch
-                    checked={checked}
-                    onCheckedChange={() => togglePackage(app.packageName)}
-                    aria-label={app.label}
-                  />
-                </div>
-              </div>
-            );
-          })
+          filteredApps.map((app) => (
+            <AppPickerRow
+              key={app.packageName}
+              app={app}
+              checked={selectedSet.has(app.packageName)}
+              iconSrc={iconMap[app.packageName]}
+              systemTagLabel={tr("routing.perAppSystemTag")}
+              onToggle={togglePackage}
+            />
+          ))
         )}
       </div>
 

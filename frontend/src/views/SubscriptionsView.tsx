@@ -34,12 +34,16 @@ export function SubscriptionsView() {
     subscriptions,
     lastImportDiagnostic,
     setLastImportDiagnostic,
+    pendingAction,
+    consumePendingAction,
     refreshAll,
     notify,
   } = useAppStore();
 
   const [subName, setSubName] = useState("");
   const [subUrl, setSubUrl] = useState("");
+  const [subIncludeRegex, setSubIncludeRegex] = useState("");
+  const [subExcludeRegex, setSubExcludeRegex] = useState("");
   const [autoIntervalVal, setAutoIntervalVal] = useState(0);
   const [autoIntervalUnit, setAutoIntervalUnit] = useState<DurationUnit>("h");
   const [adding, setAdding] = useState(false);
@@ -47,6 +51,8 @@ export function SubscriptionsView() {
   const [editingSub, setEditingSub] = useState<SubscriptionRecord | null>(null);
   const [editName, setEditName] = useState("");
   const [editUrl, setEditUrl] = useState("");
+  const [editIncludeRegex, setEditIncludeRegex] = useState("");
+  const [editExcludeRegex, setEditExcludeRegex] = useState("");
   const [editIntervalVal, setEditIntervalVal] = useState(0);
   const [editIntervalUnit, setEditIntervalUnit] = useState<DurationUnit>("h");
   const [savingEdit, setSavingEdit] = useState(false);
@@ -55,6 +61,7 @@ export function SubscriptionsView() {
   const [rawContent, setRawContent] = useState("");
   const [importing, setImporting] = useState(false);
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
+  const [refreshingAll, setRefreshingAll] = useState(false);
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerTitle, setDrawerTitle] = useState("");
@@ -64,15 +71,12 @@ export function SubscriptionsView() {
   const addUrlInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    const onQuickCreate = (e: Event) => {
-      if ((e as CustomEvent<string>).detail === "subscription") {
-        addUrlInputRef.current?.focus();
-        addUrlInputRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
-      }
-    };
-    window.addEventListener("prismray-quick-create", onQuickCreate);
-    return () => window.removeEventListener("prismray-quick-create", onQuickCreate);
-  }, []);
+    if (pendingAction === "quick-create:subscription") {
+      consumePendingAction("quick-create:subscription");
+      addUrlInputRef.current?.focus();
+      addUrlInputRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [pendingAction, consumePendingAction]);
 
   const openEditDialog = (sub: SubscriptionRecord) => {
     setDrawerOpen(false);
@@ -80,6 +84,8 @@ export function SubscriptionsView() {
     setEditingSub(sub);
     setEditName(sub.name);
     setEditUrl(sub.url);
+    setEditIncludeRegex(sub.include_regex || "");
+    setEditExcludeRegex(sub.exclude_regex || "");
     const parts = splitHours(Math.max(0, sub.auto_update_hours ?? 0), ["h", "d"], "h");
     setEditIntervalVal(parts.value);
     setEditIntervalUnit(parts.unit);
@@ -105,6 +111,8 @@ export function SubscriptionsView() {
       await api.updateSubscription(editingSub.id, {
         name: editName.trim() || editingSub.name,
         url: editUrl.trim() || editingSub.url,
+        include_regex: editIncludeRegex.trim(),
+        exclude_regex: editExcludeRegex.trim(),
         auto_update_hours: Math.max(0, joinToHours(editIntervalVal, editIntervalUnit)),
       });
       setEditingSub(null);
@@ -125,10 +133,14 @@ export function SubscriptionsView() {
       await api.createSubscription({
         name: subName.trim() || "Subscription",
         url: subUrl.trim(),
+        include_regex: subIncludeRegex.trim() || undefined,
+        exclude_regex: subExcludeRegex.trim() || undefined,
         auto_update_hours: Math.max(0, joinToHours(autoIntervalVal, autoIntervalUnit)),
       });
       setSubName("");
       setSubUrl("");
+      setSubIncludeRegex("");
+      setSubExcludeRegex("");
       await refreshAll();
       notify(locale === "zh-CN" ? "订阅已添加" : "Subscription added");
     } catch (err) {
@@ -169,13 +181,39 @@ export function SubscriptionsView() {
   const handleRefresh = async (id: string) => {
     setRefreshingId(id);
     try {
-      await api.refreshSubscription(id);
+      const updated = await api.refreshSubscription(id);
       await refreshAll();
-      notify(locale === "zh-CN" ? "订阅已刷新" : "Subscription refreshed");
+      if (updated.diff) {
+        notify(tr("subs.refreshDiff", { added: updated.diff.added, removed: updated.diff.removed }));
+      } else {
+        notify(locale === "zh-CN" ? "订阅已刷新" : "Subscription refreshed");
+      }
     } catch (err) {
       notify(formatApiError(err), "error");
     } finally {
       setRefreshingId(null);
+    }
+  };
+
+  const handleRefreshAll = async () => {
+    if (subscriptions.length === 0) return;
+    setRefreshingAll(true);
+    try {
+      const res = await api.refreshAllSubscriptions();
+      await refreshAll();
+      notify(
+        tr("subs.refreshAllDone", {
+          ok: res.succeeded,
+          total: res.total,
+          added: res.diff?.added ?? 0,
+          removed: res.diff?.removed ?? 0,
+        }),
+        res.failed > 0 ? "warning" : "success",
+      );
+    } catch (err) {
+      notify(formatApiError(err), "error");
+    } finally {
+      setRefreshingAll(false);
     }
   };
 
@@ -248,6 +286,20 @@ export function SubscriptionsView() {
                   required
                 />
               </div>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <Input
+                  value={subIncludeRegex}
+                  onChange={(e) => setSubIncludeRegex(e.target.value)}
+                  placeholder={tr("subs.includeRegex")}
+                  className="font-mono text-xs"
+                />
+                <Input
+                  value={subExcludeRegex}
+                  onChange={(e) => setSubExcludeRegex(e.target.value)}
+                  placeholder={tr("subs.excludeRegex")}
+                  className="font-mono text-xs"
+                />
+              </div>
               <div className="flex flex-wrap items-center gap-2">
                 <Button type="submit" disabled={adding}>
                   {adding ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Plus className="mr-1.5 h-3.5 w-3.5" aria-hidden="true" />}
@@ -315,7 +367,21 @@ export function SubscriptionsView() {
 
       {/* Saved Subscriptions */}
       <div className="space-y-2.5">
-        <h2 className="text-base font-semibold text-foreground">{tr("subs.title")}</h2>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-base font-semibold text-foreground">{tr("subs.title")}</h2>
+          {subscriptions.length > 0 ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={refreshingAll}
+              onClick={() => void handleRefreshAll()}
+            >
+              <RefreshCw className={`mr-1.5 h-3.5 w-3.5 ${refreshingAll ? "animate-spin" : ""}`} aria-hidden="true" />
+              {tr("subs.refreshAll")}
+            </Button>
+          ) : null}
+        </div>
         {subscriptions.length === 0 ? (
           <Card>
             <CardContent className="p-8 text-center text-xs text-muted-foreground">
@@ -431,6 +497,21 @@ export function SubscriptionsView() {
                           ? tr("subs.everyHoursBadge", { hours: sub.auto_update_hours })
                           : tr("subs.manualOnlyBadge")}
                       </span>
+                      {sub.last_updated_at ? (
+                        <span className="badge-radius border border-border/70 px-2 py-0.5 text-muted-foreground mono-num">
+                          {tr("subs.lastUpdated", { time: new Date(sub.last_updated_at).toLocaleString() })}
+                        </span>
+                      ) : null}
+                      {sub.include_regex ? (
+                        <span className="badge-radius border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-emerald-600 dark:text-emerald-400 font-mono">
+                          +{sub.include_regex}
+                        </span>
+                      ) : null}
+                      {sub.exclude_regex ? (
+                        <span className="badge-radius border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-destructive font-mono">
+                          -{sub.exclude_regex}
+                        </span>
+                      ) : null}
                     </div>
 
                     {total > 0 ? (
@@ -517,6 +598,25 @@ export function SubscriptionsView() {
                   setEditIntervalUnit(u);
                 }}
               />
+            </div>
+            <div className="space-y-1">
+              <label className="block font-medium text-muted-foreground">{tr("subs.includeRegex")}</label>
+              <Input
+                value={editIncludeRegex}
+                onChange={(e) => setEditIncludeRegex(e.target.value)}
+                placeholder="HK|JP|SG"
+                className="font-mono text-xs"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="block font-medium text-muted-foreground">{tr("subs.excludeRegex")}</label>
+              <Input
+                value={editExcludeRegex}
+                onChange={(e) => setEditExcludeRegex(e.target.value)}
+                placeholder="Expire|Traffic"
+                className="font-mono text-xs"
+              />
+              <p className="text-[11px] text-muted-foreground">{tr("subs.regexHint")}</p>
             </div>
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
               <Button type="button" variant="outline" size="sm" onClick={() => openQrShare(editingSub)}>

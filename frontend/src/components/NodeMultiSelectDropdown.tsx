@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, Search, X } from "lucide-react";
 import { type GroupConfig, type NodeConfig, type SubscriptionRecord } from "../lib/api.ts";
@@ -119,6 +119,13 @@ export function NodeMultiSelectDropdown(props: NodeMultiSelectDropdownProps) {
       : Math.max(pad, Math.min(rect.bottom + gap, vh - pad - estHeight));
     setMenuPos({ top, left, width, maxHeight });
   }, []);
+
+  useLayoutEffect(() => {
+    if (!open || isMobile) return;
+    updateViewportPlacement();
+    const raf = window.requestAnimationFrame(() => updateViewportPlacement());
+    return () => window.cancelAnimationFrame(raf);
+  }, [open, isMobile, updateViewportPlacement]);
 
   useEffect(() => {
     if (!open || isMobile) return;
@@ -464,7 +471,14 @@ export function NodeMultiSelectDropdown(props: NodeMultiSelectDropdownProps) {
         type="button"
         aria-haspopup="listbox"
         aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          if (!open) {
+            if (!isMobile) updateViewportPlacement();
+            setOpen(true);
+          } else {
+            setOpen(false);
+          }
+        }}
         className="flex h-8 w-full items-center justify-between gap-2 rounded-[6px] border border-input bg-card px-2.5 text-left text-xs text-foreground transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-[var(--m-input-h)] max-md:text-[13px]"
       >
         <span
@@ -494,21 +508,26 @@ export function NodeMultiSelectDropdown(props: NodeMultiSelectDropdownProps) {
             <div
               ref={popoverRef}
               {...({ popover: "manual" } as Record<string, string>)}
-              role="dialog"
-              aria-label={label || tr("proxies.groupsTitle")}
+              className="node-multiselect-popover"
               onPointerDown={(e) => e.stopPropagation()}
               onClick={(e) => e.stopPropagation()}
               style={{
                 position: "fixed",
+                inset: "auto",
                 top: `${menuPos.top}px`,
                 left: `${menuPos.left}px`,
                 width: `${menuPos.width}px`,
-                maxHeight: `${menuPos.maxHeight}px`,
                 zIndex: 100,
               }}
-              className="node-multiselect-popover overflow-y-auto rounded-[10px] border border-border bg-popover/95 p-3 text-popover-foreground shadow-xl backdrop-blur-md"
             >
-              {panelBody}
+              <div
+                role="dialog"
+                aria-label={label || tr("proxies.groupsTitle")}
+                style={{ maxHeight: `${menuPos.maxHeight}px` }}
+                className="overflow-y-auto rounded-[10px] border border-border bg-popover/95 p-3 text-popover-foreground shadow-xl backdrop-blur-md"
+              >
+                {panelBody}
+              </div>
             </div>,
             triggerRef.current?.closest("dialog") ?? document.body,
           )
