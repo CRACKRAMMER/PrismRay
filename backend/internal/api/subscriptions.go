@@ -413,7 +413,7 @@ func (s *Server) refreshSubscriptionWithDiff(ctx context.Context, v *Subscriptio
 		if reqErr != nil {
 			return nil, reqErr
 		}
-		req.Header.Set("User-Agent", "PrismRay/1.0.1")
+		req.Header.Set("User-Agent", "PrismRay/1.1.0")
 		return c.Do(req)
 	}
 	resp, err := doFetch(client)

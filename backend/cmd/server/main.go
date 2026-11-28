@@ -178,7 +178,7 @@ func main() {
 		slog.Info("installed Android pure-Go DNS resolver", "servers", androiddns.ActiveServers())
 	}
 
-	slog.Info("starting PrismRay backend", "version", "1.0.1", "mode", mode)
+	slog.Info("starting PrismRay backend", "version", "1.1.0", "mode", mode)
 
 	cfg, err := appconfig.Load(*configPath)
 	if err != nil {

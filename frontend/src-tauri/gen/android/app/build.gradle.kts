@@ -61,7 +61,7 @@ fun resolveReleaseSigning(): Map<String, String>? {
 
 val releaseSigning = resolveReleaseSigning()
 
-val baseVersionName = tauriProperties.getProperty("tauri.android.versionName", "1.0.1").trim().ifEmpty { "1.0.1" }
+val baseVersionName = tauriProperties.getProperty("tauri.android.versionName", "1.1.0").trim().ifEmpty { "1.1.0" }
 val localBuildSeq = System.getenv("PRISMRAY_ANDROID_LOCAL_BUILD_SEQ")?.trim()?.toIntOrNull()?.takeIf { it in 1..998 }
 
 fun computeMonotonicVersionCode(verName: String, localSeq: Int?): Int {

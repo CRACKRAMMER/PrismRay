@@ -1871,7 +1871,7 @@ func (o *Orchestrator) probeSpeedBatch(
 			dlCtx, dlCancel := context.WithTimeout(ctx, max(timeout, 6*time.Second))
 			dlReq, dlReqErr := http.NewRequestWithContext(dlCtx, http.MethodGet, downURL, nil)
 			if dlReqErr == nil {
-				dlReq.Header.Set("User-Agent", "PrismRay/1.0.1")
+				dlReq.Header.Set("User-Agent", "PrismRay/1.1.0")
 				resp, dlErr := client.Do(dlReq)
 				if dlErr == nil {
 					readStart := time.Now()
@@ -1922,7 +1922,7 @@ func (o *Orchestrator) probeSpeedBatch(
 			if ulReqErr == nil {
 				ulReq.ContentLength = upLimit
 				ulReq.Header.Set("Content-Type", "application/octet-stream")
-				ulReq.Header.Set("User-Agent", "PrismRay/1.0.1")
+				ulReq.Header.Set("User-Agent", "PrismRay/1.1.0")
 				ulStart := time.Now()
 				resp, ulErr := client.Do(ulReq)
 				ulElapsed := time.Since(ulStart)

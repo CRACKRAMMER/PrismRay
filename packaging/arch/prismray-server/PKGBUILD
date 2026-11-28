@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MPL-2.0
 pkgname=prismray-server
-pkgver=1.0.1
+pkgver=1.1.0
 pkgrel=1
 pkgdesc='Dual-core headless proxy manager (sing-box + Xray) with a Web UI and subscriptions'
 arch=('x86_64' 'aarch64')

@@ -5,7 +5,7 @@ export const LOCALE_STORAGE_KEY = "prismray-locale";
 
 const zhCN = {
   "app.name": "PrismRay",
-  "app.version": "v1.0.1",
+  "app.version": "v1.1.0",
   "nav.overview": "概览",
   "nav.proxies": "节点与分组",
   "nav.connections": "实时连接",
@@ -858,7 +858,7 @@ export type TranslationKey = keyof typeof zhCN;
 
 const enUS: Record<TranslationKey, string> = {
   "app.name": "PrismRay",
-  "app.version": "v1.0.1",
+  "app.version": "v1.1.0",
   "nav.overview": "Overview",
   "nav.proxies": "Proxies",
   "nav.connections": "Connections",
