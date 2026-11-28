@@ -14,9 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -48,11 +46,12 @@ func (s *Server) buildStatusPayload() map[string]any {
 	if st.Running {
 		statusStr = "running"
 	}
-	activeNodeID := s.activeNodeID
+	rs := s.runtimeState()
+	activeNodeID := rs.activeNodeID
 	if activeNodeID == "" {
 		activeNodeID = st.ActiveNodeID
 	}
-	activeGroupID := s.activeGroupID
+	activeGroupID := rs.activeGroupID
 	if activeGroupID == "" {
 		activeGroupID = st.ActiveGroupID
 	}
@@ -106,6 +105,7 @@ func (s *Server) buildStatusPayload() map[string]any {
 		"active_tag":                st.ActiveTag,
 		"tun_enabled":               st.TUNEnabled,
 		"android_mode":              st.AndroidMode,
+		"android_vpn_active":        s.ensureAndroidVPN().Status().Active,
 		"mixed_port":                st.MixedPort,
 		"clash_api_port":            st.ClashAPIPort,
 		"uptime_seconds":            st.UptimeSeconds,
@@ -113,10 +113,10 @@ func (s *Server) buildStatusPayload() map[string]any {
 		"skipped_naive":             st.SkippedNaive,
 		"resolved_singbox":          st.ResolvedSingBox,
 		"resolved_xray":             st.ResolvedXray,
-		"listener_health":           s.listenerHealth,
+		"listener_health":           rs.listenerHealth,
 		"mode":                      mode,
 		"system_proxy_enabled":      s.proxyManager().Active(),
-		"system_proxy_wanted":       s.systemProxyWanted,
+		"system_proxy_wanted":       rs.systemProxyWanted,
 		"kill_switch_enabled":       profile.KillSwitchEnabled(),
 		"kill_switch_tripped":       ksTripped,
 		"kill_switch_reason":        ksReason,
@@ -125,13 +125,14 @@ func (s *Server) buildStatusPayload() map[string]any {
 
 func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	s.opMu.Lock()
-	st, err := s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, s.tunEnabled)
+	rs := s.runtimeState()
+	st, err := s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled)
 	s.opMu.Unlock()
 	if err != nil {
 		respondError(w, err, http.StatusBadGateway)
 		return
 	}
-	if s.systemProxyWanted && st.Running && st.MixedPort > 0 && !s.proxyManager().Active() {
+	if s.runtimeState().systemProxyWanted && st.Running && st.MixedPort > 0 && !s.proxyManager().Active() {
 		_ = s.proxyManager().Enable(st.MixedPort)
 	}
 	writeJSON(w, http.StatusOK, s.buildStatusPayload())
@@ -160,12 +161,13 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	_ = s.ensureOrchestrator().Stop()
-	st, err := s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, s.tunEnabled)
+	rs := s.runtimeState()
+	st, err := s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled)
 	if err != nil {
 		respondError(w, err, http.StatusBadGateway)
 		return
 	}
-	if s.systemProxyWanted && st.Running && st.MixedPort > 0 && s.mode != authservice.ModeAndroid && !s.proxyManager().Active() {
+	if rs.systemProxyWanted && st.Running && st.MixedPort > 0 && s.mode != authservice.ModeAndroid && !s.proxyManager().Active() {
 		_ = s.proxyManager().Enable(st.MixedPort)
 	}
 	writeJSON(w, http.StatusOK, s.buildStatusPayload())
@@ -197,6 +199,7 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	var lastSeq uint64
 	for _, entry := range orch.LogHistory(200) {
 		lastSeq = entry.Seq
+		_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		if err := c.WriteJSON(entry); err != nil {
 			return
 		}
@@ -211,6 +214,7 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			lastSeq = entry.Seq
+			_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := c.WriteJSON(entry); err != nil {
 				return
 			}
@@ -226,17 +230,35 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	if !websocket.IsWebSocketUpgrade(r) {
 		client := s.ensureOrchestrator().ClashClient()
 		if client == nil {
-			writeJSON(w, http.StatusOK, map[string]int64{"up": 0, "down": 0})
+			writeJSON(w, http.StatusOK, map[string]int64{
+				"up":          0,
+				"down":        0,
+				"proxy_up":    0,
+				"proxy_down":  0,
+				"direct_up":   0,
+				"direct_down": 0,
+			})
 			return
 		}
 		snap, err := client.GetConnections(r.Context())
 		if err != nil {
-			writeJSON(w, http.StatusOK, map[string]int64{"up": 0, "down": 0})
+			writeJSON(w, http.StatusOK, map[string]int64{
+				"up":          0,
+				"down":        0,
+				"proxy_up":    0,
+				"proxy_down":  0,
+				"direct_up":   0,
+				"direct_down": 0,
+			})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]int64{
 			"up":             0,
 			"down":           0,
+			"proxy_up":       0,
+			"proxy_down":     0,
+			"direct_up":      0,
+			"direct_down":    0,
 			"upload_total":   snap.UploadTotal,
 			"download_total": snap.DownloadTotal,
 		})
@@ -253,47 +275,17 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	defer c.Close()
 
 	disconnected := watchDisconnect(c)
-	orch := s.ensureOrchestrator()
+	hub := s.ensureConnectionsHub()
+	ratesCh, unsub := hub.SubscribeTraffic()
+	defer unsub()
 
 	for {
-		client := orch.ClashClient()
-		if client != nil {
-			streamCtx := r.Context()
-			ch, errCh := client.StreamTraffic(streamCtx)
-			closed := false
-			for !closed {
-				select {
-				case frame, ok := <-ch:
-					if !ok {
-						closed = true
-						break
-					}
-					if err := c.WriteJSON(map[string]any{
-						"up":        frame.Up,
-						"down":      frame.Down,
-						"timestamp": time.Now().UnixMilli(),
-					}); err != nil {
-						return
-					}
-				case <-errCh:
-					closed = true
-				case <-disconnected:
-					return
-				case <-r.Context().Done():
-					return
-				}
-			}
-		}
-
-		if err := c.WriteJSON(map[string]any{
-			"up":        int64(0),
-			"down":      int64(0),
-			"timestamp": time.Now().UnixMilli(),
-		}); err != nil {
-			return
-		}
 		select {
-		case <-time.After(1 * time.Second):
+		case rates := <-ratesCh:
+			_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := c.WriteJSON(rates); err != nil {
+				return
+			}
 		case <-disconnected:
 			return
 		case <-r.Context().Done():
@@ -380,8 +372,9 @@ func (s *Server) applyNode(w http.ResponseWriter, r *http.Request, connect bool)
 			return
 		}
 	} else {
-		targetNodeID = s.activeNodeID
-		targetGroupID = s.activeGroupID
+		rs := s.runtimeState()
+		targetNodeID = rs.activeNodeID
+		targetGroupID = rs.activeGroupID
 		if targetNodeID == "" && targetGroupID == "" {
 			nodes := s.store.List()
 			if len(nodes) > 0 {
@@ -393,12 +386,13 @@ func (s *Server) applyNode(w http.ResponseWriter, r *http.Request, connect bool)
 	// Preserve existing behavior: connect always ensures running; apply also starts/reloads runtime
 	// so config changes take effect atomically and invalid configs fail before replacing running state.
 	_ = connect
-	st, err := s.reconcileRuntime(r.Context(), targetNodeID, targetGroupID, s.tunEnabled)
+	rs := s.runtimeState()
+	st, err := s.reconcileRuntime(r.Context(), targetNodeID, targetGroupID, rs.tunEnabled)
 	if err != nil {
 		respondError(w, err, http.StatusBadGateway)
 		return
 	}
-	if s.systemProxyWanted && st.Running && st.MixedPort > 0 && !s.proxyManager().Active() {
+	if rs.systemProxyWanted && st.Running && st.MixedPort > 0 && !s.proxyManager().Active() {
 		_ = s.proxyManager().Enable(st.MixedPort)
 	}
 	writeJSON(w, http.StatusOK, s.buildStatusPayload())
@@ -488,6 +482,13 @@ func (s *Server) clearDetourReferences(deletedID string) {
 			}
 		}
 	}
+	if tsCfg, err := s.tailscaleConfig(false); err == nil && strings.TrimSpace(tsCfg.DetourID) == deletedID {
+		tsCfg.DetourID = ""
+		tsCfg.AuthKey = ""
+		tsCfg.HasAuthKey = false
+		tsCfg.ClearAuthKey = false
+		_ = s.store.PutSetting(tailscaleSettingKey, tsCfg)
+	}
 }
 
 func (s *Server) validateNodeDetour(candidate *config.Node) error {
@@ -575,14 +576,139 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.ensureOrchestrator().Status().Running {
 		s.opMu.Lock()
-		_, _ = s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, s.tunEnabled)
+		rs := s.runtimeState()
+		_, _ = s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled)
 		s.opMu.Unlock()
 	}
 	writeJSON(w, http.StatusOK, &node)
 }
 
+func (s *Server) handleBatchNodes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPatch && r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Action    string   `json:"action"` // "update" (default) | "delete"
+		IDs       []string `json:"ids"`
+		Group     *string  `json:"group,omitempty"`
+		Tags      []string `json:"tags,omitempty"`
+		SetTags   bool     `json:"set_tags,omitempty"`
+		AddTag    string   `json:"add_tag,omitempty"`
+		RemoveTag string   `json:"remove_tag,omitempty"`
+		Favorite  *bool    `json:"favorite,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(req.IDs) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"updated": 0, "deleted": 0})
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	if action == "" {
+		action = "update"
+	}
+	if action != "update" && action != "delete" {
+		http.Error(w, "invalid batch action", http.StatusBadRequest)
+		return
+	}
+
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+
+	seen := make(map[string]bool, len(req.IDs))
+	updated := 0
+	deleted := 0
+	deletedActive := false
+	for _, rawID := range req.IDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		if action == "delete" {
+			if err := s.store.Delete(id); err == nil {
+				s.clearDetourReferences(id)
+				if s.runtimeState().activeNodeID == id {
+					deletedActive = true
+					s.setActiveNodeID("")
+				}
+				deleted++
+			}
+			continue
+		}
+		existing := s.store.Get(id)
+		if existing == nil {
+			continue
+		}
+		cp := *existing
+		cp.Tags = append([]string(nil), existing.Tags...)
+		if req.Group != nil {
+			cp.Group = strings.TrimSpace(*req.Group)
+		}
+		if req.Favorite != nil {
+			cp.Favorite = *req.Favorite
+		}
+		if req.SetTags {
+			cleaned := make([]string, 0, len(req.Tags))
+			tagSeen := map[string]bool{}
+			for _, t := range req.Tags {
+				v := strings.TrimSpace(t)
+				if v != "" && !tagSeen[v] {
+					tagSeen[v] = true
+					cleaned = append(cleaned, v)
+				}
+			}
+			cp.Tags = cleaned
+		}
+		add := strings.TrimSpace(req.AddTag)
+		if add != "" {
+			if !slices.Contains(cp.Tags, add) {
+				cp.Tags = append(cp.Tags, add)
+			}
+		}
+		if rem := strings.TrimSpace(req.RemoveTag); rem != "" {
+			next := make([]string, 0, len(cp.Tags))
+			for _, t := range cp.Tags {
+				if t != rem {
+					next = append(next, t)
+				}
+			}
+			cp.Tags = next
+			if strings.TrimSpace(cp.Group) == rem {
+				cp.Group = add
+			}
+		}
+		if err := s.store.Update(&cp); err == nil {
+			updated++
+		}
+	}
+
+	if deletedActive {
+		rs := s.runtimeState()
+		s.persistRuntimeSelection("", rs.activeGroupID, rs.tunEnabled)
+	}
+	if (updated > 0 || deleted > 0) && s.ensureOrchestrator().Status().Running {
+		if deleted > 0 && len(s.store.List()) == 0 {
+			_ = s.ensureOrchestrator().Stop()
+			s.persistWantRunning(false)
+		} else {
+			rs := s.runtimeState()
+			_, _ = s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"updated": updated,
+		"deleted": deleted,
+	})
+}
+
 func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
 	if err := s.store.Delete(id); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			http.Error(w, "node not found", http.StatusNotFound)
@@ -592,8 +718,17 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.clearDetourReferences(id)
-	if s.activeNodeID == id {
-		s.activeNodeID = ""
+	rs := s.runtimeState()
+	if rs.activeNodeID == id {
+		s.persistRuntimeSelection("", rs.activeGroupID, rs.tunEnabled)
+		if s.ensureOrchestrator().Status().Running {
+			if len(s.store.List()) == 0 {
+				_ = s.ensureOrchestrator().Stop()
+				s.persistWantRunning(false)
+			} else {
+				_, _ = s.reconcileRuntime(r.Context(), "", rs.activeGroupID, rs.tunEnabled)
+			}
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -631,14 +766,34 @@ func (s *Server) handleImportSubscription(w http.ResponseWriter, r *http.Request
 			http.Error(w, "subscription url must be http or https", http.StatusBadRequest)
 			return
 		}
-		client := safeHTTPClient(20 * time.Second)
+		allowLAN := s.allowLANSubscriptionFetch()
+		if err := validateFetchTargetURL(r.Context(), parsedURL.String(), allowLAN); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		client := s.safeHTTPClient(20 * time.Second)
+		defer closeClientIdleConnections(client)
 		request, err := http.NewRequestWithContext(r.Context(), http.MethodGet, parsedURL.String(), nil)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		request.Header.Set("User-Agent", "PrismRay/1.0.1")
+		request.Header.Set("User-Agent", "PrismRay/"+AppVersion)
 		resp, err := client.Do(request)
+		if err != nil && !errors.Is(err, errSSRFBlocked) {
+			if st := s.ensureOrchestrator().Status(); st.Running && st.MixedPort > 0 {
+				proxied := s.safeProxyHTTPClient(20*time.Second, st.MixedPort)
+				defer closeClientIdleConnections(proxied)
+				if pReq, pReqErr := http.NewRequestWithContext(r.Context(), http.MethodGet, parsedURL.String(), nil); pReqErr == nil {
+					pReq.Header.Set("User-Agent", "PrismRay/"+AppVersion)
+					if pResp, pErr := proxied.Do(pReq); pErr == nil {
+						resp, err = pResp, nil
+					} else if errors.Is(pErr, errSSRFBlocked) {
+						err = pErr
+					}
+				}
+			}
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -696,6 +851,8 @@ func (s *Server) handleImportSubscription(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleDownloadXray(w http.ResponseWriter, r *http.Request) {
+	s.coreMu.Lock()
+	defer s.coreMu.Unlock()
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	if s.ensureOrchestrator().Status().Running {
@@ -816,7 +973,8 @@ func (s *Server) handleUpdateListener(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.ensureOrchestrator().Status().Running {
 		s.opMu.Lock()
-		_, _ = s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, s.tunEnabled)
+		rs := s.runtimeState()
+		_, _ = s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled)
 		s.opMu.Unlock()
 	}
 	writeJSON(w, http.StatusOK, &lis)
@@ -845,11 +1003,12 @@ func (s *Server) handleApplyListeners(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no listeners configured", http.StatusBadRequest)
 		return
 	}
-	if _, err := s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, s.tunEnabled); err != nil {
+	rs := s.runtimeState()
+	if _, err := s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled); err != nil {
 		respondError(w, err, http.StatusBadGateway)
 		return
 	}
-	s.listenerHealth = ""
+	s.setListenerHealthState("")
 	writeJSON(w, http.StatusOK, s.buildStatusPayload())
 }
 
@@ -859,12 +1018,32 @@ func (s *Server) validateCandidate(data []byte) error {
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(os.TempDir(), "prismray-check-"+strconv.FormatInt(time.Now().UnixNano(), 10)+".json")
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	dir := ""
+	if s.cfg != nil {
+		dir = strings.TrimSpace(s.cfg.RuntimeDir())
+	}
+	if dir == "" || dir == "." {
+		dir = os.TempDir()
+	} else {
+		_ = os.MkdirAll(dir, 0o700)
+	}
+	tmpFile, err := os.CreateTemp(dir, "prismray-check-*.json")
+	if err != nil {
 		return err
 	}
+	tmp := tmpFile.Name()
 	defer os.Remove(tmp)
-	if out, checkErr := exec.Command(sbBin, "check", "-c", tmp).CombinedOutput(); checkErr != nil {
+	_ = tmpFile.Chmod(0o600)
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if out, checkErr := exec.CommandContext(ctx, sbBin, "check", "-c", tmp).CombinedOutput(); checkErr != nil {
 		return fmt.Errorf("sing-box check failed: %w (%s)", checkErr, strings.TrimSpace(string(out)))
 	}
 	return nil

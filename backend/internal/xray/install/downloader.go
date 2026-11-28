@@ -50,6 +50,11 @@ func DownloadXray(destDir string) (string, error) {
 	return DownloadXrayVersion(destDir, "latest")
 }
 func DownloadXrayVersion(destDir, version string) (string, error) {
+	return DownloadXrayVersionWithClient(nil, destDir, version)
+}
+
+// DownloadXrayVersionWithClient downloads and verifies the requested Xray-core binary using client.
+func DownloadXrayVersionWithClient(client *http.Client, destDir, version string) (string, error) {
 	base := releaseBaseURL
 	if version != "latest" {
 		if !regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`).MatchString(version) {
@@ -69,7 +74,9 @@ func DownloadXrayVersion(destDir, version string) (string, error) {
 	defer tmpFile.Close()
 
 	// Download
-	client := &http.Client{Timeout: 5 * time.Minute}
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Minute}
+	}
 	resp, err := client.Get(url)
 	if err != nil {
 		return "", fmt.Errorf("failed to download xray from %s: %w", url, err)

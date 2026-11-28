@@ -4,6 +4,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -141,12 +142,12 @@ func TestCompileAndCheckWithRealSingBox(t *testing.T) {
 				t.Fatalf("expected TUN mtu=1500, got %v", ib["mtu"])
 			}
 			addrs, _ := ib["address"].([]any)
-			if len(addrs) != 1 || addrs[0] != "172.19.0.1/30" {
-				t.Fatalf("expected IPv4-only TUN address under prefer_ipv4, got %v", ib["address"])
+			if len(addrs) != 2 || addrs[0] != "172.19.0.1/30" || addrs[1] != "fdfe:dcba:9876::1/126" {
+				t.Fatalf("expected dual-stack TUN address under prefer_ipv4 for IPv6 leak capture, got %v", ib["address"])
 			}
 			excl, _ := ib["route_exclude_address"].([]any)
-			if len(excl) != 1 || excl[0] != "127.0.0.0/8" {
-				t.Fatalf("expected IPv4-only route_exclude_address under prefer_ipv4, got %v", ib["route_exclude_address"])
+			if len(excl) != 2 || excl[0] != "127.0.0.0/8" || excl[1] != "::1/128" {
+				t.Fatalf("expected dual-stack loopback route_exclude_address under prefer_ipv4, got %v", ib["route_exclude_address"])
 			}
 			if runtime.GOOS == "linux" {
 				if ar, _ := ib["auto_redirect"].(bool); !ar {
@@ -576,23 +577,52 @@ func TestCompileLoadBalanceDomainHashSharding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Expect logical domain_regex shard rules referencing only healthy nodes (node-n1 / node-n2), not dead node-n3.
+	// Expect logical domain_regex shard rules routing through lb-shard-lb1-0 / lb-shard-lb1-1 selectors,
+	// each wrapping only healthy nodes (node-n1 / node-n2) + block-out, never dead node-n3.
+	shardSelectors := map[string]string{}
+	for _, ob := range doc.Outbounds {
+		tag, _ := ob["tag"].(string)
+		if ob["type"] == "selector" && strings.HasPrefix(tag, "lb-shard-lb1-") {
+			def, _ := ob["default"].(string)
+			shardSelectors[tag] = def
+		}
+	}
+	if len(shardSelectors) != 2 || shardSelectors["lb-shard-lb1-0"] != "node-n1" || shardSelectors["lb-shard-lb1-1"] != "node-n2" {
+		t.Fatalf("expected 2 lb-shard selector wrappers pointing to node-n1/node-n2, got %v", shardSelectors)
+	}
 	shardTargets := map[string]bool{}
-	shardCount := 0
+	hashRuleCount := 0
+	affinityGlobalCount := 0
 	for _, r := range doc.Route.Rules {
 		if r["type"] == "logical" && r["mode"] == "and" {
 			ob, _ := r["outbound"].(string)
 			if ob == "node-n3" {
 				t.Fatalf("expected dead node-n3 (latency=-1) to be excluded from loadbalance shards: %+v", r)
 			}
-			if ob == "node-n1" || ob == "node-n2" {
+			subRules, _ := r["rules"].([]any)
+			hasDomainRegex := false
+			hasDomainSuffix := false
+			for _, sr := range subRules {
+				if sm, ok := sr.(map[string]any); ok {
+					if _, ok := sm["domain_regex"]; ok {
+						hasDomainRegex = true
+					}
+					if _, ok := sm["domain_suffix"]; ok {
+						hasDomainSuffix = true
+					}
+				}
+			}
+			if hasDomainRegex && (ob == "lb-shard-lb1-0" || ob == "lb-shard-lb1-1") {
 				shardTargets[ob] = true
-				shardCount++
+				hashRuleCount++
+			}
+			if hasDomainSuffix && ob == "lb-shard-lb1-0" {
+				affinityGlobalCount++
 			}
 		}
 	}
-	if shardCount != 2 || !shardTargets["node-n1"] || !shardTargets["node-n2"] {
-		t.Fatalf("expected 2 healthy loadbalance shard rules (node-n1, node-n2), got count=%d targets=%v", shardCount, shardTargets)
+	if hashRuleCount != 2 || !shardTargets["lb-shard-lb1-0"] || !shardTargets["lb-shard-lb1-1"] || affinityGlobalCount != 1 {
+		t.Fatalf("expected 2 healthy loadbalance hash rules + 1 logical affinity rule (lb-shard-lb1-0/1), got hash=%d affinity=%d targets=%v", hashRuleCount, affinityGlobalCount, shardTargets)
 	}
 
 	if idxRoot, idxSub := DomainHashShardIndex("github.com", 2), DomainHashShardIndex("api.github.com", 2); idxRoot < 0 || idxRoot != idxSub {
@@ -1173,15 +1203,15 @@ func TestCompileGooglePlayAllowlistIPv6RejectAndAndroidAppRules(t *testing.T) {
 	if !strings.Contains(raw, `"play.googleapis.com"`) || !strings.Contains(raw, `"invert": true`) {
 		t.Fatalf("expected BlockAds logical allowlist for Google Play domains, got:\n%s", raw)
 	}
-	// 3. Load-balance must cap shards at MaxLoadBalanceShards (4), default interval 10m, and pin Google/ippure.com to shard 0 (node-n1).
-	if strings.Contains(raw, `"outbound": "node-n5"`) {
-		t.Fatalf("expected loadbalance shard count capped at %d, found node-n5 route", MaxLoadBalanceShards)
+	// 3. Load-balance must cap shards at MaxLoadBalanceShards (4), default interval 10m, and pin Google/ippure.com to shard 0 (lb-shard-g-lb-0 -> node-n1).
+	if strings.Contains(raw, `"outbound": "node-n5"`) || strings.Contains(raw, `"lb-shard-g-lb-4"`) {
+		t.Fatalf("expected loadbalance shard count capped at %d, found node-n5 / lb-shard-g-lb-4 route", MaxLoadBalanceShards)
 	}
 	if !strings.Contains(raw, `"interval": "10m"`) {
 		t.Fatalf("expected loadbalance default interval 10m, got:\n%s", raw)
 	}
-	if !strings.Contains(raw, `"ippure.com"`) || !strings.Contains(raw, `"outbound": "node-n1"`) {
-		t.Fatalf("expected loadbalance session affinity pinning ippure.com/Google to shard 0 (node-n1), got:\n%s", raw)
+	if !strings.Contains(raw, `"ippure.com"`) || !strings.Contains(raw, `"outbound": "lb-shard-g-lb-0"`) || !strings.Contains(raw, `"default": "node-n1"`) {
+		t.Fatalf("expected loadbalance session affinity pinning ippure.com/Google to shard 0 selector (lb-shard-g-lb-0 -> node-n1), got:\n%s", raw)
 	}
 	// 4. Android non-IPv6 mode must reject global IPv6 (2000::/3) inside sing-box so carrier IPv6 cannot leak.
 	if !strings.Contains(raw, `"2000::/3"`) {
@@ -1311,5 +1341,921 @@ func TestCompileHybridURLTestAndFailoverManualPin(t *testing.T) {
 		if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
 			t.Fatalf("sing-box check failed with hybrid urltest/failover groups: %v\n%s\n%s", err, output, string(out.Raw))
 		}
+	}
+}
+
+func TestCompileAndroidPowerOptimizations(t *testing.T) {
+	nodes := []*config.Node{
+		{
+			ID:                       "n-anytls",
+			Name:                     "AnyTLS Mobile",
+			Protocol:                 config.ProtocolAnyTLS,
+			Address:                  "anytls.example.com",
+			Port:                     443,
+			Password:                 "secret-pass",
+			Security:                 "tls",
+			Sni:                      "anytls.example.com",
+			IdleSessionCheckInterval: "30s",
+			IdleSessionTimeout:       "30s",
+			MinIdleSession:           5,
+		},
+		{
+			ID:                "n-tuic",
+			Name:              "TUIC Mobile",
+			Protocol:          config.ProtocolTUIC,
+			Address:           "tuic.example.com",
+			Port:              443,
+			UUID:              "11111111-1111-4111-8111-111111111111",
+			Password:          "tuic-pass",
+			Security:          "tls",
+			Sni:               "tuic.example.com",
+			CongestionControl: "bbr",
+			Heartbeat:         "10s",
+		},
+	}
+	groups := []storage.Group{
+		{
+			ID:       "g-failover",
+			Name:     "Failover",
+			Strategy: "failover",
+			NodeIDs:  []string{"n-anytls", "n-tuic"},
+		},
+	}
+
+	// Android mode: failover defaults to 5m, idle_timeout=10m, AnyTLS min_idle_session<=1 & check>=60s, TUIC heartbeat>=30s.
+	androidOut, err := Compile(CompileInput{
+		Nodes:         nodes,
+		Groups:        groups,
+		Routing:       ruleset.DefaultRoutingProfile(),
+		ActiveGroupID: "g-failover",
+		AndroidMode:   true,
+	})
+	if err != nil {
+		t.Fatalf("Compile(AndroidMode=true) failed: %v", err)
+	}
+	var androidDoc struct {
+		Outbounds []map[string]any `json:"outbounds"`
+	}
+	if err := json.Unmarshal(androidOut.Raw, &androidDoc); err != nil {
+		t.Fatalf("unmarshal android config: %v", err)
+	}
+	aByTag := map[string]map[string]any{}
+	for _, ob := range androidDoc.Outbounds {
+		if tag, ok := ob["tag"].(string); ok {
+			aByTag[tag] = ob
+		}
+	}
+	failAuto := aByTag[GroupAutoTag("g-failover")]
+	if failAuto == nil || failAuto["interval"] != "5m" || failAuto["idle_timeout"] != "10m0s" {
+		t.Fatalf("expected Android failover interval=5m and idle_timeout=10m0s, got %+v", failAuto)
+	}
+	anyOb := aByTag[NodeTag("n-anytls")]
+	if anyOb == nil || anyOb["idle_session_check_interval"] != "60s" || anyOb["min_idle_session"] != float64(1) {
+		t.Fatalf("expected Android AnyTLS check_interval=60s and min_idle_session=1, got %+v", anyOb)
+	}
+	tuicOb := aByTag[NodeTag("n-tuic")]
+	if tuicOb == nil || tuicOb["heartbeat"] != "30s" {
+		t.Fatalf("expected Android TUIC heartbeat clamped to 30s, got %+v", tuicOb)
+	}
+
+	// Desktop mode (AndroidMode=false): protocol keepalive params remain untouched.
+	desktopOut, err := Compile(CompileInput{
+		Nodes:         nodes,
+		Groups:        groups,
+		Routing:       ruleset.DefaultRoutingProfile(),
+		ActiveGroupID: "g-failover",
+		AndroidMode:   false,
+	})
+	if err != nil {
+		t.Fatalf("Compile(AndroidMode=false) failed: %v", err)
+	}
+	var desktopDoc struct {
+		Outbounds []map[string]any `json:"outbounds"`
+	}
+	if err := json.Unmarshal(desktopOut.Raw, &desktopDoc); err != nil {
+		t.Fatalf("unmarshal desktop config: %v", err)
+	}
+	dByTag := map[string]map[string]any{}
+	for _, ob := range desktopDoc.Outbounds {
+		if tag, ok := ob["tag"].(string); ok {
+			dByTag[tag] = ob
+		}
+	}
+	dAny := dByTag[NodeTag("n-anytls")]
+	if dAny == nil || dAny["idle_session_check_interval"] != "30s" || dAny["min_idle_session"] != float64(5) {
+		t.Fatalf("expected Desktop AnyTLS keepalive untouched (30s / 5), got %+v", dAny)
+	}
+	dTuic := dByTag[NodeTag("n-tuic")]
+	if dTuic == nil || dTuic["heartbeat"] != "10s" {
+		t.Fatalf("expected Desktop TUIC heartbeat untouched (10s), got %+v", dTuic)
+	}
+
+	if binary := os.Getenv("SINGBOX_TEST_BINARY"); binary != "" {
+		cfgPath := filepath.Join(t.TempDir(), "sing-box-android-power.json")
+		if err := os.WriteFile(cfgPath, androidOut.Raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
+			t.Fatalf("sing-box check failed with Android power optimizations: %v\n%s\n%s", err, output, string(androidOut.Raw))
+		}
+	}
+}
+
+func TestCompileCustomRulesMasterToggleAndGooglePlayBypassCNExemption(t *testing.T) {
+	node := &config.Node{
+		ID:       "n-play",
+		Name:     "Play Node",
+		Protocol: config.ProtocolSocks,
+		Address:  "198.51.100.40",
+		Port:     1080,
+		Security: "none",
+	}
+
+	// Build a profile with an enabled custom rule, but master switch CustomRulesEnabled=false.
+	profile := ruleset.DefaultRoutingProfile()
+	profile.BlockAds = true
+	profile.BypassCN = true
+	profile.CustomRulesEnabled = ruleset.BoolPtr(false)
+	profile.CustomRules = []ruleset.RoutingRule{
+		{
+			ID:           "r-pause",
+			Name:         "Paused Custom Rule",
+			Enabled:      true,
+			DomainSuffix: []string{"paused-custom.example"},
+			Outbound:     "direct",
+		},
+	}
+
+	for _, fakeIP := range []bool{false, true} {
+		profile.FakeIP = fakeIP
+		out, err := Compile(CompileInput{
+			Nodes:            []*config.Node{node},
+			Routing:          profile,
+			RuleSets:         ruleset.BuiltinRuleSets(t.TempDir()),
+			ForceRemoteRules: true,
+			ActiveNodeID:     node.ID,
+			AndroidMode:      true,
+		})
+		if err != nil {
+			t.Fatalf("Compile(fakeIP=%v) failed: %v", fakeIP, err)
+		}
+		raw := string(out.Raw)
+		if strings.Contains(raw, "paused-custom.example") {
+			t.Fatalf("expected CustomRulesEnabled=false to skip custom rules (fakeIP=%v), got:\n%s", fakeIP, raw)
+		}
+
+		// Verify BOTH dns.rules (geosite-cn -> local-dns) AND route.rules (BypassCN -> direct)
+		// exempt Google Play download CDN domains (gvt1.com, xn--ngstr-lra8j.com, dl.google.com).
+		var doc struct {
+			DNS struct {
+				Rules []map[string]any `json:"rules"`
+			} `json:"dns"`
+			Route struct {
+				Rules []map[string]any `json:"rules"`
+			} `json:"route"`
+		}
+		if err := json.Unmarshal(out.Raw, &doc); err != nil {
+			t.Fatalf("unmarshal config: %v", err)
+		}
+
+		hasPlayExemptLogical := func(rules []map[string]any, expectKey, expectVal string) bool {
+			for _, r := range rules {
+				if r["type"] != "logical" || r["mode"] != "and" || r[expectKey] != expectVal {
+					continue
+				}
+				subRaw, _ := json.Marshal(r["rules"])
+				sub := string(subRaw)
+				if strings.Contains(sub, `"geosite-cn"`) &&
+					strings.Contains(sub, `"gvt1.com"`) &&
+					strings.Contains(sub, `"xn--ngstr-lra8j.com"`) &&
+					strings.Contains(sub, `"dl.google.com"`) &&
+					strings.Contains(sub, `"invert":true`) {
+					return true
+				}
+			}
+			return false
+		}
+		if !hasPlayExemptLogical(doc.DNS.Rules, "server", "local-dns") {
+			t.Fatalf("expected DNS geosite-cn -> local-dns logical rule exempting Google Play CDN domains (fakeIP=%v), got:\n%s", fakeIP, raw)
+		}
+		if !hasPlayExemptLogical(doc.Route.Rules, "outbound", "direct") {
+			t.Fatalf("expected Route BypassCN -> direct logical rule exempting Google Play CDN domains (fakeIP=%v), got:\n%s", fakeIP, raw)
+		}
+
+		if binary := os.Getenv("SINGBOX_TEST_BINARY"); binary != "" {
+			cfgPath := filepath.Join(t.TempDir(), fmt.Sprintf("sing-box-play-fakeip-%v.json", fakeIP))
+			if err := os.WriteFile(cfgPath, out.Raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
+				t.Fatalf("sing-box check failed (fakeIP=%v): %v\n%s\n%s", fakeIP, err, output, raw)
+			}
+		}
+	}
+
+	// Re-enabling master switch emits the custom rule again.
+	profile.FakeIP = false
+	profile.CustomRulesEnabled = ruleset.BoolPtr(true)
+	enabledOut, err := Compile(CompileInput{
+		Nodes:        []*config.Node{node},
+		Routing:      profile,
+		ActiveNodeID: node.ID,
+	})
+	if err != nil {
+		t.Fatalf("Compile(CustomRulesEnabled=true) failed: %v", err)
+	}
+	if !strings.Contains(string(enabledOut.Raw), "paused-custom.example") {
+		t.Fatalf("expected CustomRulesEnabled=true to emit custom rule, got:\n%s", string(enabledOut.Raw))
+	}
+}
+
+func TestCompileFailoverTriggerTolerance(t *testing.T) {
+	nodes := []*config.Node{
+		{ID: "n1", Name: "Primary", Protocol: config.ProtocolSocks, Address: "198.51.100.1", Port: 1080, Security: "none"},
+		{ID: "n2", Name: "Backup", Protocol: config.ProtocolSocks, Address: "198.51.100.2", Port: 1080, Security: "none"},
+	}
+	groups := []storage.Group{
+		{
+			ID:              "g-unavail",
+			Name:            "Failover Unavailable Only",
+			Strategy:        "failover",
+			FailoverTrigger: "unavailable_only",
+			HighLatencyMS:   450,
+			NodeIDs:         []string{"n1", "n2"},
+		},
+		{
+			ID:              "g-custom-ms",
+			Name:            "Failover Custom Latency",
+			Strategy:        "failover",
+			FailoverTrigger: "high_latency_or_unavailable",
+			HighLatencyMS:   600,
+			NodeIDs:         []string{"n1", "n2"},
+		},
+		{
+			ID:              "g-inherit-ms",
+			Name:            "Failover Inherit Global Latency",
+			Strategy:        "failover",
+			FailoverTrigger: "high_latency_or_unavailable",
+			HighLatencyMS:   0,
+			NodeIDs:         []string{"n1", "n2"},
+		},
+	}
+
+	out, err := Compile(CompileInput{
+		Nodes:         nodes,
+		Groups:        groups,
+		Routing:       ruleset.DefaultRoutingProfile(),
+		ActiveGroupID: "g-unavail",
+		HighLatencyMS: 950,
+	})
+	if err != nil {
+		t.Fatalf("Compile failover triggers failed: %v", err)
+	}
+	var doc struct {
+		Outbounds []map[string]any `json:"outbounds"`
+	}
+	if err := json.Unmarshal(out.Raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	tolerances := map[string]int{}
+	for _, ob := range doc.Outbounds {
+		if ob["type"] == "urltest" {
+			tag, _ := ob["tag"].(string)
+			tol, _ := ob["tolerance"].(float64)
+			tolerances[tag] = int(tol)
+		}
+	}
+	if tolerances["group-g-unavail-auto"] != 65535 {
+		t.Fatalf("expected unavailable_only tolerance=65535, got %d (%+v)", tolerances["group-g-unavail-auto"], tolerances)
+	}
+	if tolerances["group-g-custom-ms-auto"] != 600 {
+		t.Fatalf("expected custom high_latency_ms tolerance=600, got %d (%+v)", tolerances["group-g-custom-ms-auto"], tolerances)
+	}
+	if tolerances["group-g-inherit-ms-auto"] != 950 {
+		t.Fatalf("expected inherited global HighLatencyMS tolerance=950, got %d (%+v)", tolerances["group-g-inherit-ms-auto"], tolerances)
+	}
+
+	if binary := os.Getenv("SINGBOX_TEST_BINARY"); binary != "" {
+		cfgPath := filepath.Join(t.TempDir(), "sing-box-failover-triggers.json")
+		if err := os.WriteFile(cfgPath, out.Raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
+			t.Fatalf("sing-box check failed for failover triggers: %v\n%s\n%s", err, output, string(out.Raw))
+		}
+	}
+}
+
+func TestCompileTailscaleParallelMeshAndHeadscale(t *testing.T) {
+	node := &config.Node{
+		ID:       "n1",
+		Name:     "Relay HK",
+		Protocol: config.ProtocolSocks,
+		Address:  "198.51.100.1",
+		Port:     1080,
+		Security: "none",
+	}
+	profile := ruleset.DefaultRoutingProfile()
+	profile.Mode = "global"
+	profile.BypassLAN = true
+	profile.FakeIP = true
+	profile.CustomRules = []ruleset.RoutingRule{
+		{
+			ID:           "r-ts",
+			Name:         "Internal App via Tailscale",
+			Enabled:      true,
+			DomainSuffix: []string{"corp.internal"},
+			Outbound:     ruleset.TailscaleEndpointTag,
+		},
+	}
+
+	tsCfg := ruleset.TailscaleConfig{
+		Enabled:      true,
+		ControlURL:   "https://headscale.example.com",
+		AuthKey:      "tskey-auth-test-secret",
+		Hostname:     "prismray-test",
+		AcceptRoutes: true,
+		MagicDNS:     true,
+		ExtraDomains: []string{"corp.internal"},
+		ExtraSubnets: []string{"10.240.0.0/16"},
+		DetourID:     "n1",
+		UDPTimeout:   "5m",
+		Ephemeral:    true,
+	}
+
+	out, err := Compile(CompileInput{
+		Nodes:             []*config.Node{node},
+		Routing:           profile,
+		Tailscale:         &tsCfg,
+		TailscaleStateDir: filepath.Join(t.TempDir(), "ts-state"),
+		ActiveNodeID:      node.ID,
+		MixedPort:         10808,
+		ClashAPIPort:      9090,
+	})
+	if err != nil {
+		t.Fatalf("Compile with Tailscale failed: %v", err)
+	}
+
+	var doc struct {
+		Endpoints []map[string]any `json:"endpoints"`
+		DNS       struct {
+			Servers []map[string]any `json:"servers"`
+			Rules   []map[string]any `json:"rules"`
+		} `json:"dns"`
+		Route struct {
+			Rules []map[string]any `json:"rules"`
+		} `json:"route"`
+	}
+	if err := json.Unmarshal(out.Raw, &doc); err != nil {
+		t.Fatalf("unmarshal tailscale config: %v", err)
+	}
+	if len(doc.Endpoints) != 1 {
+		t.Fatalf("expected 1 tailscale endpoint, got %d", len(doc.Endpoints))
+	}
+	ep := doc.Endpoints[0]
+	if ep["type"] != "tailscale" || ep["tag"] != ruleset.TailscaleEndpointTag || ep["control_url"] != "https://headscale.example.com" || ep["detour"] != "node-n1" {
+		t.Fatalf("unexpected tailscale endpoint: %+v", ep)
+	}
+
+	foundTSDNS := false
+	for _, srv := range doc.DNS.Servers {
+		if srv["type"] == "tailscale" && srv["tag"] == ruleset.TailscaleDNSTag && srv["endpoint"] == ruleset.TailscaleEndpointTag {
+			foundTSDNS = true
+		}
+	}
+	if !foundTSDNS {
+		t.Fatalf("expected tailscale MagicDNS server %q in dns.servers: %+v", ruleset.TailscaleDNSTag, doc.DNS.Servers)
+	}
+
+	idxTSRoute, idxGlobal, idxBypassLAN := -1, -1, -1
+	for i, r := range doc.Route.Rules {
+		if r["outbound"] == ruleset.TailscaleEndpointTag && idxTSRoute < 0 {
+			if cidrs, ok := r["ip_cidr"].([]any); ok && len(cidrs) >= 2 {
+				idxTSRoute = i
+			}
+		}
+		if r["clash_mode"] == "Global" && idxGlobal < 0 {
+			idxGlobal = i
+		}
+		if r["ip_is_private"] == true && r["outbound"] == "direct" && idxBypassLAN < 0 {
+			idxBypassLAN = i
+		}
+	}
+	if idxTSRoute < 0 || idxGlobal < 0 {
+		t.Fatalf("missing tailscale route (%d) or Global (%d) in route.rules: %+v", idxTSRoute, idxGlobal, doc.Route.Rules)
+	}
+	if idxTSRoute >= idxGlobal {
+		t.Fatalf("expected Tailscale mesh route (%d) BEFORE clash_mode Global (%d)", idxTSRoute, idxGlobal)
+	}
+	if idxBypassLAN >= 0 && idxTSRoute >= idxBypassLAN {
+		t.Fatalf("expected Tailscale mesh route (%d) BEFORE BypassLAN (%d)", idxTSRoute, idxBypassLAN)
+	}
+
+	if binary := os.Getenv("SINGBOX_TEST_BINARY"); binary != "" {
+		cfgPath := filepath.Join(t.TempDir(), "sing-box-tailscale.json")
+		if err := os.WriteFile(cfgPath, out.Raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
+			t.Fatalf("sing-box check failed for Tailscale parallel mesh config: %v\n%s\n%s", err, output, string(out.Raw))
+		}
+	}
+
+	// Regression test: direct Tailscale (empty DetourID) must omit "detour" (sing-box rejects
+	// detouring to an empty direct outbound) and attach protect_path on Android.
+	tsDirect := ruleset.TailscaleConfig{
+		Enabled:      true,
+		AuthKey:      "tskey-auth-direct",
+		Hostname:     "prismray-direct",
+		AcceptRoutes: true,
+		MagicDNS:     true,
+		UDPTimeout:   "5m",
+	}
+	directOut, err := Compile(CompileInput{
+		Nodes:             []*config.Node{node},
+		Routing:           profile,
+		Tailscale:         &tsDirect,
+		TailscaleStateDir: filepath.Join(t.TempDir(), "ts-direct-state"),
+		ActiveNodeID:      node.ID,
+		MixedPort:         10808,
+		ClashAPIPort:      9090,
+		AndroidMode:       true,
+		ProtectPath:       "/tmp/protect.sock",
+	})
+	if err != nil {
+		t.Fatalf("Compile with direct Tailscale failed: %v", err)
+	}
+	var directDoc struct {
+		Endpoints []map[string]any `json:"endpoints"`
+	}
+	if err := json.Unmarshal(directOut.Raw, &directDoc); err != nil {
+		t.Fatalf("unmarshal direct tailscale config: %v", err)
+	}
+	if len(directDoc.Endpoints) != 1 {
+		t.Fatalf("expected 1 direct tailscale endpoint, got %d", len(directDoc.Endpoints))
+	}
+	dep := directDoc.Endpoints[0]
+	if _, hasDetour := dep["detour"]; hasDetour {
+		t.Fatalf("direct tailscale endpoint must not emit detour: %+v", dep)
+	}
+	if dep["protect_path"] != "/tmp/protect.sock" {
+		t.Fatalf("expected protect_path on Android direct tailscale endpoint, got %+v", dep)
+	}
+}
+
+func TestCompileCustomLoadBalanceShardCount(t *testing.T) {
+	nodes := make([]*config.Node, 0, 7)
+	nodeIDs := make([]string, 0, 7)
+	for i := 1; i <= 7; i++ {
+		id := fmt.Sprintf("n%d", i)
+		nodeIDs = append(nodeIDs, id)
+		nodes = append(nodes, &config.Node{
+			ID:       id,
+			Name:     "Node " + id,
+			Protocol: config.ProtocolSocks,
+			Address:  fmt.Sprintf("198.51.100.%d", i),
+			Port:     1080,
+			Latency:  20 + i*5,
+		})
+	}
+	groups := []storage.Group{
+		{
+			ID:                "g-lb-6",
+			Name:              "LB 6 Shards",
+			Strategy:          "loadbalance",
+			LoadBalanceShards: 6,
+			NodeIDs:           nodeIDs,
+		},
+	}
+	out, err := Compile(CompileInput{
+		Nodes:         nodes,
+		Groups:        groups,
+		Routing:       ruleset.DefaultRoutingProfile(),
+		ActiveGroupID: "g-lb-6",
+		MixedPort:     10808,
+		ClashAPIPort:  9090,
+	})
+	if err != nil {
+		t.Fatalf("Compile custom 6-shard loadbalance failed: %v", err)
+	}
+	raw := string(out.Raw)
+	for i := 0; i < 6; i++ {
+		wantRoute := fmt.Sprintf(`"outbound": "lb-shard-g-lb-6-%d"`, i)
+		wantDefault := fmt.Sprintf(`"default": "node-n%d"`, i+1)
+		if !strings.Contains(raw, wantRoute) || !strings.Contains(raw, wantDefault) {
+			t.Fatalf("expected shard %d (%s & %s) in compiled config", i, wantRoute, wantDefault)
+		}
+	}
+	if strings.Contains(raw, `"lb-shard-g-lb-6-6"`) || strings.Contains(raw, `"default": "node-n7"`) {
+		t.Fatalf("expected custom 6-shard cap to exclude node-n7 from shard wrappers & route rules")
+	}
+	if regexes := BuildDomainHashBucketRegexes(6); len(regexes) != 6 {
+		t.Fatalf("expected 6 bucket regexes, got %d", len(regexes))
+	}
+	if binary := os.Getenv("SINGBOX_TEST_BINARY"); binary != "" {
+		cfgPath := filepath.Join(t.TempDir(), "sing-box-lb6.json")
+		if err := os.WriteFile(cfgPath, out.Raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
+			t.Fatalf("sing-box check failed for 6-shard loadbalance: %v\n%s", err, output)
+		}
+	}
+}
+
+func TestCompileIPv6DisabledDNSPrecedesDirectGlobalAndCN(t *testing.T) {
+	disable := true
+	routing := ruleset.DefaultRoutingProfile()
+	routing.Mode = "rule"
+	routing.DisableIPv6 = &disable
+	routing.BypassCN = true
+	routing.FakeIP = true
+
+	node := &config.Node{
+		ID:       "n1",
+		Name:     "Node 1",
+		Protocol: config.ProtocolSocks,
+		Address:  "198.51.100.10",
+		Port:     1080,
+	}
+	rsDir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(rsDir, "geosite-cn.srs"), []byte("srs"), 0o600)
+	_ = os.WriteFile(filepath.Join(rsDir, "geoip-cn.srs"), []byte("srs"), 0o600)
+	out, err := Compile(CompileInput{
+		Nodes:        []*config.Node{node},
+		Routing:      routing,
+		ActiveNodeID: node.ID,
+		RuleSets:     ruleset.BuiltinRuleSets(rsDir),
+		MixedPort:    10808,
+		ClashAPIPort: 9090,
+		EnableTUN:    true,
+	})
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out.Raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	dnsObj, _ := doc["dns"].(map[string]any)
+	dnsRules, _ := dnsObj["rules"].([]any)
+	aaaaIdx, directIdx, globalIdx, cnIdx := -1, -1, -1, -1
+	for idx, raw := range dnsRules {
+		m, _ := raw.(map[string]any)
+		if m["action"] == "predefined" && m["rcode"] == "NOERROR" && aaaaIdx < 0 {
+			aaaaIdx = idx
+		}
+		if m["clash_mode"] == "Direct" && directIdx < 0 {
+			directIdx = idx
+		}
+		if m["clash_mode"] == "Global" && globalIdx < 0 {
+			globalIdx = idx
+		}
+		if m["type"] == "logical" {
+			if subRules, ok := m["rules"].([]any); ok {
+				for _, sr := range subRules {
+					sm, _ := sr.(map[string]any)
+					if sm["rule_set"] == "geosite-cn" && cnIdx < 0 {
+						cnIdx = idx
+					}
+				}
+			}
+		} else if m["rule_set"] == "geosite-cn" && cnIdx < 0 {
+			cnIdx = idx
+		}
+	}
+	if aaaaIdx < 0 {
+		t.Fatalf("expected AAAA/HTTPS NOERROR predefined DNS rule when DisableIPv6=true")
+	}
+	if directIdx < 0 || globalIdx < 0 || cnIdx < 0 {
+		t.Fatalf("expected Direct (%d), Global (%d), and geosite-cn (%d) DNS rules", directIdx, globalIdx, cnIdx)
+	}
+	if !(aaaaIdx < directIdx && aaaaIdx < globalIdx && aaaaIdx < cnIdx) {
+		t.Fatalf("expected AAAA/HTTPS NOERROR rule (%d) BEFORE Direct (%d), Global (%d), and geosite-cn (%d)", aaaaIdx, directIdx, globalIdx, cnIdx)
+	}
+
+	// Verify route rules place BypassLAN (ip_is_private -> direct) and 2000::/3 -> reject BEFORE clash_mode: Global.
+	routeObj, _ := doc["route"].(map[string]any)
+	routeRules, _ := routeObj["rules"].([]any)
+	lanIdx, ipv6RejectIdx, routeGlobalIdx := -1, -1, -1
+	for idx, raw := range routeRules {
+		m, _ := raw.(map[string]any)
+		if m["outbound"] == "direct" && lanIdx < 0 {
+			if priv, _ := m["ip_is_private"].(bool); priv {
+				lanIdx = idx
+			} else if cidrs, ok := m["ip_cidr"].([]any); ok {
+				for _, c := range cidrs {
+					if c == "192.168.0.0/16" {
+						lanIdx = idx
+						break
+					}
+				}
+			}
+		}
+		if cidrs, ok := m["ip_cidr"].([]any); ok && m["action"] == "reject" {
+			for _, c := range cidrs {
+				if c == "2000::/3" && ipv6RejectIdx < 0 {
+					ipv6RejectIdx = idx
+				}
+			}
+		}
+		if m["clash_mode"] == "Global" && routeGlobalIdx < 0 {
+			routeGlobalIdx = idx
+		}
+	}
+	if lanIdx < 0 || ipv6RejectIdx < 0 || routeGlobalIdx < 0 {
+		t.Fatalf("expected lan (%d), ipv6 reject (%d), and Global (%d) route rules", lanIdx, ipv6RejectIdx, routeGlobalIdx)
+	}
+	if !(lanIdx < routeGlobalIdx && ipv6RejectIdx < routeGlobalIdx) {
+		t.Fatalf("expected BypassLAN (%d) and 2000::/3 reject (%d) BEFORE Global (%d)", lanIdx, ipv6RejectIdx, routeGlobalIdx)
+	}
+}
+
+func TestCompileSystemTailscaleCoexistence(t *testing.T) {
+	bypassTS := true
+	disableIPv6 := true
+	routing := ruleset.DefaultRoutingProfile()
+	routing.BypassSystemTailscale = &bypassTS
+	routing.DisableIPv6 = &disableIPv6
+	routing.WebRTCMode = "block"
+
+	node := &config.Node{
+		ID:       "n1",
+		Name:     "Node 1",
+		Protocol: config.ProtocolSocks,
+		Address:  "198.51.100.10",
+		Port:     1080,
+	}
+	out, err := Compile(CompileInput{
+		Nodes:        []*config.Node{node},
+		Routing:      routing,
+		ActiveNodeID: node.ID,
+		MixedPort:    10808,
+		ClashAPIPort: 9090,
+		EnableTUN:    true,
+		SystemTailscale: &SystemTailscaleInfo{
+			Detected:       true,
+			Interface:      "tailscale0",
+			IPv4:           "100.64.10.20",
+			MagicDNSActive: true,
+			SearchDomains:  []string{"tail1234.ts.net"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Compile with SystemTailscale failed: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out.Raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// 1. DNS: system-tailscale-dns server exists (detouring to system-tailscale-direct) and its rule precedes AAAA/HTTPS NOERROR.
+	dnsObj, _ := doc["dns"].(map[string]any)
+	servers, _ := dnsObj["servers"].([]any)
+	foundSysDNSServer := false
+	for _, raw := range servers {
+		m, _ := raw.(map[string]any)
+		if m["tag"] == "system-tailscale-dns" && m["server"] == "100.100.100.100" && m["detour"] == "system-tailscale-direct" {
+			foundSysDNSServer = true
+		}
+	}
+	if !foundSysDNSServer {
+		t.Fatalf("expected system-tailscale-dns server (100.100.100.100 -> system-tailscale-direct) in DNS config")
+	}
+
+	dnsRules, _ := dnsObj["rules"].([]any)
+	sysTsDNSIdx, aaaaIdx := -1, -1
+	for idx, raw := range dnsRules {
+		m, _ := raw.(map[string]any)
+		if m["server"] == "system-tailscale-dns" && sysTsDNSIdx < 0 {
+			sysTsDNSIdx = idx
+		}
+		if m["action"] == "predefined" && m["rcode"] == "NOERROR" && aaaaIdx < 0 {
+			aaaaIdx = idx
+		}
+	}
+	if sysTsDNSIdx < 0 || aaaaIdx < 0 || sysTsDNSIdx > aaaaIdx {
+		t.Fatalf("expected system-tailscale-dns rule (%d) BEFORE AAAA/HTTPS NOERROR (%d)", sysTsDNSIdx, aaaaIdx)
+	}
+
+	// 2. Route: 100.64.0.0/10 & fd7a:115c:a1e0::/48 route to system-tailscale-direct before Global; tailscaled UDP 3478 exempted direct before WebRTC reject.
+	routeObj, _ := doc["route"].(map[string]any)
+	routeRules, _ := routeObj["rules"].([]any)
+	sysTsRouteIdx, globalIdx, stunExemptIdx, webrtcRejectIdx := -1, -1, -1, -1
+	for idx, raw := range routeRules {
+		m, _ := raw.(map[string]any)
+		if m["outbound"] == "system-tailscale-direct" {
+			if cidrs, ok := m["ip_cidr"].([]any); ok {
+				hasCGNAT := false
+				hasTS6 := false
+				for _, c := range cidrs {
+					if c == "100.64.0.0/10" {
+						hasCGNAT = true
+					}
+					if c == "fd7a:115c:a1e0::/48" {
+						hasTS6 = true
+					}
+				}
+				if hasCGNAT && hasTS6 && sysTsRouteIdx < 0 {
+					sysTsRouteIdx = idx
+				}
+			}
+		}
+		if m["outbound"] == "direct" {
+			if procs, ok := m["process_name"].([]any); ok {
+				for _, p := range procs {
+					if p == "tailscaled" && stunExemptIdx < 0 {
+						stunExemptIdx = idx
+					}
+				}
+			}
+		}
+		if m["clash_mode"] == "Global" && globalIdx < 0 {
+			globalIdx = idx
+		}
+		if m["action"] == "reject" {
+			if ports, ok := m["port"].([]any); ok {
+				for _, p := range ports {
+					if f, ok := p.(float64); ok && int(f) == 3478 && webrtcRejectIdx < 0 {
+						webrtcRejectIdx = idx
+					}
+				}
+			}
+		}
+	}
+	if sysTsRouteIdx < 0 || globalIdx < 0 || sysTsRouteIdx > globalIdx {
+		t.Fatalf("expected System Tailscale CIDR direct rule (%d) BEFORE Global (%d)", sysTsRouteIdx, globalIdx)
+	}
+	if stunExemptIdx < 0 || webrtcRejectIdx < 0 || stunExemptIdx > webrtcRejectIdx {
+		t.Fatalf("expected tailscaled UDP 3478 exemption (%d) BEFORE WebRTC reject (%d)", stunExemptIdx, webrtcRejectIdx)
+	}
+	if binary := os.Getenv("SINGBOX_TEST_BINARY"); binary != "" {
+		cfgPath := filepath.Join(t.TempDir(), "sing-box-sys-ts.json")
+		if err := os.WriteFile(cfgPath, out.Raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
+			t.Fatalf("sing-box check failed for System Tailscale coexistence config: %v\n%s", err, output)
+		}
+	}
+}
+
+func TestCompileWebRTCProxyLocalDoHIMDSAndInvertedLBAffinity(t *testing.T) {
+	disableIPv6 := true
+	bypassTS := true
+	routing := ruleset.DefaultRoutingProfile()
+	routing.Mode = "rule"
+	routing.WebRTCMode = "proxy"
+	routing.BypassLAN = true
+	routing.DisableIPv6 = &disableIPv6
+	routing.BypassSystemTailscale = &bypassTS
+	routing.LocalDNS = "https://dns.alidns.com/dns-query"
+	routing.RemoteDNS = "https://dns.google/dns-query"
+	routing.CustomRules = []ruleset.RoutingRule{
+		{
+			ID:           "inv-1",
+			Name:         "Invert to LB",
+			Enabled:      true,
+			DomainSuffix: []string{"excluded.example"},
+			Invert:       true,
+			Outbound:     "g-lb",
+		},
+	}
+
+	out, err := Compile(CompileInput{
+		Nodes: []*config.Node{
+			{ID: "n1", Name: "N1", Protocol: config.ProtocolSocks, Address: "198.51.100.1", Port: 1080, Latency: 20},
+			{ID: "n2", Name: "N2", Protocol: config.ProtocolSocks, Address: "198.51.100.2", Port: 1080, Latency: 30},
+		},
+		Groups: []storage.Group{
+			{ID: "g-lb", Name: "LB", Strategy: "loadbalance", NodeIDs: []string{"n1", "n2"}},
+		},
+		Routing:       routing,
+		ActiveGroupID: "g-lb",
+		EnableTUN:     true,
+		SystemTailscale: &SystemTailscaleInfo{
+			Detected:  true,
+			Interface: "tailscale0",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Compile failed: %v", err)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(out.Raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Both local & remote DoH hosts populate doh-bootstrap-dns.
+	dnsObj, _ := doc["dns"].(map[string]any)
+	servers, _ := dnsObj["servers"].([]any)
+	foundLocalDoH, foundMergedBootstrap := false, false
+	for _, rawSrv := range servers {
+		m, _ := rawSrv.(map[string]any)
+		if m["tag"] == "local-dns" && m["domain_resolver"] == "doh-bootstrap-dns" {
+			foundLocalDoH = true
+		}
+		if m["tag"] == "doh-bootstrap-dns" {
+			pre, _ := m["predefined"].(map[string]any)
+			if _, ok1 := pre["dns.alidns.com"]; ok1 {
+				if _, ok2 := pre["dns.google"]; ok2 {
+					foundMergedBootstrap = true
+				}
+			}
+		}
+	}
+	if !foundLocalDoH || !foundMergedBootstrap {
+		t.Fatalf("expected merged local/remote doh-bootstrap-dns (local=%v merged=%v)", foundLocalDoH, foundMergedBootstrap)
+	}
+
+	// 2. WebRTC proxy DNS rules resolve stun. and turn. via remote-dns.
+	dnsRules, _ := dnsObj["rules"].([]any)
+	hasStunDNS, hasTurnDNS := false, false
+	for _, rawRule := range dnsRules {
+		m, _ := rawRule.(map[string]any)
+		if m["server"] == "remote-dns" {
+			if _, ok := m["domain_keyword"]; ok {
+				hasStunDNS = true
+			}
+			if _, ok := m["domain_regex"]; ok {
+				hasTurnDNS = true
+			}
+		}
+	}
+	if !hasStunDNS || !hasTurnDNS {
+		t.Fatalf("expected WebRTC proxy DNS stun/turn remote-dns rules, got stun=%v turn=%v", hasStunDNS, hasTurnDNS)
+	}
+
+	// 3. Route ordering: IMDS reject -> BypassLAN -> 2000::/3 reject -> tailscaled exempt -> WebRTC proxy -> inverted LB logical affinity.
+	routeObj, _ := doc["route"].(map[string]any)
+	routeRules, _ := routeObj["rules"].([]any)
+	imdsIdx, lanIdx, v6Idx, tsExemptIdx, stunProxyIdx, turnTCPIdx := -1, -1, -1, -1, -1, -1
+	invertedAffinityIsolated := false
+	for idx, rawR := range routeRules {
+		m, _ := rawR.(map[string]any)
+		if cidrs, ok := m["ip_cidr"].([]any); ok && len(cidrs) > 0 && cidrs[0] == "169.254.169.254/32" && m["action"] == "reject" {
+			imdsIdx = idx
+		}
+		if m["ip_is_private"] == true && m["outbound"] == "direct" && lanIdx < 0 {
+			lanIdx = idx
+		}
+		if cidrs, ok := m["ip_cidr"].([]any); ok && len(cidrs) == 1 && cidrs[0] == "2000::/3" && m["action"] == "reject" {
+			v6Idx = idx
+		}
+		if procs, ok := m["process_name"].([]any); ok && len(procs) > 0 && procs[0] == "tailscaled" && m["outbound"] == "direct" {
+			tsExemptIdx = idx
+		}
+		if kw, ok := m["domain_keyword"].([]any); ok && len(kw) == 1 && kw[0] == "stun." && m["outbound"] == "lb-shard-g-lb-0" {
+			stunProxyIdx = idx
+		}
+		if netList, ok := m["network"].([]any); ok && len(netList) == 1 && netList[0] == "tcp" && m["outbound"] == "lb-shard-g-lb-0" {
+			turnTCPIdx = idx
+		}
+		if m["type"] == "logical" && m["mode"] == "and" && m["outbound"] == "lb-shard-g-lb-0" {
+			if sub, ok := m["rules"].([]any); ok && len(sub) == 2 {
+				s0, _ := sub[0].(map[string]any)
+				s1, _ := sub[1].(map[string]any)
+				if s0["invert"] == true && s1["domain_suffix"] != nil && s1["invert"] == nil {
+					invertedAffinityIsolated = true
+				}
+			}
+		}
+	}
+	if imdsIdx < 0 || lanIdx <= imdsIdx || v6Idx <= lanIdx || tsExemptIdx <= v6Idx || stunProxyIdx <= tsExemptIdx || turnTCPIdx < 0 {
+		t.Fatalf("unexpected route order: imds=%d lan=%d v6=%d tsExempt=%d stunProxy=%d turnTCP=%d", imdsIdx, lanIdx, v6Idx, tsExemptIdx, stunProxyIdx, turnTCPIdx)
+	}
+	if !invertedAffinityIsolated {
+		t.Fatalf("expected inverted custom rule affinity to isolate invert inside logical and subrule")
+	}
+
+	if binary := os.Getenv("SINGBOX_TEST_BINARY"); binary != "" {
+		cfgPath := filepath.Join(t.TempDir(), "sing-box-webrtc-proxy.json")
+		if err := os.WriteFile(cfgPath, out.Raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if output, err := exec.Command(binary, "check", "-c", cfgPath).CombinedOutput(); err != nil {
+			t.Fatalf("sing-box check failed: %v\n%s", err, output)
+		}
+	}
+
+	// Custom local DoH domain emits system-local-bootstrap resolver.
+	routing2 := ruleset.DefaultRoutingProfile()
+	routing2.LocalDNS = "https://custom-doh.example.org/dns-query"
+	out2, err := Compile(CompileInput{Nodes: []*config.Node{{ID: "n1", Name: "N1", Protocol: config.ProtocolSocks, Address: "198.51.100.1", Port: 1080}}, Routing: routing2})
+	if err != nil || !strings.Contains(string(out2.Raw), `"tag": "system-local-bootstrap"`) {
+		t.Fatalf("expected system-local-bootstrap for custom local DoH domain, err=%v", err)
+	}
+
+	// Verify Simulator alignment with IMDS reject and BypassLAN > WebRTC > TURN TCP.
+	if simIMDS := ruleset.Simulate(ruleset.RoutingProfile{Mode: "rule", BypassLAN: true}, ruleset.SimulationInput{IP: "169.254.169.254", Port: 80}); simIMDS.Action != "reject" {
+		t.Fatalf("expected cloud metadata IP rejected in Simulate, got %+v", simIMDS)
+	}
+	if simLanStun := ruleset.Simulate(ruleset.RoutingProfile{Mode: "rule", BypassLAN: true, WebRTCMode: "proxy"}, ruleset.SimulationInput{IP: "192.168.1.20", Network: "udp", Port: 3478}); simLanStun.Outbound != "direct" {
+		t.Fatalf("expected LAN UDP 3478 direct before WebRTC proxy, got %+v", simLanStun)
+	}
+	if simTurnTCP := ruleset.Simulate(ruleset.RoutingProfile{Mode: "rule", BypassCN: true, WebRTCMode: "proxy"}, ruleset.SimulationInput{Domain: "turn.qq.com", Network: "tcp", Port: 5349}); simTurnTCP.Outbound != "proxy" {
+		t.Fatalf("expected TURN TCP 5349 proxied before BypassCN, got %+v", simTurnTCP)
 	}
 }

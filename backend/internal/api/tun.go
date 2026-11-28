@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -19,13 +21,14 @@ import (
 func (s *Server) StopTUN() error {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
-	wasTUN := s.tunEnabled || s.ensureOrchestrator().Status().TUNEnabled
-	s.tunEnabled = false
+	rs := s.runtimeState()
+	wasTUN := rs.tunEnabled || s.ensureOrchestrator().Status().TUNEnabled
+	s.setTunEnabledState(false)
 	if s.store != nil {
 		_ = s.store.PutSetting("runtime.tun_enabled", false)
 	}
 	if s.ensureOrchestrator().Status().Running && wasTUN {
-		_, err := s.reconcileRuntime(context.Background(), s.activeNodeID, s.activeGroupID, false)
+		_, err := s.reconcileRuntime(context.Background(), rs.activeNodeID, rs.activeGroupID, false)
 		if runtime.GOOS == "linux" {
 			_ = tun.CleanupStaleRoutes(context.Background(), s.effectiveSudoPassword())
 		}
@@ -42,9 +45,13 @@ func (s *Server) StopTUN() error {
 func (s *Server) ShutdownCleanup(ctx context.Context) error {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
-	if s.androidTun != nil {
-		s.androidTun.Stop()
+	s.androidVPNMu.Lock()
+	androidTun := s.androidTun
+	s.androidVPNMu.Unlock()
+	if androidTun != nil {
+		androidTun.Stop()
 	}
+	s.stopHubAndFlushLedger()
 	orch := s.ensureOrchestrator()
 	wasTUN := orch.Status().TUNEnabled
 	err := orch.Stop()
@@ -71,10 +78,10 @@ func (s *Server) resolvePersistentSingBoxBinary() (string, error) {
 		if stageErr != nil {
 			return "", fmt.Errorf("无法将 AppImage 内置 sing-box 复制到持久目录：%w", stageErr)
 		}
+		// Never overwrite core.singbox.active in SQLite with an ephemeral-staged path; otherwise
+		// subsequent AppImage / macOS .app upgrades stay pinned to the stale staged binary forever
+		// instead of re-staging via StageEphemeralCore's SHA-256 check on next launch.
 		s.SetSingBoxPath(staged)
-		if s.store != nil {
-			_ = s.store.PutSetting("core.singbox.active", staged)
-		}
 		return staged, nil
 	}
 	return sbBin, nil
@@ -95,6 +102,48 @@ func (s *Server) handleTUNPrivilege(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func (s *Server) isManagedSingBoxPath(binPath string) bool {
+	realBin, err := filepath.EvalSymlinks(binPath)
+	if err != nil {
+		realBin = binPath
+	}
+	realBin, err = filepath.Abs(realBin)
+	if err != nil {
+		return false
+	}
+	base := filepath.Base(realBin)
+	if base != "sing-box" && !strings.HasPrefix(base, "sing-box-") {
+		return false
+	}
+	allowedRoots := []string{"/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/usr/lib/prismray", "/usr/lib/prismray-server"}
+	if s.cfg != nil {
+		if dd := strings.TrimSpace(s.cfg.DataDir()); dd != "" {
+			allowedRoots = append(allowedRoots, dd)
+		}
+		if rd := strings.TrimSpace(s.cfg.RuntimeDir()); rd != "" {
+			allowedRoots = append(allowedRoots, rd)
+		}
+	}
+	if exe, exeErr := os.Executable(); exeErr == nil && exe != "" {
+		exeDir := filepath.Dir(exe)
+		allowedRoots = append(allowedRoots, exeDir, filepath.Clean(filepath.Join(exeDir, "..", "lib", "prismray")))
+	}
+	for _, root := range allowedRoots {
+		absRoot, rErr := filepath.Abs(root)
+		if rErr != nil {
+			continue
+		}
+		if resolvedRoot, symErr := filepath.EvalSymlinks(absRoot); symErr == nil {
+			absRoot = resolvedRoot
+		}
+		rel, relErr := filepath.Rel(absRoot, realBin)
+		if relErr == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleTUNAuthorize(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -103,6 +152,10 @@ func (s *Server) handleTUNAuthorize(w http.ResponseWriter, r *http.Request) {
 	sbBin, err := s.resolvePersistentSingBoxBinary()
 	if err != nil {
 		http.Error(w, "未找到 sing-box 核心："+err.Error(), http.StatusPreconditionFailed)
+		return
+	}
+	if !s.isManagedSingBoxPath(sbBin) {
+		http.Error(w, "拒绝为受管目录之外的可执行文件授予网络权限", http.StatusForbidden)
 		return
 	}
 	if err := tun.AuthorizeWithPkexec(r.Context(), sbBin); err != nil {
@@ -119,11 +172,12 @@ func (s *Server) handleTUNAuthorize(w http.ResponseWriter, r *http.Request) {
 		s.opMu.Lock()
 		orch := s.ensureOrchestrator()
 		st := orch.Status()
-		shouldEnableTUN := s.tunEnabled && (!st.Running || !st.TUNEnabled)
+		rs := s.runtimeState()
+		shouldEnableTUN := rs.tunEnabled && ((st.Running && !st.TUNEnabled) || (!st.Running && rs.wantRunning))
 		if shouldEnableTUN && s.store != nil && len(s.store.List()) > 0 {
-			if nextSt, recErr := s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, true); recErr == nil {
+			if nextSt, recErr := s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, true); recErr == nil {
 				reconciled = nextSt.Running && nextSt.TUNEnabled
-				if s.systemProxyWanted && nextSt.Running && nextSt.MixedPort > 0 && !s.proxyManager().Active() {
+				if rs.systemProxyWanted && nextSt.Running && nextSt.MixedPort > 0 && !s.proxyManager().Active() {
 					_ = s.proxyManager().Enable(nextSt.MixedPort)
 				}
 			} else {
@@ -151,7 +205,8 @@ func (s *Server) handleTUN(w http.ResponseWriter, r *http.Request) {
 		sbBin, _ := s.resolvePersistentSingBoxBinary()
 		priv := tun.CheckPrivilege(sbBin)
 		st := s.ensureOrchestrator().Status()
-		stack := s.tunStack
+		rs := s.runtimeState()
+		stack := rs.tunStack
 		if stack == "" {
 			if runtime.GOOS == "linux" {
 				stack = "mixed"
@@ -159,12 +214,14 @@ func (s *Server) handleTUN(w http.ResponseWriter, r *http.Request) {
 				stack = "gvisor"
 			}
 		}
+		tunActive := st.Running && st.TUNEnabled
 		writeJSON(w, http.StatusOK, map[string]any{
-			"enabled":     (st.Running && st.TUNEnabled) || (s.tunEnabled && priv.ReadyWithoutPassword),
-			"running":     st.Running && st.TUNEnabled,
+			"enabled":     tunActive,
+			"running":     tunActive,
+			"preferred":   rs.tunEnabled,
 			"stack":       stack,
-			"node_id":     s.activeNodeID,
-			"group_id":    s.activeGroupID,
+			"node_id":     rs.activeNodeID,
+			"group_id":    rs.activeGroupID,
 			"privilege":   priv,
 			"sudo_cached": len(s.effectiveSudoPassword()) > 0,
 		})
@@ -189,7 +246,11 @@ func (s *Server) handleTUN(w http.ResponseWriter, r *http.Request) {
 	if req.Stack != "" {
 		switch strings.ToLower(strings.TrimSpace(req.Stack)) {
 		case "system", "gvisor", "mixed":
-			s.tunStack = strings.ToLower(strings.TrimSpace(req.Stack))
+			stack := strings.ToLower(strings.TrimSpace(req.Stack))
+			s.setTunStackState(stack)
+			if s.store != nil {
+				_ = s.store.PutSetting("runtime.tun_stack", stack)
+			}
 		default:
 			http.Error(w, "TUN stack must be system, gvisor, or mixed", http.StatusBadRequest)
 			return
@@ -224,11 +285,12 @@ func (s *Server) handleTUN(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	rs := s.runtimeState()
 	targetNodeID := strings.TrimSpace(req.NodeID)
 	targetGroupID := strings.TrimSpace(req.GroupID)
 	if targetNodeID == "" && targetGroupID == "" {
-		targetNodeID = s.activeNodeID
-		targetGroupID = s.activeGroupID
+		targetNodeID = rs.activeNodeID
+		targetGroupID = rs.activeGroupID
 	}
 
 	st, err := s.reconcileRuntime(r.Context(), targetNodeID, targetGroupID, true)
@@ -236,12 +298,13 @@ func (s *Server) handleTUN(w http.ResponseWriter, r *http.Request) {
 		respondError(w, err, http.StatusBadGateway)
 		return
 	}
-	if s.systemProxyWanted && st.Running && st.MixedPort > 0 && s.mode != authservice.ModeAndroid && !s.proxyManager().Active() {
+	rsAfter := s.runtimeState()
+	if rsAfter.systemProxyWanted && st.Running && st.MixedPort > 0 && s.mode != authservice.ModeAndroid && !s.proxyManager().Active() {
 		_ = s.proxyManager().Enable(st.MixedPort)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"enabled":  true,
-		"node_id":  s.activeNodeID,
-		"group_id": s.activeGroupID,
+		"node_id":  rsAfter.activeNodeID,
+		"group_id": rsAfter.activeGroupID,
 	})
 }

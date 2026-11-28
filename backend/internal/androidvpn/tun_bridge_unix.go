@@ -148,6 +148,7 @@ func (b *TunBridge) handleConn(conn *net.UnixConn) {
 	}
 	mixedPort := b.mixedPort
 	mtu := b.mtu
+	DefaultAppRoutingProxy.ResetTrafficTotals()
 	startErr := b.engine.Start(receivedFD, mixedPort, mtu)
 	if startErr != nil {
 		b.mu.Unlock()
@@ -167,6 +168,11 @@ func (b *TunBridge) handleConn(conn *net.UnixConn) {
 // ConfigureAppRouting updates live Android per-app routing settings used by tun2socks.
 func (b *TunBridge) ConfigureAppRouting(cfg AppRoutingConfig) {
 	DefaultAppRoutingProxy.Update(cfg)
+}
+
+// TrafficTotals returns cumulative uploaded/downloaded bytes tracked by the embedded tun2socks proxy.
+func (b *TunBridge) TrafficTotals() (tx int64, rx int64) {
+	return DefaultAppRoutingProxy.TrafficTotals()
 }
 
 // Active reports whether the embedded TUN forwarder is currently running.

@@ -5,6 +5,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -27,8 +28,10 @@ const (
 	LinuxAutoRedirectOutputMark uint32 = 0x21782
 	// BlockOutboundTag identifies the fail-closed block outbound used by Kill Switch.
 	BlockOutboundTag = "block-out"
-	// MaxLoadBalanceShards caps simultaneous load-balance exit shards to curb battery/CPU overhead.
-	MaxLoadBalanceShards = 4
+	// MaxLoadBalanceShards is the default concurrent exit shard count for domain-hash load-balance groups.
+	MaxLoadBalanceShards = storage.DefaultLoadBalanceShards
+	// MaxLoadBalanceShardsLimit is the hard upper bound matching the 36-char domain-hash alphabet [a-z0-9].
+	MaxLoadBalanceShardsLimit = storage.MaxLoadBalanceShardsLimit
 	// AndroidAppInboundTag identifies the authenticated loopback SOCKS5 inbound used for Android per-app rules.
 	AndroidAppInboundTag = "android-app-in"
 	// AndroidAppOtherUser is the fallback SOCKS5 username for Android apps not matching any watched package rule.
@@ -59,14 +62,19 @@ type CompileInput struct {
 	IncludeNaive          bool
 	ForceRemoteRules      bool
 	CacheFilePath         string
+	HighLatencyMS         int
+	Tailscale             *ruleset.TailscaleConfig
+	TailscaleStateDir     string
+	SystemTailscale       *SystemTailscaleInfo
 }
 
 // CompileOutput holds the generated JSON bytes alongside structural diagnostics.
 type CompileOutput struct {
-	Raw          []byte
-	ActiveTag    string
-	IncludedTags map[string]bool
-	SkippedNaive []string
+	Raw            []byte
+	ActiveTag      string
+	IncludedTags   map[string]bool
+	SkippedNaive   []string
+	LBShardTargets map[string][]string
 }
 
 // CronetAvailable checks whether libcronet shared library exists alongside sing-box
@@ -100,6 +108,11 @@ func GroupTag(id string) string { return "group-" + id }
 // GroupAutoTag returns the internal urltest/failover auto-selection outbound tag wrapped by GroupTag.
 func GroupAutoTag(id string) string { return "group-" + id + "-auto" }
 
+// LBShardSelectorTag returns the deterministic selector wrapper tag for load-balance shard i.
+func LBShardSelectorTag(groupID string, idx int) string {
+	return fmt.Sprintf("lb-shard-%s-%d", groupID, idx)
+}
+
 // GroupScopedNodeTag returns the scoped sing-box outbound tag used when a member node
 // is dialed through a policy group that configures its own detour relay.
 func GroupScopedNodeTag(nodeID, groupID string) string {
@@ -121,7 +134,7 @@ func ValidateGroupInterval(raw string) error {
 
 // normalizeGroupTiming sanitizes urltest/failover interval and tolerance values so sing-box
 // never exits at startup (e.g. missing duration unit, tolerance > uint16, or interval > idle_timeout).
-func normalizeGroupTiming(rawInterval, defaultInterval string, rawTol, defaultTol int) (interval, idleTimeout string, tol int) {
+func normalizeGroupTiming(rawInterval, defaultInterval string, rawTol, defaultTol int, androidMode bool) (interval, idleTimeout string, tol int) {
 	s := strings.TrimSpace(rawInterval)
 	if s == "" {
 		s = defaultInterval
@@ -140,8 +153,19 @@ func normalizeGroupTiming(rawInterval, defaultInterval string, rawTol, defaultTo
 			s = d.String()
 		}
 	}
-	const defaultIdleTimeout = 30 * time.Minute
-	if d > defaultIdleTimeout {
+	const defaultDesktopIdleTimeout = 30 * time.Minute
+	const defaultAndroidIdleTimeout = 10 * time.Minute
+	if androidMode {
+		// On Android, stop periodic urltest probing quickly once the device is idle to let 4G/5G radio sleep.
+		idle := defaultAndroidIdleTimeout
+		if d*2 > idle {
+			idle = d * 2
+		}
+		if idle < d {
+			idle = d
+		}
+		idleTimeout = idle.String()
+	} else if d > defaultDesktopIdleTimeout {
 		idle := d * 2
 		if idle < d {
 			idle = d
@@ -340,6 +364,11 @@ func ValidateAllDetours(nodes []*config.Node, groups []storage.Group) error {
 	return nil
 }
 
+// EffectiveLoadBalanceShards resolves a load-balance group's configured concurrent exit shard count (default 4, max 36).
+func EffectiveLoadBalanceShards(g storage.Group) int {
+	return storage.EffectiveGroupLoadBalanceShards(g.LoadBalanceShards)
+}
+
 // Compile builds a complete sing-box 1.14+ configuration document.
 func Compile(in CompileInput) (*CompileOutput, error) {
 	routing := in.Routing
@@ -364,6 +393,7 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 			"direct":         true,
 			BlockOutboundTag: true,
 		},
+		LBShardTargets: map[string][]string{},
 	}
 
 	nodeMap := make(map[string]*config.Node, len(in.Nodes))
@@ -421,7 +451,7 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 			continue
 		}
 
-		ob, err := compileOutbound(n, tag, in.ProtectPath)
+		ob, err := compileOutbound(n, tag, in.ProtectPath, in.AndroidMode)
 		if err != nil {
 			return nil, err
 		}
@@ -441,7 +471,7 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 		strategy := storage.CanonicalGroupStrategy(g.Strategy)
 		switch strategy {
 		case "urltest":
-			interval, idleTimeout, tol := normalizeGroupTiming(g.Interval, "5m", g.ToleranceMS, 50)
+			interval, idleTimeout, tol := normalizeGroupTiming(g.Interval, "5m", g.ToleranceMS, 50, in.AndroidMode)
 			ob := map[string]any{
 				"type":      "urltest",
 				"tag":       tag,
@@ -455,7 +485,21 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 			}
 			return ob
 		case "failover":
-			interval, idleTimeout, tol := normalizeGroupTiming(g.Interval, "1m", g.ToleranceMS, 1000)
+			trigger := storage.CanonicalFailoverTrigger(g.FailoverTrigger)
+			defaultTol := g.HighLatencyMS
+			if defaultTol <= 0 {
+				defaultTol = in.HighLatencyMS
+			}
+			if defaultTol <= 0 {
+				defaultTol = 800
+			}
+			rawTol := g.ToleranceMS
+			if trigger == "unavailable_only" {
+				// Stick firmly to the primary healthy node; only fail over when unreachable/timeout.
+				rawTol = 65535
+				defaultTol = 65535
+			}
+			interval, idleTimeout, tol := normalizeGroupTiming(g.Interval, "5m", rawTol, defaultTol, in.AndroidMode)
 			ob := map[string]any{
 				"type":      "urltest",
 				"tag":       tag,
@@ -469,7 +513,7 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 			}
 			return ob
 		case "loadbalance":
-			interval, idleTimeout, tol := normalizeGroupTiming(g.Interval, "10m", g.ToleranceMS, 150)
+			interval, idleTimeout, tol := normalizeGroupTiming(g.Interval, "10m", g.ToleranceMS, 150, in.AndroidMode)
 			ob := map[string]any{
 				"type":      "urltest",
 				"tag":       tag,
@@ -574,8 +618,9 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 			if len(healthy) == 0 {
 				healthy = append(healthy, members...)
 			}
-			if len(healthy) > MaxLoadBalanceShards {
-				healthy = healthy[:MaxLoadBalanceShards]
+			shardLimit := EffectiveLoadBalanceShards(g)
+			if len(healthy) > shardLimit {
+				healthy = healthy[:shardLimit]
 			}
 			if len(healthy) > 1 {
 				lbShards[gtag] = healthy
@@ -704,7 +749,7 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 			return scopedTag
 		}
 
-		ob, err := compileOutbound(n, scopedTag, "")
+		ob, err := compileOutbound(n, scopedTag, "", in.AndroidMode)
 		if err != nil {
 			delete(scopedCache, cacheKey)
 			return NodeTag(n.ID)
@@ -781,13 +826,95 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 			if len(remapped) == 0 {
 				remapped = append(remapped, scopedMembers...)
 			}
-			if len(remapped) > MaxLoadBalanceShards {
-				remapped = remapped[:MaxLoadBalanceShards]
+			shardLimit := EffectiveLoadBalanceShards(g)
+			if len(remapped) > shardLimit {
+				remapped = remapped[:shardLimit]
 			}
 			if len(remapped) > 1 {
 				lbShards[gtag] = remapped
 			}
 		}
+	}
+
+	// Wrap every active load-balance shard in its own selector (<tag> -> [memberTag, block-out])
+	// so Kill Switch can atomically sever sharded egress without restarting TUN.
+	for _, g := range in.Groups {
+		gtag := GroupTag(g.ID)
+		shards := lbShards[gtag]
+		if len(shards) <= 1 {
+			continue
+		}
+		origMembers := append([]string(nil), shards...)
+		wrapped := make([]string, len(origMembers))
+		for i, memberTag := range origMembers {
+			shardSelTag := LBShardSelectorTag(g.ID, i)
+			outbounds = append(outbounds, map[string]any{
+				"type":                        "selector",
+				"tag":                         shardSelTag,
+				"outbounds":                   []string{memberTag, BlockOutboundTag},
+				"default":                     memberTag,
+				"interrupt_exist_connections": true,
+			})
+			out.IncludedTags[shardSelTag] = true
+			wrapped[i] = shardSelTag
+		}
+		lbShards[gtag] = wrapped
+		out.LBShardTargets[g.ID] = origMembers
+	}
+
+	// Mount built-in parallel Tailscale / Headscale mesh endpoint when enabled.
+	if in.Tailscale != nil && in.Tailscale.Enabled {
+		tsCfg := *in.Tailscale
+		tsCfg.Normalize()
+		ep := map[string]any{
+			"type":          "tailscale",
+			"tag":           ruleset.TailscaleEndpointTag,
+			"hostname":      tsCfg.Hostname,
+			"accept_routes": tsCfg.AcceptRoutes,
+			"udp_timeout":   tsCfg.UDPTimeout,
+		}
+		if dir := strings.TrimSpace(in.TailscaleStateDir); dir != "" {
+			ep["state_directory"] = dir
+		}
+		if tsCfg.AuthKey != "" {
+			ep["auth_key"] = tsCfg.AuthKey
+		}
+		if tsCfg.ControlURL != "" {
+			ep["control_url"] = tsCfg.ControlURL
+		}
+		if tsCfg.Ephemeral {
+			ep["ephemeral"] = true
+		}
+		if tsCfg.ExitNode != "" {
+			ep["exit_node"] = tsCfg.ExitNode
+			if tsCfg.ExitNodeAllowLAN {
+				ep["exit_node_allow_lan_access"] = true
+			}
+		}
+		if len(tsCfg.AdvertiseRoutes) > 0 {
+			ep["advertise_routes"] = tsCfg.AdvertiseRoutes
+		}
+		if tsCfg.AdvertiseExitNode {
+			ep["advertise_exit_node"] = true
+		}
+		detourTag := ""
+		if tsCfg.DetourID != "" {
+			if resolved := resolveRelayTag(tsCfg.DetourID); resolved != "" && resolved != "direct" {
+				detourTag = resolved
+			}
+		}
+		if detourTag != "" {
+			ep["detour"] = detourTag
+			if routing.Mode != "direct" {
+				ep["domain_resolver"] = "remote-dns"
+			}
+		} else if in.ProtectPath != "" {
+			// Direct Tailscale control/DERP connections must omit "detour": "direct"
+			// (sing-box rejects detouring to an empty direct outbound) and protect sockets on Android.
+			ep["protect_path"] = in.ProtectPath
+		}
+		endpoints = append(endpoints, ep)
+		out.IncludedTags[ruleset.TailscaleEndpointTag] = true
 	}
 
 	// Determine top-level "proxy" selector members and default.
@@ -913,8 +1040,25 @@ func Compile(in CompileInput) (*CompileOutput, error) {
 		}
 	}
 
-	dnsObj := buildDNS(routing, in.Nodes, ruleSetTags, in.ProtectPath)
-	routeObj := buildRoute(routing, in, in.Listeners, listenerTargets, compiledRuleSets, ruleSetTags, out.IncludedTags, nameToTag, lbShards, out.ActiveTag)
+	var sysTS SystemTailscaleInfo
+	if !in.AndroidMode && (in.Tailscale == nil || !in.Tailscale.Enabled) && routing.BypassSystemTailscaleEnabled() {
+		if in.SystemTailscale != nil {
+			sysTS = *in.SystemTailscale
+		} else {
+			sysTS = DetectSystemTailscale()
+		}
+		if sysTS.Detected && sysTS.Interface != "" {
+			outbounds = append(outbounds, map[string]any{
+				"type":           "direct",
+				"tag":            "system-tailscale-direct",
+				"bind_interface": sysTS.Interface,
+			})
+			out.IncludedTags["system-tailscale-direct"] = true
+		}
+	}
+
+	dnsObj := buildDNS(routing, in.Nodes, ruleSetTags, in.ProtectPath, in.Tailscale, in.AndroidMode, sysTS)
+	routeObj := buildRoute(routing, in, in.Listeners, listenerTargets, compiledRuleSets, ruleSetTags, out.IncludedTags, nameToTag, lbShards, out.ActiveTag, sysTS)
 
 	clashMode := "Rule"
 	switch routing.Mode {
@@ -980,8 +1124,11 @@ func buildDirectOutbound(protectPath string) map[string]any {
 func buildInbounds(in CompileInput) []map[string]any {
 	var inbounds []map[string]any
 	if in.EnableTUN && !in.AndroidMode {
-		tunAddresses := []string{"172.19.0.1/30"}
-		tunExclude := []string{"127.0.0.0/8"}
+		// Always bind dual-stack TUN addresses on Desktop so auto_route captures ::/0 even under
+		// prefer_ipv4; when IPv6 is disabled, the 2000::/3 -> reject rule blocks real ISP IPv6 leaks
+		// while still allowing Tailscale IPv6 ULA (fd7a:115c:a1e0::/48) to reach tailscale-ep.
+		tunAddresses := []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"}
+		tunExclude := []string{"127.0.0.0/8", "::1/128"}
 		if in.Routing.BypassLAN && in.Routing.AllowLANBroadcast {
 			// On Desktop TUN, exclude only non-DNS link-local, multicast (mDNS/SSDP/DLNA), and
 			// broadcast (255.255.255.255 for KDE Connect) ranges at the OS/nftables route layer.
@@ -993,14 +1140,9 @@ func buildInbounds(in CompileInput) []map[string]any {
 				"169.254.0.0/16",
 				"224.0.0.0/4",
 				"240.0.0.0/4",
+				"fe80::/10",
+				"ff00::/8",
 			)
-		}
-		if in.Routing.IPv6Enabled() {
-			tunAddresses = append(tunAddresses, "fdfe:dcba:9876::1/126")
-			tunExclude = append(tunExclude, "::1/128")
-			if in.Routing.BypassLAN && in.Routing.AllowLANBroadcast {
-				tunExclude = append(tunExclude, "fe80::/10", "ff00::/8")
-			}
 		}
 		tun := map[string]any{
 			"type":                  "tun",
@@ -1139,6 +1281,23 @@ func isLiteralIPHost(host string) bool {
 	return err == nil
 }
 
+func splitDNSHostPort(raw string, defaultPort int) (string, int) {
+	clean := strings.TrimSpace(raw)
+	if clean == "" {
+		return "", 0
+	}
+	if h, pStr, err := net.SplitHostPort(clean); err == nil {
+		if p, pErr := strconv.Atoi(pStr); pErr == nil && p > 0 && p <= 65535 {
+			if p == defaultPort {
+				return strings.ToLower(strings.TrimSpace(h)), 0
+			}
+			return strings.ToLower(strings.TrimSpace(h)), p
+		}
+		return strings.ToLower(strings.TrimSpace(h)), 0
+	}
+	return strings.ToLower(strings.Trim(clean, "[]")), 0
+}
+
 func parseDNSServer(tag, addr string, directServer bool, protectPath string) (map[string]any, string) {
 	addr = strings.TrimSpace(addr)
 	if strings.HasPrefix(addr, "https://") {
@@ -1170,18 +1329,35 @@ func parseDNSServer(tag, addr string, directServer bool, protectPath string) (ma
 						srv["domain_resolver"] = "local-dns"
 					}
 				}
-			} else if protectPath != "" {
-				srv["protect_path"] = protectPath
+			} else {
+				if !isLiteralIPHost(host) {
+					if _, ok := dohBootstrapHosts[host]; ok {
+						srv["domain_resolver"] = "doh-bootstrap-dns"
+						bootstrapHost = host
+					} else {
+						srv["domain_resolver"] = "system-local-bootstrap"
+					}
+				}
+				if protectPath != "" {
+					srv["protect_path"] = protectPath
+				}
 			}
 			return srv, bootstrapHost
 		}
 	}
 	if strings.HasPrefix(addr, "tls://") {
-		host := strings.ToLower(strings.TrimPrefix(addr, "tls://"))
+		rawHost := strings.TrimPrefix(addr, "tls://")
+		if idx := strings.IndexByte(rawHost, '/'); idx >= 0 {
+			rawHost = rawHost[:idx]
+		}
+		host, port := splitDNSHostPort(rawHost, 853)
 		srv := map[string]any{
 			"tag":    tag,
 			"type":   "tls",
 			"server": host,
+		}
+		if port > 0 {
+			srv["server_port"] = port
 		}
 		bootstrapHost := ""
 		if !directServer {
@@ -1194,15 +1370,36 @@ func parseDNSServer(tag, addr string, directServer bool, protectPath string) (ma
 					srv["domain_resolver"] = "local-dns"
 				}
 			}
-		} else if protectPath != "" {
-			srv["protect_path"] = protectPath
+		} else {
+			if !isLiteralIPHost(host) {
+				if _, ok := dohBootstrapHosts[host]; ok {
+					srv["domain_resolver"] = "doh-bootstrap-dns"
+					bootstrapHost = host
+				} else {
+					srv["domain_resolver"] = "system-local-bootstrap"
+				}
+			}
+			if protectPath != "" {
+				srv["protect_path"] = protectPath
+			}
 		}
 		return srv, bootstrapHost
 	}
-	host := addr
-	if strings.HasPrefix(host, "udp://") {
-		host = strings.TrimPrefix(host, "udp://")
+	if strings.EqualFold(addr, "local") || strings.HasPrefix(strings.ToLower(addr), "dhcp://") {
+		srv := map[string]any{
+			"tag":  tag,
+			"type": "local",
+		}
+		if protectPath != "" {
+			srv["protect_path"] = protectPath
+		}
+		return srv, ""
 	}
+	rawHost := addr
+	if strings.HasPrefix(rawHost, "udp://") {
+		rawHost = strings.TrimPrefix(rawHost, "udp://")
+	}
+	host, port := splitDNSHostPort(rawHost, 53)
 	if host == "" {
 		host = "223.5.5.5"
 	}
@@ -1210,6 +1407,9 @@ func parseDNSServer(tag, addr string, directServer bool, protectPath string) (ma
 		"tag":    tag,
 		"type":   "udp",
 		"server": host,
+	}
+	if port > 0 {
+		srv["server_port"] = port
 	}
 	if !directServer {
 		srv["detour"] = "proxy"
@@ -1219,7 +1419,7 @@ func parseDNSServer(tag, addr string, directServer bool, protectPath string) (ma
 	return srv, ""
 }
 
-func collectFakeIPBypass(routing ruleset.RoutingProfile, nodes []*config.Node) (exactDomains, domainSuffixes []string) {
+func collectFakeIPBypass(routing ruleset.RoutingProfile, nodes []*config.Node, tailscale *ruleset.TailscaleConfig) (exactDomains, domainSuffixes []string) {
 	exactSet := map[string]bool{
 		"localhost": true,
 	}
@@ -1235,6 +1435,13 @@ func collectFakeIPBypass(routing ruleset.RoutingProfile, nodes []*config.Node) (
 		"msftconnecttest.com": true,
 		"msftncsi.com":        true,
 	}
+	if tailscale != nil && tailscale.Enabled && tailscale.MagicDNS {
+		// Let tailscale-dns resolve Tailnet domains instead of local-dns.
+		for _, dom := range tailscale.EffectiveDomains() {
+			delete(suffixSet, dom)
+			delete(suffixSet, strings.TrimPrefix(dom, "."))
+		}
+	}
 	for _, n := range nodes {
 		if n == nil {
 			continue
@@ -1247,18 +1454,20 @@ func collectFakeIPBypass(routing ruleset.RoutingProfile, nodes []*config.Node) (
 			exactSet[host] = true
 		}
 	}
-	for _, cr := range routing.CustomRules {
-		if !cr.Enabled || cr.Outbound != "direct" {
-			continue
-		}
-		for _, d := range cr.Domains {
-			if clean := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(d)), "."); clean != "" {
-				exactSet[clean] = true
+	if routing.CustomRulesEnabledOrDefault() {
+		for _, cr := range routing.CustomRules {
+			if !cr.Enabled || cr.Outbound != "direct" {
+				continue
 			}
-		}
-		for _, s := range cr.DomainSuffix {
-			if clean := strings.ToLower(strings.TrimSpace(s)); clean != "" {
-				suffixSet[clean] = true
+			for _, d := range cr.Domains {
+				if clean := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(d)), "."); clean != "" {
+					exactSet[clean] = true
+				}
+			}
+			for _, s := range cr.DomainSuffix {
+				if clean := strings.ToLower(strings.TrimSpace(s)); clean != "" {
+					suffixSet[clean] = true
+				}
 			}
 		}
 	}
@@ -1281,35 +1490,94 @@ func collectFakeIPBypass(routing ruleset.RoutingProfile, nodes []*config.Node) (
 	return exactDomains, domainSuffixes
 }
 
-func buildDNS(routing ruleset.RoutingProfile, nodes []*config.Node, ruleSetTags map[string]bool, protectPath string) map[string]any {
-	localSrv, _ := parseDNSServer("local-dns", routing.LocalDNS, true, protectPath)
+func buildDNS(routing ruleset.RoutingProfile, nodes []*config.Node, ruleSetTags map[string]bool, protectPath string, tailscale *ruleset.TailscaleConfig, androidMode bool, sysTS SystemTailscaleInfo) map[string]any {
+	localSrv, localBootstrap := parseDNSServer("local-dns", routing.LocalDNS, true, protectPath)
 	servers := []map[string]any{localSrv}
 	finalDNS := "local-dns"
 
+	bootstrapPredefined := map[string][]string{}
+	if localBootstrap != "" {
+		if ips, ok := dohBootstrapHosts[localBootstrap]; ok {
+			bootstrapPredefined[localBootstrap] = ips
+		}
+	}
+	if localSrv["domain_resolver"] == "system-local-bootstrap" {
+		sysLocalBoot := map[string]any{
+			"tag":  "system-local-bootstrap",
+			"type": "local",
+		}
+		if protectPath != "" {
+			sysLocalBoot["protect_path"] = protectPath
+		}
+		servers = append(servers, sysLocalBoot)
+	}
+
 	var rules []map[string]any
+	if tailscale != nil && tailscale.Enabled && tailscale.MagicDNS {
+		servers = append(servers, map[string]any{
+			"tag":                      ruleset.TailscaleDNSTag,
+			"type":                     "tailscale",
+			"endpoint":                 ruleset.TailscaleEndpointTag,
+			"accept_default_resolvers": false,
+		})
+		rules = append(rules, map[string]any{
+			"domain_suffix": tailscale.EffectiveDomains(),
+			"server":        ruleset.TailscaleDNSTag,
+		})
+	} else if !androidMode && routing.BypassSystemTailscaleEnabled() && sysTS.Detected && sysTS.MagicDNSActive {
+		// Forward *.ts.net and host Tailnet search domains to the external system Tailscale MagicDNS resolver
+		// pinned to the system Tailscale interface so TUN hijack-dns never leaks Tailnet queries.
+		sysDNS := map[string]any{
+			"tag":         "system-tailscale-dns",
+			"type":        "udp",
+			"server":      "100.100.100.100",
+			"server_port": 53,
+		}
+		if sysTS.Interface != "" {
+			sysDNS["detour"] = "system-tailscale-direct"
+		}
+		servers = append(servers, sysDNS)
+		rules = append(rules, map[string]any{
+			"domain_suffix": sysTS.EffectiveSearchDomains(),
+			"server":        "system-tailscale-dns",
+		})
+	}
+
+	ipv6Enabled := routing.IPv6Enabled()
+	if !ipv6Enabled {
+		// Suppress AAAA & HTTPS (SVCB IPv6 hint) answers BEFORE Direct, Global, FakeIP bypass,
+		// and geosite-cn rules so dual-stack CN mirrors (e.g. mirrors.tuna.tsinghua.edu.cn) never
+		// hand back IPv6 addresses that TUN captures and rejects with TCP RST.
+		rules = append(rules, map[string]any{
+			"query_type": []string{"AAAA", "HTTPS"},
+			"action":     "predefined",
+			"rcode":      "NOERROR",
+		})
+	}
+
 	if routing.Mode != "direct" {
 		remoteSrv, bootstrapHost := parseDNSServer("remote-dns", routing.RemoteDNS, false, "")
 		if bootstrapHost != "" {
 			if ips, ok := dohBootstrapHosts[bootstrapHost]; ok {
-				servers = append(servers, map[string]any{
-					"tag":        "doh-bootstrap-dns",
-					"type":       "hosts",
-					"predefined": map[string][]string{bootstrapHost: ips},
-				})
+				bootstrapPredefined[bootstrapHost] = ips
 			}
 		}
 		servers = append(servers, remoteSrv)
 		finalDNS = "remote-dns"
 		rules = append(rules, map[string]any{"clash_mode": "Direct", "server": "local-dns"})
-		if routing.WebRTCMode == "block" {
-			rules = append(rules, map[string]any{
-				"domain_keyword": []string{"stun."},
-				"action":         "predefined",
-				"rcode":          "NOERROR",
-			})
+		switch routing.WebRTCMode {
+		case "block":
+			rules = append(rules,
+				map[string]any{"domain_keyword": []string{"stun."}, "action": "predefined", "rcode": "NOERROR"},
+				map[string]any{"domain_regex": []string{`(^|\.)turn\.`}, "action": "predefined", "rcode": "NOERROR"},
+			)
+		case "proxy":
+			rules = append(rules,
+				map[string]any{"domain_keyword": []string{"stun."}, "server": "remote-dns"},
+				map[string]any{"domain_regex": []string{`(^|\.)turn\.`}, "server": "remote-dns"},
+			)
 		}
 
-		ipv6Enabled := routing.IPv6Enabled()
 		if routing.FakeIP {
 			fakeSrv := map[string]any{
 				"tag":         "fakeip-dns",
@@ -1320,7 +1588,7 @@ func buildDNS(routing ruleset.RoutingProfile, nodes []*config.Node, ruleSetTags 
 				fakeSrv["inet6_range"] = routing.FakeIPv6Range
 			}
 			servers = append(servers, fakeSrv)
-			exactDomains, domainSuffixes := collectFakeIPBypass(routing, nodes)
+			exactDomains, domainSuffixes := collectFakeIPBypass(routing, nodes, tailscale)
 			if len(exactDomains) > 0 {
 				rules = append(rules, map[string]any{"domain": exactDomains, "server": "local-dns"})
 			}
@@ -1331,14 +1599,6 @@ func buildDNS(routing ruleset.RoutingProfile, nodes []*config.Node, ruleSetTags 
 			if ipv6Enabled {
 				fakeQueryTypes = []string{"A", "AAAA"}
 			}
-			if !ipv6Enabled {
-				rules = append(rules, map[string]any{
-					"clash_mode": "Global",
-					"query_type": []string{"AAAA", "HTTPS"},
-					"action":     "predefined",
-					"rcode":      "NOERROR",
-				})
-			}
 			rules = append(rules, map[string]any{
 				"clash_mode":  "Global",
 				"query_type":  fakeQueryTypes,
@@ -1346,13 +1606,14 @@ func buildDNS(routing ruleset.RoutingProfile, nodes []*config.Node, ruleSetTags 
 				"rewrite_ttl": 1,
 			})
 			if routing.BypassCN && ruleSetTags[ruleset.TagGeoSiteCN] {
-				rules = append(rules, map[string]any{"rule_set": ruleset.TagGeoSiteCN, "server": "local-dns"})
-			}
-			if !ipv6Enabled {
 				rules = append(rules, map[string]any{
-					"query_type": []string{"AAAA", "HTTPS"},
-					"action":     "predefined",
-					"rcode":      "NOERROR",
+					"type": "logical",
+					"mode": "and",
+					"rules": []map[string]any{
+						{"rule_set": ruleset.TagGeoSiteCN},
+						{"domain_suffix": ruleset.GooglePlayAllowlistDomains, "invert": true},
+					},
+					"server": "local-dns",
 				})
 			}
 			rules = append(rules, map[string]any{
@@ -1361,26 +1622,27 @@ func buildDNS(routing ruleset.RoutingProfile, nodes []*config.Node, ruleSetTags 
 				"rewrite_ttl": 1,
 			})
 		} else {
-			if !ipv6Enabled {
-				rules = append(rules, map[string]any{
-					"clash_mode": "Global",
-					"query_type": []string{"AAAA", "HTTPS"},
-					"action":     "predefined",
-					"rcode":      "NOERROR",
-				})
-			}
 			rules = append(rules, map[string]any{"clash_mode": "Global", "server": "remote-dns"})
 			if routing.BypassCN && ruleSetTags[ruleset.TagGeoSiteCN] {
-				rules = append(rules, map[string]any{"rule_set": ruleset.TagGeoSiteCN, "server": "local-dns"})
-			}
-			if !ipv6Enabled {
 				rules = append(rules, map[string]any{
-					"query_type": []string{"AAAA", "HTTPS"},
-					"action":     "predefined",
-					"rcode":      "NOERROR",
+					"type": "logical",
+					"mode": "and",
+					"rules": []map[string]any{
+						{"rule_set": ruleset.TagGeoSiteCN},
+						{"domain_suffix": ruleset.GooglePlayAllowlistDomains, "invert": true},
+					},
+					"server": "local-dns",
 				})
 			}
 		}
+	}
+
+	if len(bootstrapPredefined) > 0 {
+		servers = append(servers, map[string]any{
+			"tag":        "doh-bootstrap-dns",
+			"type":       "hosts",
+			"predefined": bootstrapPredefined,
+		})
 	}
 
 	dnsDoc := map[string]any{
@@ -1417,25 +1679,16 @@ var loadBalanceAffinityDomains = []string{
 	"ggpht.com",
 	"gvt1.com",
 	"gvt2.com",
+	"gvt3.com",
+	"gvt1-cn.com",
+	"gvt2-cn.com",
+	"xn--ngstr-lra8j.com",
+	"dl.google.com",
+	"services.googleapis.cn",
 	"youtube.com",
 	"googlevideo.com",
 	"ytimg.com",
 	"ippure.com",
-}
-
-// googlePlayAllowlistDomains prevents geosite-category-ads-all from blocking Google Play Store,
-// Play Points redemption, Play Billing, and Play Integrity telemetry endpoints.
-var googlePlayAllowlistDomains = []string{
-	"play.google.com",
-	"play.googleapis.com",
-	"play-fe.googleapis.com",
-	"playatoms-pa.googleapis.com",
-	"play-lh.googleusercontent.com",
-	"android.clients.google.com",
-	"payments.google.com",
-	"pay.google.com",
-	"firebaseinstallations.googleapis.com",
-	"firebaselogging-pa.googleapis.com",
 }
 
 // BuildDomainHashBucketRegexes splits eTLD+1 root domains deterministically into K shards.
@@ -1443,8 +1696,8 @@ func BuildDomainHashBucketRegexes(shardCount int) []string {
 	if shardCount <= 1 {
 		return nil
 	}
-	if shardCount > MaxLoadBalanceShards {
-		shardCount = MaxLoadBalanceShards
+	if shardCount > len(domainHashAlphabet) {
+		shardCount = len(domainHashAlphabet)
 	}
 	buckets := make([]strings.Builder, shardCount)
 	for idx := 0; idx < len(domainHashAlphabet); idx++ {
@@ -1504,11 +1757,13 @@ func appendShardedOrDirectRoute(
 				"domain_suffix": loadBalanceAffinityDomains,
 				"outbound":      shards[0],
 			})
-		} else if _, hasSuffix := baseCond["domain_suffix"]; !hasSuffix {
-			aff := cloneRuleMap(baseCond)
-			aff["domain_suffix"] = loadBalanceAffinityDomains
-			aff["outbound"] = shards[0]
-			*rules = append(*rules, aff)
+		} else {
+			*rules = append(*rules, map[string]any{
+				"type":     "logical",
+				"mode":     "and",
+				"rules":    []map[string]any{cloneRuleMap(baseCond), {"domain_suffix": loadBalanceAffinityDomains}},
+				"outbound": shards[0],
+			})
 		}
 		for i, rx := range BuildDomainHashBucketRegexes(len(shards)) {
 			if len(baseCond) == 0 {
@@ -1533,7 +1788,7 @@ func appendShardedOrDirectRoute(
 		return
 	}
 
-	if preResolveIPv4 && fallbackOutbound != "direct" && fallbackOutbound != BlockOutboundTag {
+	if preResolveIPv4 && fallbackOutbound != "direct" && fallbackOutbound != BlockOutboundTag && fallbackOutbound != ruleset.TailscaleEndpointTag && fallbackOutbound != "system-tailscale-direct" {
 		*rules = append(*rules, makeIPv4ResolveRule(baseCond))
 	}
 	if len(baseCond) > 0 && fallbackOutbound != "" {
@@ -1554,6 +1809,7 @@ func buildRoute(
 	nameToTag map[string]string,
 	lbShards map[string][]string,
 	activeTag string,
+	sysTS SystemTailscaleInfo,
 ) map[string]any {
 	// When IPv6 is disabled (prefer_ipv4 / ipv4_only), pre-resolve domain-targeted proxy flows
 	// (e.g. Chrome HTTP CONNECT / SOCKS5h via mixed-in) to IPv4 through remote-dns so remote VPS
@@ -1582,24 +1838,47 @@ func buildRoute(
 			}, target, target, lbShards, preResolveIPv4)
 		}
 	}
-	rules = append(rules, map[string]any{"clash_mode": "Direct", "outbound": "direct"})
-
-	if routing.Mode != "direct" {
-		switch routing.WebRTCMode {
-		case "block":
-			rules = append(rules,
-				map[string]any{"protocol": []string{"stun"}, "action": "reject"},
-				map[string]any{"network": []string{"udp"}, "port": []int{3478, 5349, 19302, 19305, 19306, 19307}, "action": "reject"},
-			)
-		case "proxy":
-			rules = append(rules,
-				map[string]any{"protocol": []string{"stun"}, "outbound": "proxy"},
-				map[string]any{"network": []string{"udp"}, "port": []int{3478, 5349, 19302, 19305, 19306, 19307}, "outbound": "proxy"},
-			)
+	// Route Tailscale CGNAT/ULA subnets, user-declared Tailnet subnets, and MagicDNS domains
+	// to tailscale-ep BEFORE Direct, Global, and BypassLAN so Tailscale stays reachable in all modes.
+	if in.Tailscale != nil && in.Tailscale.Enabled {
+		rules = append(rules, map[string]any{
+			"ip_cidr":  in.Tailscale.EffectiveSubnets(),
+			"outbound": ruleset.TailscaleEndpointTag,
+		})
+		if in.Tailscale.MagicDNS {
+			rules = append(rules, map[string]any{
+				"domain_suffix": in.Tailscale.EffectiveDomains(),
+				"outbound":      ruleset.TailscaleEndpointTag,
+			})
+		}
+	} else if !in.AndroidMode && routing.BypassSystemTailscaleEnabled() {
+		// Bypass external host system Tailscale (tailscale0 / utun) networks in all modes (Rule & Global),
+		// binding directly to the detected Tailscale interface when available.
+		sysTSTarget := "direct"
+		if includedTags["system-tailscale-direct"] {
+			sysTSTarget = "system-tailscale-direct"
+		}
+		rules = append(rules, map[string]any{
+			"ip_cidr":  []string{"100.64.0.0/10", "fd7a:115c:a1e0::/48"},
+			"outbound": sysTSTarget,
+		})
+		if sysTS.Detected && sysTS.MagicDNSActive {
+			rules = append(rules, map[string]any{
+				"domain_suffix": sysTS.EffectiveSearchDomains(),
+				"outbound":      sysTSTarget,
+			})
 		}
 	}
 
-	appendShardedOrDirectRoute(&rules, map[string]any{"clash_mode": "Global"}, activeTag, "proxy", lbShards, preResolveIPv4)
+	rules = append(rules, map[string]any{"clash_mode": "Direct", "outbound": "direct"})
+
+	if routing.Mode != "direct" {
+		// Reject cloud instance metadata service (IMDS) probes before BypassLAN/proxy rules.
+		rules = append(rules, map[string]any{
+			"ip_cidr": []string{"169.254.169.254/32", "100.100.100.200/32", "fd00:ec2::254/128"},
+			"action":  "reject",
+		})
+	}
 
 	if routing.BypassLAN {
 		if routing.FakeIP {
@@ -1613,122 +1892,167 @@ func buildRoute(
 		}
 	}
 	if !routing.IPv6Enabled() && routing.Mode != "direct" && (in.AndroidMode || in.EnableTUN) {
-		// Reject global IPv6 destinations when IPv6 is disabled so Android/TUN captures ::/0
-		// without leaking real ISP IPv6 and apps fall back immediately to proxied IPv4.
+		// Reject global IPv6 destinations BEFORE WebRTC rules so IPv6 STUN/TURN never leaks or dials out
+		// when IPv6 is disabled while Tailscale ULA remains reachable.
 		rules = append(rules, map[string]any{
 			"ip_cidr": []string{"2000::/3"},
 			"action":  "reject",
 		})
 	}
+
+	if routing.Mode != "direct" {
+		if (routing.WebRTCMode == "block" || routing.WebRTCMode == "proxy") && !in.AndroidMode && (in.Tailscale == nil || !in.Tailscale.Enabled) && routing.BypassSystemTailscaleEnabled() {
+			// Let external system tailscaled perform UDP 3478 STUN hole-punching over direct WAN without degrading to DERP.
+			rules = append(rules, map[string]any{
+				"process_name": []string{"tailscaled", "tailscaled.exe", "IPNExtension"},
+				"network":      []string{"udp"},
+				"port":         []int{3478},
+				"outbound":     "direct",
+			})
+		}
+		switch routing.WebRTCMode {
+		case "block":
+			rules = append(rules,
+				map[string]any{"protocol": []string{"stun"}, "action": "reject"},
+				map[string]any{"domain_keyword": []string{"stun."}, "action": "reject"},
+				map[string]any{"domain_regex": []string{`(^|\.)turn\.`}, "action": "reject"},
+				map[string]any{"network": []string{"udp"}, "port": []int{3478, 5349, 19302, 19305, 19306, 19307}, "action": "reject"},
+				map[string]any{"network": []string{"tcp"}, "port": []int{3478, 5349}, "action": "reject"},
+			)
+		case "proxy":
+			webrtcOutbound := "proxy"
+			if shards := lbShards[activeTag]; len(shards) > 1 {
+				// Pin WebRTC STUN/TURN traffic to shard 0 so the reflexive UDP/TCP IP matches HTTP affinity checks.
+				webrtcOutbound = shards[0]
+			}
+			if preResolveIPv4 {
+				rules = append(rules,
+					makeIPv4ResolveRule(map[string]any{"domain_keyword": []string{"stun."}}),
+					makeIPv4ResolveRule(map[string]any{"domain_regex": []string{`(^|\.)turn\.`}}),
+				)
+			}
+			rules = append(rules,
+				map[string]any{"protocol": []string{"stun"}, "outbound": webrtcOutbound},
+				map[string]any{"domain_keyword": []string{"stun."}, "outbound": webrtcOutbound},
+				map[string]any{"domain_regex": []string{`(^|\.)turn\.`}, "outbound": webrtcOutbound},
+				map[string]any{"network": []string{"udp"}, "port": []int{3478, 5349, 19302, 19305, 19306, 19307}, "outbound": webrtcOutbound},
+				map[string]any{"network": []string{"tcp"}, "port": []int{3478, 5349}, "outbound": webrtcOutbound},
+			)
+		}
+	}
+
+	appendShardedOrDirectRoute(&rules, map[string]any{"clash_mode": "Global"}, activeTag, "proxy", lbShards, preResolveIPv4)
 	if routing.BlockAds && routing.Mode != "direct" && ruleSetTags[ruleset.TagGeoSiteAds] {
-		// Exclude Google Play Store / Play Points / Play Billing domains from ad rejection
+		// Exclude Google Play Store / Play Points / Play Billing / APK CDN domains from ad rejection
 		// without shadowing downstream user custom rules.
 		rules = append(rules, map[string]any{
 			"type": "logical",
 			"mode": "and",
 			"rules": []map[string]any{
 				{"rule_set": ruleset.TagGeoSiteAds},
-				{"domain_suffix": googlePlayAllowlistDomains, "invert": true},
+				{"domain_suffix": ruleset.GooglePlayAllowlistDomains, "invert": true},
 			},
 			"action": "reject",
 		})
 	}
 
-	for _, cr := range routing.CustomRules {
-		if !cr.Enabled {
-			continue
-		}
-		rule := map[string]any{}
-		if len(cr.Domains) > 0 {
-			rule["domain"] = cr.Domains
-		}
-		if len(cr.DomainSuffix) > 0 {
-			rule["domain_suffix"] = cr.DomainSuffix
-		}
-		if len(cr.DomainKeyword) > 0 {
-			rule["domain_keyword"] = cr.DomainKeyword
-		}
-		if len(cr.DomainRegex) > 0 {
-			rule["domain_regex"] = cr.DomainRegex
-		}
-		if len(cr.IPCIDR) > 0 {
-			rule["ip_cidr"] = cr.IPCIDR
-		}
-		if len(cr.SourceIPCIDR) > 0 {
-			rule["source_ip_cidr"] = cr.SourceIPCIDR
-		}
-		if cr.IPIsPrivate {
-			rule["ip_is_private"] = true
-		}
-		if len(cr.Network) > 0 {
-			rule["network"] = cr.Network
-		}
-		if len(cr.ProcessName) > 0 {
-			rule["process_name"] = cr.ProcessName
-		}
-		if len(cr.ProcessPath) > 0 {
-			rule["process_path"] = cr.ProcessPath
-		}
-		if len(cr.PackageName) > 0 {
-			if in.AndroidMode && in.AndroidAppSocksPort > 0 {
-				// On unrooted Android, tun2socks resolves the real UID/package via ConnectivityManager
-				// and authenticates into android-app-in using the package name as SOCKS5 auth_user.
-				rule["auth_user"] = cr.PackageName
-			} else {
-				rule["package_name"] = cr.PackageName
+	if routing.CustomRulesEnabledOrDefault() {
+		for _, cr := range routing.CustomRules {
+			if !cr.Enabled {
+				continue
 			}
-		}
-		if len(cr.Port) > 0 {
-			rule["port"] = cr.Port
-		}
-		if len(cr.PortRange) > 0 {
-			rule["port_range"] = cr.PortRange
-		}
-		if len(cr.SourcePort) > 0 {
-			rule["source_port"] = cr.SourcePort
-		}
-		if len(cr.Protocol) > 0 {
-			rule["protocol"] = cr.Protocol
-		}
-		if len(cr.Inbound) > 0 {
-			rule["inbound"] = cr.Inbound
-		}
-		var validRS []string
-		for _, rsTag := range cr.RuleSet {
-			if ruleSetTags[rsTag] {
-				validRS = append(validRS, rsTag)
+			rule := map[string]any{}
+			if len(cr.Domains) > 0 {
+				rule["domain"] = cr.Domains
 			}
-		}
-		if len(validRS) > 0 {
-			rule["rule_set"] = validRS
-		}
-		if len(rule) == 0 {
-			continue
-		}
-		if cr.Invert {
-			rule["invert"] = true
-		}
-		if cr.Outbound == "block" || cr.Outbound == "reject" {
-			rule["action"] = "reject"
-			rules = append(rules, rule)
-		} else {
-			outTag := cr.Outbound
-			if !includedTags[outTag] {
-				if includedTags[NodeTag(outTag)] {
-					outTag = NodeTag(outTag)
-				} else if includedTags[GroupTag(outTag)] {
-					outTag = GroupTag(outTag)
-				} else if mapped, ok := nameToTag[strings.ToLower(strings.TrimSpace(outTag))]; ok && includedTags[mapped] {
-					outTag = mapped
+			if len(cr.DomainSuffix) > 0 {
+				rule["domain_suffix"] = cr.DomainSuffix
+			}
+			if len(cr.DomainKeyword) > 0 {
+				rule["domain_keyword"] = cr.DomainKeyword
+			}
+			if len(cr.DomainRegex) > 0 {
+				rule["domain_regex"] = cr.DomainRegex
+			}
+			if len(cr.IPCIDR) > 0 {
+				rule["ip_cidr"] = cr.IPCIDR
+			}
+			if len(cr.SourceIPCIDR) > 0 {
+				rule["source_ip_cidr"] = cr.SourceIPCIDR
+			}
+			if cr.IPIsPrivate {
+				rule["ip_is_private"] = true
+			}
+			if len(cr.Network) > 0 {
+				rule["network"] = cr.Network
+			}
+			if len(cr.ProcessName) > 0 {
+				rule["process_name"] = cr.ProcessName
+			}
+			if len(cr.ProcessPath) > 0 {
+				rule["process_path"] = cr.ProcessPath
+			}
+			if len(cr.PackageName) > 0 {
+				if in.AndroidMode && in.AndroidAppSocksPort > 0 {
+					// On unrooted Android, tun2socks resolves the real UID/package via ConnectivityManager
+					// and authenticates into android-app-in using the package name as SOCKS5 auth_user.
+					rule["auth_user"] = cr.PackageName
 				} else {
-					outTag = "proxy"
+					rule["package_name"] = cr.PackageName
 				}
 			}
-			shardTarget := outTag
-			if outTag == "proxy" {
-				shardTarget = activeTag
+			if len(cr.Port) > 0 {
+				rule["port"] = cr.Port
 			}
-			appendShardedOrDirectRoute(&rules, rule, shardTarget, outTag, lbShards, preResolveIPv4)
+			if len(cr.PortRange) > 0 {
+				rule["port_range"] = cr.PortRange
+			}
+			if len(cr.SourcePort) > 0 {
+				rule["source_port"] = cr.SourcePort
+			}
+			if len(cr.Protocol) > 0 {
+				rule["protocol"] = cr.Protocol
+			}
+			if len(cr.Inbound) > 0 {
+				rule["inbound"] = cr.Inbound
+			}
+			var validRS []string
+			for _, rsTag := range cr.RuleSet {
+				if ruleSetTags[rsTag] {
+					validRS = append(validRS, rsTag)
+				}
+			}
+			if len(validRS) > 0 {
+				rule["rule_set"] = validRS
+			}
+			if len(rule) == 0 {
+				continue
+			}
+			if cr.Invert {
+				rule["invert"] = true
+			}
+			if cr.Outbound == "block" || cr.Outbound == "reject" {
+				rule["action"] = "reject"
+				rules = append(rules, rule)
+			} else {
+				outTag := cr.Outbound
+				if !includedTags[outTag] {
+					if includedTags[NodeTag(outTag)] {
+						outTag = NodeTag(outTag)
+					} else if includedTags[GroupTag(outTag)] {
+						outTag = GroupTag(outTag)
+					} else if mapped, ok := nameToTag[strings.ToLower(strings.TrimSpace(outTag))]; ok && includedTags[mapped] {
+						outTag = mapped
+					} else {
+						outTag = "proxy"
+					}
+				}
+				shardTarget := outTag
+				if outTag == "proxy" {
+					shardTarget = activeTag
+				}
+				appendShardedOrDirectRoute(&rules, rule, shardTarget, outTag, lbShards, preResolveIPv4)
+			}
 		}
 	}
 
@@ -1741,8 +2065,16 @@ func buildRoute(
 			cnSets = append(cnSets, ruleset.TagGeoIPCN)
 		}
 		if len(cnSets) > 0 {
+			// Exempt Google Play Store & APK download CDN domains (included in geosite-cn)
+			// from China direct bypass so Android Play downloads do not stall on China CDN /
+			// local DNS, while keeping user custom rules above free to override.
 			rules = append(rules, map[string]any{
-				"rule_set": cnSets,
+				"type": "logical",
+				"mode": "and",
+				"rules": []map[string]any{
+					{"rule_set": cnSets},
+					{"domain_suffix": ruleset.GooglePlayAllowlistDomains, "invert": true},
+				},
 				"outbound": "direct",
 			})
 		}
@@ -1910,7 +2242,7 @@ func buildTransportBlock(n *config.Node) map[string]any {
 	}
 }
 
-func compileOutbound(n *config.Node, tag, protectPath string) (map[string]any, error) {
+func compileOutbound(n *config.Node, tag, protectPath string, androidMode bool) (map[string]any, error) {
 	ob := map[string]any{
 		"type":        string(n.Protocol),
 		"tag":         tag,
@@ -2005,20 +2337,52 @@ func compileOutbound(n *config.Node, tag, protectPath string) (map[string]any, e
 		if n.ZeroRTTHandshake {
 			ob["zero_rtt_handshake"] = true
 		}
+		if androidMode {
+			// Clamp TUIC heartbeat on Android to >= 30s to avoid waking cellular radios every 10s.
+			hb := strings.TrimSpace(n.Heartbeat)
+			if d, err := time.ParseDuration(hb); err != nil || d < 30*time.Second {
+				ob["heartbeat"] = "30s"
+			} else {
+				ob["heartbeat"] = hb
+			}
+		} else if strings.TrimSpace(n.Heartbeat) != "" {
+			ob["heartbeat"] = strings.TrimSpace(n.Heartbeat)
+		}
 		if tls := buildTLSBlock(n, true); tls != nil {
 			ob["tls"] = tls
 		}
 
 	case config.ProtocolAnyTLS:
 		ob["password"] = n.Password
-		if n.IdleSessionCheckInterval != "" {
-			ob["idle_session_check_interval"] = n.IdleSessionCheckInterval
-		}
-		if n.IdleSessionTimeout != "" {
-			ob["idle_session_timeout"] = n.IdleSessionTimeout
-		}
-		if n.MinIdleSession > 0 {
-			ob["min_idle_session"] = n.MinIdleSession
+		if androidMode {
+			// Converge AnyTLS idle session pool on Android (cap at 1 idle tunnel, check >= 60s)
+			// so battery-powered devices do not hold 5 persistent idle TLS connections.
+			checkIv := strings.TrimSpace(n.IdleSessionCheckInterval)
+			if d, err := time.ParseDuration(checkIv); err != nil || d < 60*time.Second {
+				ob["idle_session_check_interval"] = "60s"
+			} else {
+				ob["idle_session_check_interval"] = checkIv
+			}
+			if n.IdleSessionTimeout != "" {
+				ob["idle_session_timeout"] = n.IdleSessionTimeout
+			}
+			if n.MinIdleSession > 0 {
+				minIdle := n.MinIdleSession
+				if minIdle > 1 {
+					minIdle = 1
+				}
+				ob["min_idle_session"] = minIdle
+			}
+		} else {
+			if n.IdleSessionCheckInterval != "" {
+				ob["idle_session_check_interval"] = n.IdleSessionCheckInterval
+			}
+			if n.IdleSessionTimeout != "" {
+				ob["idle_session_timeout"] = n.IdleSessionTimeout
+			}
+			if n.MinIdleSession > 0 {
+				ob["min_idle_session"] = n.MinIdleSession
+			}
 		}
 		if tls := buildTLSBlock(n, true); tls != nil {
 			ob["tls"] = tls

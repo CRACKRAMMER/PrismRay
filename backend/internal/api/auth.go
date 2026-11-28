@@ -5,13 +5,20 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"os/exec"
 	"runtime"
 	"strings"
 	"time"
+
+	authservice "github.com/CRACKRAMMER/PrismRay/backend/internal/auth"
 )
 
 const sessionCookie = "prismray_session"
@@ -134,7 +141,10 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAuthLock(w http.ResponseWriter, _ *http.Request) {
 	if s.auth != nil {
-		s.auth.Lock()
+		if err := s.auth.TryLock(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -162,6 +172,9 @@ func (s *Server) handlePasswordLock(w http.ResponseWriter, r *http.Request) {
 		} else if err := s.auth.EnablePasswordLock(req.Password); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		if newToken, err := s.auth.IssueSession(); err == nil && newToken != "" {
+			setSessionCookie(w, r, newToken)
 		}
 	} else {
 		pw := req.Password
@@ -191,9 +204,28 @@ func (s *Server) handleBiometricConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Enabled         bool   `json:"enabled"`
 		CurrentPassword string `json:"current_password"`
+		HardwareWrap    bool   `json:"hardware_wrap"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	useHardware := req.HardwareWrap || s.auth.Mode() == authservice.ModeAndroid || s.mode == authservice.ModeAndroid
+	if useHardware {
+		kekB64, err := s.auth.SetBiometricUnlockHardware(req.Enabled, req.CurrentPassword)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		resp := map[string]any{
+			"password_lock_enabled": s.auth.PasswordLocked(),
+			"biometric_enabled":     s.auth.BiometricEnabled(),
+			"hardware_wrap":         true,
+		}
+		if kekB64 != "" {
+			resp["biometric_kek"] = kekB64
+		}
+		json.NewEncoder(w).Encode(resp)
 		return
 	}
 	if err := s.auth.SetBiometricUnlock(req.Enabled, req.CurrentPassword); err != nil {
@@ -206,17 +238,98 @@ func (s *Server) handleBiometricConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleBiometricChallenge(w http.ResponseWriter, r *http.Request) {
+	if s.auth == nil {
+		http.Error(w, "authentication unavailable", http.StatusNotImplemented)
+		return
+	}
+	if s.token != "" && !s.desktopTrusted(r) {
+		http.Error(w, "desktop trust required", http.StatusForbidden)
+		return
+	}
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		http.Error(w, "failed to generate challenge", http.StatusInternalServerError)
+		return
+	}
+	nonce := base64.RawURLEncoding.EncodeToString(raw)
+	now := time.Now()
+	s.bioMu.Lock()
+	if s.bioChallenges == nil {
+		s.bioChallenges = map[string]time.Time{}
+	}
+	for k, exp := range s.bioChallenges {
+		if now.After(exp) {
+			delete(s.bioChallenges, k)
+		}
+	}
+	if len(s.bioChallenges) >= 32 {
+		// Evict oldest/all when flooded.
+		clear(s.bioChallenges)
+	}
+	s.bioChallenges[nonce] = now.Add(60 * time.Second)
+	s.bioMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]string{"challenge": nonce})
+}
+
+func (s *Server) verifyDesktopBiometricProof(challenge, signatureHex string) bool {
+	challenge = strings.TrimSpace(challenge)
+	signatureHex = strings.TrimSpace(signatureHex)
+	if challenge == "" || signatureHex == "" {
+		return false
+	}
+	s.bioMu.Lock()
+	key := append([]byte(nil), s.bioHMACKey...)
+	exp, exists := s.bioChallenges[challenge]
+	delete(s.bioChallenges, challenge)
+	s.bioMu.Unlock()
+	if len(key) < 32 || !exists || time.Now().After(exp) {
+		return false
+	}
+	sigBytes, err := hex.DecodeString(signatureHex)
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(challenge))
+	expected := mac.Sum(nil)
+	return hmac.Equal(sigBytes, expected)
+}
+
 func (s *Server) handleBiometricUnlock(w http.ResponseWriter, r *http.Request) {
 	if s.auth == nil {
 		http.Error(w, "authentication unavailable", http.StatusNotImplemented)
 		return
 	}
-	// Strictly require the local Tauri desktop token so remote/browser callers cannot invoke biometric unlock.
+	// Strictly require the local Tauri desktop/android IPC token so remote/browser callers cannot invoke biometric unlock.
 	if s.token != "" && !s.desktopTrusted(r) {
 		http.Error(w, "desktop trust required", http.StatusForbidden)
 		return
 	}
-	token, err := s.auth.UnlockWithBiometric()
+	var req struct {
+		BiometricKEK string `json:"biometric_kek"`
+		Challenge    string `json:"challenge"`
+		Signature    string `json:"signature"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	var token string
+	var err error
+	if s.auth.Mode() == authservice.ModeAndroid || s.mode == authservice.ModeAndroid || strings.TrimSpace(req.BiometricKEK) != "" {
+		if strings.TrimSpace(req.BiometricKEK) == "" {
+			http.Error(w, "hardware biometric key required", http.StatusUnauthorized)
+			return
+		}
+		token, err = s.auth.UnlockWithBiometricKEK(strings.TrimSpace(req.BiometricKEK))
+	} else {
+		if !s.verifyDesktopBiometricProof(req.Challenge, req.Signature) {
+			http.Error(w, "biometric challenge verification failed", http.StatusUnauthorized)
+			return
+		}
+		token, err = s.auth.UnlockWithBiometric()
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return

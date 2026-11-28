@@ -52,7 +52,7 @@ func TestPickRecommendedAsset(t *testing.T) {
 	if a, _ := pickRecommendedAsset(assets, "windows", "amd64", authservice.ModeDesktop, false); a == nil || a.Name != "prismray-windows-x64-full.exe" {
 		t.Fatalf("windows asset mismatch: %+v", a)
 	}
-	if a, hint := pickRecommendedAsset(assets, "linux", "amd64", authservice.ModeDesktop, true); a == nil || a.Name != "prismray-1.1.0-1-x86_64.pkg.tar.zst" || hint == "" {
+	if a, hint := pickRecommendedAsset(assets, "linux", "amd64", authservice.ModeDesktop, true); a == nil || a.Name != "prismray-1.1.0-1-x86_64.pkg.tar.zst" || hint != "" {
 		t.Fatalf("arch asset/hint mismatch: %+v %q", a, hint)
 	}
 	if a, _ := pickRecommendedAsset(assets, "linux", "amd64", authservice.ModeDesktop, false); a == nil || a.Name != "prismray-linux-x64-full.AppImage" {
@@ -88,7 +88,9 @@ func TestHandleAppUpdateCheckWithMockGitHub(t *testing.T) {
 	prevVer := AppVersion
 	githubAPIBase = ts.URL
 	AppVersion = "1.0.0"
+	safeHTTPAllowLoopbackForTest.Store(true)
 	defer func() {
+		safeHTTPAllowLoopbackForTest.Store(false)
 		githubAPIBase = prevBase
 		AppVersion = prevVer
 	}()
@@ -119,7 +121,11 @@ func TestHandleAppUpdateCheckNoPublishedRelease(t *testing.T) {
 
 	prevBase := githubAPIBase
 	githubAPIBase = ts.URL
-	defer func() { githubAPIBase = prevBase }()
+	safeHTTPAllowLoopbackForTest.Store(true)
+	defer func() {
+		safeHTTPAllowLoopbackForTest.Store(false)
+		githubAPIBase = prevBase
+	}()
 
 	s := NewServer(nil, nil, nil, nil)
 	rec := httptest.NewRecorder()

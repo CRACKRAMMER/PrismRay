@@ -144,7 +144,8 @@ func TestOriginPolicy(t *testing.T) {
 		origin string
 		want   int
 	}{
-		{"http://localhost:1420", http.StatusOK},
+		{"https://tauri.localhost", http.StatusOK},
+		{"http://localhost:1420", http.StatusForbidden},
 		{"https://evil.example", http.StatusForbidden},
 	} {
 		r := httptest.NewRequest("GET", "/api/nodes", nil)

@@ -76,27 +76,70 @@ const (
 // BoolPtr returns a pointer to v for optional boolean profile fields.
 func BoolPtr(v bool) *bool { return &v }
 
+// GooglePlayAllowlistDomains lists Google Play Store, Play Billing/Integrity, and APK download
+// CDN domains exempted from ad blocking (geosite-category-ads-all) and China direct bypass
+// (geosite-cn, which includes redirector.gvt1.com, dl.google.com, and xn--ngstr-lra8j.com)
+// so Android Play downloads do not stall while still letting user custom rules override freely.
+var GooglePlayAllowlistDomains = []string{
+	"play.google.com",
+	"play.googleapis.com",
+	"play-fe.googleapis.com",
+	"playatoms-pa.googleapis.com",
+	"play-lh.googleusercontent.com",
+	"android.clients.google.com",
+	"android.googleapis.com",
+	"payments.google.com",
+	"pay.google.com",
+	"firebaseinstallations.googleapis.com",
+	"firebaselogging-pa.googleapis.com",
+	"gvt1.com",
+	"gvt2.com",
+	"gvt3.com",
+	"gvt1-cn.com",
+	"gvt2-cn.com",
+	"xn--ngstr-lra8j.com",
+	"dl.google.com",
+	"services.googleapis.cn",
+}
+
+// IsGooglePlayAllowlistDomain reports whether domain matches GooglePlayAllowlistDomains by exact or suffix match.
+func IsGooglePlayAllowlistDomain(domain string) bool {
+	d := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+	if d == "" {
+		return false
+	}
+	for _, s := range GooglePlayAllowlistDomains {
+		if d == s || strings.HasSuffix(d, "."+s) {
+			return true
+		}
+	}
+	return false
+}
+
 // RoutingProfile holds v1.0 routing, DNS preset, FakeIP, WebRTC, and Android per-app settings.
 type RoutingProfile struct {
-	Mode              string        `json:"mode"` // "rule" | "global" | "direct"
-	BlockAds          bool          `json:"block_ads"`
-	BypassLAN         bool          `json:"bypass_lan"`
-	AllowLANBroadcast bool          `json:"allow_lan_broadcast,omitempty"`
-	BypassCN          bool          `json:"bypass_cn"`
-	LocalDNS          string        `json:"local_dns"`
-	RemoteDNS         string        `json:"remote_dns"`
-	DomainStrategy    string        `json:"domain_strategy,omitempty"` // prefer_ipv4 | prefer_ipv6 | ipv4_only | as_is
-	HijackDNS         *bool         `json:"hijack_dns,omitempty"`
-	FakeIP            bool          `json:"fake_ip"`
-	FakeIPv4Range     string        `json:"fake_ip_v4_range,omitempty"`
-	FakeIPv6Range     string        `json:"fake_ip_v6_range,omitempty"`
-	FakeIPFilter      []string      `json:"fake_ip_filter,omitempty"`
-	KillSwitch        *bool         `json:"kill_switch,omitempty"`
-	WebRTCMode        string        `json:"webrtc_mode,omitempty"` // block | proxy | direct
-	LogLevel          string        `json:"log_level,omitempty"`
-	PerAppMode        string        `json:"per_app_mode,omitempty"` // all | whitelist | blacklist
-	PerAppPackages    []string      `json:"per_app_packages,omitempty"`
-	CustomRules       []RoutingRule `json:"custom_rules"`
+	Mode                  string        `json:"mode"` // "rule" | "global" | "direct"
+	BlockAds              bool          `json:"block_ads"`
+	BypassLAN             bool          `json:"bypass_lan"`
+	AllowLANBroadcast     bool          `json:"allow_lan_broadcast,omitempty"`
+	BypassCN              bool          `json:"bypass_cn"`
+	BypassSystemTailscale *bool         `json:"bypass_system_tailscale,omitempty"`
+	DisableIPv6           *bool         `json:"disable_ipv6,omitempty"`
+	LocalDNS              string        `json:"local_dns"`
+	RemoteDNS             string        `json:"remote_dns"`
+	DomainStrategy        string        `json:"domain_strategy,omitempty"` // prefer_ipv4 | prefer_ipv6 | ipv4_only | as_is
+	HijackDNS             *bool         `json:"hijack_dns,omitempty"`
+	FakeIP                bool          `json:"fake_ip"`
+	FakeIPv4Range         string        `json:"fake_ip_v4_range,omitempty"`
+	FakeIPv6Range         string        `json:"fake_ip_v6_range,omitempty"`
+	FakeIPFilter          []string      `json:"fake_ip_filter,omitempty"`
+	KillSwitch            *bool         `json:"kill_switch,omitempty"`
+	WebRTCMode            string        `json:"webrtc_mode,omitempty"` // block | proxy | direct
+	LogLevel              string        `json:"log_level,omitempty"`
+	PerAppMode            string        `json:"per_app_mode,omitempty"` // all | whitelist | blacklist
+	PerAppPackages        []string      `json:"per_app_packages,omitempty"`
+	CustomRulesEnabled    *bool         `json:"custom_rules_enabled,omitempty"`
+	CustomRules           []RoutingRule `json:"custom_rules"`
 }
 
 // HijackDNSEnabled reports whether DNS traffic interception is enabled (defaults to true).
@@ -109,9 +152,23 @@ func (p RoutingProfile) KillSwitchEnabled() bool {
 	return p.KillSwitch == nil || *p.KillSwitch
 }
 
-// IPv6Enabled reports whether TUN IPv6 routing and proxied AAAA/HTTPS IPv6 hints should be enabled.
-// Defaults to false for "prefer_ipv4" and "ipv4_only" so IPv4-only proxy nodes do not break Happy Eyeballs.
+// CustomRulesEnabledOrDefault reports whether custom routing rules are evaluated (defaults to true).
+func (p RoutingProfile) CustomRulesEnabledOrDefault() bool {
+	return p.CustomRulesEnabled == nil || *p.CustomRulesEnabled
+}
+
+// BypassSystemTailscaleEnabled reports whether desktop hosts running an external system Tailscale
+// daemon should automatically bypass proxy rules for Tailnet CIDRs and MagicDNS (defaults to true).
+func (p RoutingProfile) BypassSystemTailscaleEnabled() bool {
+	return p.BypassSystemTailscale == nil || *p.BypassSystemTailscale
+}
+
+// IPv6Enabled reports whether TUN IPv6 routing and AAAA/HTTPS IPv6 answers should be enabled.
+// Respects the explicit DisableIPv6 switch when set; otherwise falls back to DomainStrategy.
 func (p RoutingProfile) IPv6Enabled() bool {
+	if p.DisableIPv6 != nil {
+		return !*p.DisableIPv6
+	}
 	switch p.DomainStrategy {
 	case "prefer_ipv6", "ipv6_only", "as_is":
 		return true
@@ -120,28 +177,31 @@ func (p RoutingProfile) IPv6Enabled() bool {
 	}
 }
 
-// DefaultRoutingProfile returns the recommended rule-based profile (FakeIP disabled, WebRTC blocked by default).
+// DefaultRoutingProfile returns the recommended rule-based profile (FakeIP disabled, IPv6 disabled, WebRTC blocked by default).
 func DefaultRoutingProfile() RoutingProfile {
 	return RoutingProfile{
-		Mode:              "rule",
-		BlockAds:          true,
-		BypassLAN:         true,
-		AllowLANBroadcast: false,
-		BypassCN:          true,
-		LocalDNS:          "223.5.5.5",
-		RemoteDNS:         "https://1.1.1.1/dns-query",
-		DomainStrategy:    "prefer_ipv4",
-		HijackDNS:         BoolPtr(true),
-		FakeIP:            false,
-		FakeIPv4Range:     defaultFakeIPv4Range,
-		FakeIPv6Range:     defaultFakeIPv6Range,
-		FakeIPFilter:      []string{},
-		KillSwitch:        BoolPtr(true),
-		WebRTCMode:        "block",
-		LogLevel:          "info",
-		PerAppMode:        "all",
-		PerAppPackages:    []string{},
-		CustomRules:       []RoutingRule{},
+		Mode:                  "rule",
+		BlockAds:              true,
+		BypassLAN:             true,
+		AllowLANBroadcast:     false,
+		BypassCN:              true,
+		BypassSystemTailscale: BoolPtr(true),
+		DisableIPv6:           BoolPtr(true),
+		LocalDNS:              "223.5.5.5",
+		RemoteDNS:             "https://1.1.1.1/dns-query",
+		DomainStrategy:        "prefer_ipv4",
+		HijackDNS:             BoolPtr(true),
+		FakeIP:                false,
+		FakeIPv4Range:         defaultFakeIPv4Range,
+		FakeIPv6Range:         defaultFakeIPv6Range,
+		FakeIPFilter:          []string{},
+		KillSwitch:            BoolPtr(true),
+		WebRTCMode:            "block",
+		LogLevel:              "info",
+		PerAppMode:            "all",
+		PerAppPackages:        []string{},
+		CustomRulesEnabled:    BoolPtr(true),
+		CustomRules:           []RoutingRule{},
 	}
 }
 
@@ -166,11 +226,31 @@ func (p *RoutingProfile) Normalize() {
 	if p.DomainStrategy == "" {
 		p.DomainStrategy = "prefer_ipv4"
 	}
+	if p.DisableIPv6 == nil {
+		switch p.DomainStrategy {
+		case "prefer_ipv6", "ipv6_only", "as_is":
+			p.DisableIPv6 = BoolPtr(false)
+		default:
+			p.DisableIPv6 = BoolPtr(true)
+		}
+	} else if *p.DisableIPv6 {
+		if p.DomainStrategy == "prefer_ipv6" || p.DomainStrategy == "ipv6_only" || p.DomainStrategy == "as_is" {
+			p.DomainStrategy = "prefer_ipv4"
+		}
+	} else if p.DomainStrategy == "ipv4_only" {
+		p.DomainStrategy = "prefer_ipv4"
+	}
+	if p.BypassSystemTailscale == nil {
+		p.BypassSystemTailscale = BoolPtr(true)
+	}
 	if p.HijackDNS == nil {
 		p.HijackDNS = BoolPtr(true)
 	}
 	if p.KillSwitch == nil {
 		p.KillSwitch = BoolPtr(true)
+	}
+	if p.CustomRulesEnabled == nil {
+		p.CustomRulesEnabled = BoolPtr(true)
 	}
 	switch strings.ToLower(strings.TrimSpace(p.WebRTCMode)) {
 	case "block", "proxy", "direct":
@@ -420,10 +500,14 @@ func isWebRTCTraffic(domain string, in SimulationInput) bool {
 	if strings.EqualFold(strings.TrimSpace(in.Protocol), "stun") {
 		return true
 	}
-	if strings.Contains(domain, "stun.") {
+	if strings.Contains(domain, "stun.") || strings.HasPrefix(domain, "turn.") || strings.Contains(domain, ".turn.") {
 		return true
 	}
-	return strings.EqualFold(strings.TrimSpace(in.Network), "udp") && isSTUNPort(in.Port)
+	netLower := strings.TrimSpace(in.Network)
+	if strings.EqualFold(netLower, "udp") && isSTUNPort(in.Port) {
+		return true
+	}
+	return strings.EqualFold(netLower, "tcp") && (in.Port == 3478 || in.Port == 5349)
 }
 
 // Simulate evaluates a sample connection against the profile in compilation order.
@@ -448,6 +532,29 @@ func Simulate(profile RoutingProfile, in SimulationInput) SimulationResult {
 		}
 	}
 
+	if profile.BypassSystemTailscaleEnabled() {
+		tsCGNAT := netip.MustParsePrefix("100.64.0.0/10")
+		tsULA := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+		if hasIP && (tsCGNAT.Contains(parsedIP) || tsULA.Contains(parsedIP)) {
+			return SimulationResult{Outbound: "direct", MatchedRule: "builtin:system_tailscale", Action: "route"}
+		}
+		if domain == "ts.net" || strings.HasSuffix(domain, ".ts.net") {
+			return SimulationResult{Outbound: "direct", MatchedRule: "builtin:system_tailscale", Action: "route"}
+		}
+	}
+
+	if profile.Mode != "direct" && hasIP && (parsedIP == netip.MustParseAddr("169.254.169.254") || parsedIP == netip.MustParseAddr("100.100.100.200") || parsedIP == netip.MustParseAddr("fd00:ec2::254")) {
+		return SimulationResult{Outbound: "block", MatchedRule: "builtin:cloud_metadata", Action: "reject"}
+	}
+
+	if hasIP && profile.BypassLAN && !isFakeIPAddr(profile, parsedIP) && (parsedIP.IsPrivate() || parsedIP.IsLoopback() || parsedIP.IsLinkLocalUnicast()) {
+		return SimulationResult{Outbound: "direct", MatchedRule: "builtin:ip_is_private", Action: "route"}
+	}
+
+	if !profile.IPv6Enabled() && profile.Mode != "direct" && hasIP && parsedIP.Is6() && netip.MustParsePrefix("2000::/3").Contains(parsedIP) {
+		return SimulationResult{Outbound: "block", MatchedRule: "builtin:disable_ipv6", Action: "reject"}
+	}
+
 	if profile.Mode != "direct" && isWebRTCTraffic(domain, in) {
 		switch profile.WebRTCMode {
 		case "block":
@@ -457,10 +564,6 @@ func Simulate(profile RoutingProfile, in SimulationInput) SimulationResult {
 		}
 	}
 
-	if hasIP && profile.BypassLAN && !isFakeIPAddr(profile, parsedIP) && (parsedIP.IsPrivate() || parsedIP.IsLoopback() || parsedIP.IsLinkLocalUnicast()) {
-		return SimulationResult{Outbound: "direct", MatchedRule: "builtin:ip_is_private", Action: "route"}
-	}
-
 	switch profile.Mode {
 	case "direct":
 		return SimulationResult{Outbound: "direct", MatchedRule: "mode:direct", Action: "route"}
@@ -468,34 +571,36 @@ func Simulate(profile RoutingProfile, in SimulationInput) SimulationResult {
 		return SimulationResult{Outbound: "proxy", MatchedRule: "mode:global", Action: "route"}
 	}
 
-	if profile.BlockAds && isKnownAdDomain(domain) {
+	if profile.BlockAds && isKnownAdDomain(domain) && !IsGooglePlayAllowlistDomain(domain) {
 		return SimulationResult{Outbound: "block", MatchedRule: "builtin:geosite-category-ads-all", Action: "reject"}
 	}
 
-	for i, rule := range profile.CustomRules {
-		if !rule.Enabled {
-			continue
-		}
-		if matchesRule(rule, domain, parsedIP, hasIP, sourceIP, hasSourceIP, in) {
-			name := rule.Name
-			if name == "" {
-				name = fmt.Sprintf("custom_rule_%d", i+1)
+	if profile.CustomRulesEnabledOrDefault() {
+		for i, rule := range profile.CustomRules {
+			if !rule.Enabled {
+				continue
 			}
-			action := "route"
-			out := rule.Outbound
-			if out == "" {
-				out = "proxy"
+			if matchesRule(rule, domain, parsedIP, hasIP, sourceIP, hasSourceIP, in) {
+				name := rule.Name
+				if name == "" {
+					name = fmt.Sprintf("custom_rule_%d", i+1)
+				}
+				action := "route"
+				out := rule.Outbound
+				if out == "" {
+					out = "proxy"
+				}
+				if out == "block" || out == "reject" {
+					out = "block"
+					action = "reject"
+				}
+				return SimulationResult{Outbound: out, MatchedRule: name, Action: action}
 			}
-			if out == "block" || out == "reject" {
-				out = "block"
-				action = "reject"
-			}
-			return SimulationResult{Outbound: out, MatchedRule: name, Action: action}
 		}
 	}
 
 	if profile.BypassCN {
-		if domain != "" && (strings.HasSuffix(domain, ".cn") || domain == "baidu.com" || strings.HasSuffix(domain, ".baidu.com") || strings.HasSuffix(domain, ".qq.com") || strings.HasSuffix(domain, ".taobao.com") || strings.HasSuffix(domain, ".jd.com") || strings.HasSuffix(domain, ".bilibili.com")) {
+		if domain != "" && !IsGooglePlayAllowlistDomain(domain) && (strings.HasSuffix(domain, ".cn") || domain == "baidu.com" || strings.HasSuffix(domain, ".baidu.com") || strings.HasSuffix(domain, ".qq.com") || strings.HasSuffix(domain, ".taobao.com") || strings.HasSuffix(domain, ".jd.com") || strings.HasSuffix(domain, ".bilibili.com")) {
 			return SimulationResult{Outbound: "direct", MatchedRule: "builtin:geosite-cn", Action: "route"}
 		}
 		if hasIP && isCNProbeHintIP(parsedIP) {

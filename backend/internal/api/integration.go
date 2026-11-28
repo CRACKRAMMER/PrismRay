@@ -30,7 +30,7 @@ func (s *Server) handleSystemProxy(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"enabled":    m.Active(),
-			"remembered": s.systemProxyWanted,
+			"remembered": s.runtimeState().systemProxyWanted,
 			"port":       s.ensureOrchestrator().Status().MixedPort,
 		})
 		return
@@ -53,7 +53,8 @@ func (s *Server) handleSystemProxy(w http.ResponseWriter, r *http.Request) {
 		s.opMu.Lock()
 		st := s.ensureOrchestrator().Status()
 		if !st.Running && s.store != nil && len(s.store.List()) > 0 {
-			if reconciled, recErr := s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, s.tunEnabled); recErr == nil {
+			rs := s.runtimeState()
+			if reconciled, recErr := s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled); recErr == nil {
 				st = reconciled
 			}
 		}
@@ -81,6 +82,6 @@ func (s *Server) handleSystemProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"enabled":    m.Active(),
-		"remembered": s.systemProxyWanted,
+		"remembered": s.runtimeState().systemProxyWanted,
 	})
 }

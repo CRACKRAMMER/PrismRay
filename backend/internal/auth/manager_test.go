@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/config"
@@ -331,5 +332,103 @@ func TestDesktopBiometricUnlockLifecycle(t *testing.T) {
 	}
 	if _, found, _ := kr.Derive("biometric").Load(); found {
 		t.Fatal("expected biometric keyring slot deleted after disabling password lock")
+	}
+}
+
+func TestAndroidHardwareBiometricKEKLifecycleAndPasswordChange(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "prismray.db")
+	keySlot := filepath.Join(dir, ".device.key")
+	legacyPlain := keySlot + ".biometric"
+
+	// Simulate an existing legacy plaintext .device.key.biometric left over from older versions.
+	if err := os.WriteFile(legacyPlain, []byte("legacy-plaintext-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := storage.NewStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	kr := keyring.New(keyring.Options{FallbackPath: keySlot, DisableOSKeyring: true})
+	m, err := NewWithOptions(st, Options{Mode: ModeAndroid, Keyring: kr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Stat(legacyPlain); !os.IsNotExist(statErr) {
+		t.Fatal("expected Android startup to delete legacy plaintext .device.key.biometric")
+	}
+
+	if err := m.EnablePasswordLock("InitialPass123!"); err != nil {
+		t.Fatalf("EnablePasswordLock failed: %v", err)
+	}
+	kek, err := m.SetBiometricUnlockHardware(true, "InitialPass123!")
+	if err != nil || kek == "" {
+		t.Fatalf("SetBiometricUnlockHardware failed: %v", err)
+	}
+	if _, statErr := os.Stat(legacyPlain); !os.IsNotExist(statErr) {
+		t.Fatal("hardware biometric enrollment must not create plaintext .device.key.biometric")
+	}
+
+	// Changing password must preserve hardware biometric wrapping.
+	if err := m.ChangePassword("InitialPass123!", "RotatedPass456!"); err != nil {
+		t.Fatalf("ChangePassword failed: %v", err)
+	}
+	m.Lock()
+	if _, err := m.UnlockWithBiometricKEK("invalid-base64"); err == nil {
+		t.Fatal("expected invalid KEK to fail")
+	}
+	tok, err := m.UnlockWithBiometricKEK(kek)
+	if err != nil || tok == "" {
+		t.Fatalf("expected hardware KEK unlock to succeed after ChangePassword, got err=%v", err)
+	}
+	// Legacy keyring-based UnlockWithBiometric must always be rejected on Android.
+	m.Lock()
+	if _, err := m.UnlockWithBiometric(); err == nil {
+		t.Fatal("expected UnlockWithBiometric without hardware KEK to fail on Android")
+	}
+}
+
+func TestAuthHardeningDoubleEnableAndTryLockAndLockout(t *testing.T) {
+	dir := t.TempDir()
+	st, err := storage.NewStore(filepath.Join(dir, "prismray.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	kr := keyring.New(keyring.Options{FallbackPath: filepath.Join(dir, ".device.key"), DisableOSKeyring: true})
+	m, err := NewWithOptions(st, Options{Mode: ModeDesktop, Keyring: kr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.EnablePasswordLock("StrongPass123!"); err != nil {
+		t.Fatalf("EnablePasswordLock failed: %v", err)
+	}
+	if err := m.EnablePasswordLock("OverwritePass999!"); err == nil {
+		t.Fatal("expected second EnablePasswordLock call while already locked to fail")
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			if idx%2 == 0 {
+				_ = m.TryLock()
+			} else {
+				_, _ = m.Login("WrongPassword!")
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Drain up to 5 failures to trigger brute-force lockout and verify subsequent attempt is rejected.
+	for i := 0; i < 5; i++ {
+		_, _ = m.Login("WrongPassword!")
+	}
+	if _, err := m.Login("StrongPass123!"); err == nil || !strings.Contains(err.Error(), "too many attempts") {
+		t.Fatalf("expected lockout after 5 bad passwords, got %v", err)
 	}
 }

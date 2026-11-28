@@ -19,6 +19,7 @@ type Config struct {
 	PerAppPackages []string `json:"per_app_packages,omitempty"`
 	ActiveNodeID   string   `json:"active_node_id,omitempty"`
 	ActiveGroupID  string   `json:"active_group_id,omitempty"`
+	HevAvailable   *bool    `json:"hev_available,omitempty"`
 }
 
 // Status reflects the current Android VpnService coordination state.

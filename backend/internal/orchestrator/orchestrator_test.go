@@ -368,4 +368,108 @@ func TestAppendLogStripsANSIAndInfersLevel(t *testing.T) {
 	if logs[2].Level != "error" || logs[2].Message != "ERROR dial tcp timeout" {
 		t.Fatalf("unexpected log[2]: %+v", logs[2])
 	}
+
+	// Leading sing-box UTC/offset timestamp + level prefix should be stripped while preserving level inference.
+	o.AppendLog("sing-box", "", "+0000 2026-11-26 18:06:01 ERROR [4283015988 64ms] connection: open connection failed")
+	o.AppendLog("sing-box", "", "+0800 2026-11-27 02:06:01 WARN inbound/mixed: connection reset")
+	logs2 := o.LogHistory(10)
+	if len(logs2) != 5 {
+		t.Fatalf("expected 5 logs, got %d", len(logs2))
+	}
+	if logs2[3].Level != "error" || logs2[3].Message != "[4283015988 64ms] connection: open connection failed" {
+		t.Fatalf("unexpected log[3]: %+v", logs2[3])
+	}
+	if logs2[4].Level != "warn" || logs2[4].Message != "inbound/mixed: connection reset" {
+		t.Fatalf("unexpected log[4]: %+v", logs2[4])
+	}
+}
+
+func TestTopologyFingerprintDetectsHealthTransition(t *testing.T) {
+	baseNode := func(lat int) *config.Node {
+		return &config.Node{
+			ID:       "n1",
+			Name:     "Shard 1",
+			Protocol: config.ProtocolSocks,
+			Address:  "198.51.100.1",
+			Port:     1080,
+			Latency:  lat,
+		}
+	}
+	makeInput := func(lat int) ApplyInput {
+		return ApplyInput{
+			Nodes: []*config.Node{baseNode(lat)},
+			Groups: []storage.Group{
+				{ID: "g-lb", Name: "LB", Strategy: "loadbalance", NodeIDs: []string{"n1"}},
+			},
+			Routing:       ruleset.DefaultRoutingProfile(),
+			ActiveGroupID: "g-lb",
+			MixedPort:     10808,
+			ClashAPIPort:  9090,
+		}
+	}
+
+	fpHealthy50, err := topologyFingerprint(makeInput(50), false)
+	if err != nil {
+		t.Fatalf("fpHealthy50: %v", err)
+	}
+	fpHealthy120, err := topologyFingerprint(makeInput(120), false)
+	if err != nil {
+		t.Fatalf("fpHealthy120: %v", err)
+	}
+	fpDead, err := topologyFingerprint(makeInput(-1), false)
+	if err != nil {
+		t.Fatalf("fpDead: %v", err)
+	}
+
+	if fpHealthy50 != fpHealthy120 {
+		t.Fatalf("normal latency jitter between healthy values should NOT trigger topology reload")
+	}
+	if fpHealthy50 == fpDead {
+		t.Fatalf("transition from healthy (50ms) to dead (-1) MUST change topologyFingerprint so LB evicts dead shard")
+	}
+}
+
+func TestTopologyFingerprintDetectsFailoverAndActiveLBChanges(t *testing.T) {
+	baseIn := func() ApplyInput {
+		return ApplyInput{
+			Nodes: []*config.Node{
+				{ID: "n1", Name: "N1", Protocol: config.ProtocolSocks, Address: "198.51.100.1", Port: 1080, Latency: 20},
+				{ID: "n2", Name: "N2", Protocol: config.ProtocolSocks, Address: "198.51.100.2", Port: 1080, Latency: 30},
+			},
+			Groups: []storage.Group{
+				{ID: "g-fo", Name: "FO", Strategy: "failover", FailoverTrigger: "high_latency_or_unavailable", HighLatencyMS: 800, NodeIDs: []string{"n1", "n2"}},
+				{ID: "g-lb", Name: "LB", Strategy: "loadbalance", NodeIDs: []string{"n1", "n2"}},
+			},
+			Routing:       ruleset.DefaultRoutingProfile(),
+			ActiveGroupID: "g-fo",
+			HighLatencyMS: 800,
+			MixedPort:     10808,
+			ClashAPIPort:  9090,
+		}
+	}
+	fpBase, err := topologyFingerprint(baseIn(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	inTrig := baseIn()
+	inTrig.Groups[0].FailoverTrigger = "unavailable_only"
+	fpTrig, _ := topologyFingerprint(inTrig, false)
+	if fpBase == fpTrig {
+		t.Fatalf("expected FailoverTrigger change to alter topologyFingerprint")
+	}
+
+	inLat := baseIn()
+	inLat.HighLatencyMS = 450
+	fpLat, _ := topologyFingerprint(inLat, false)
+	if fpBase == fpLat {
+		t.Fatalf("expected global HighLatencyMS change to alter topologyFingerprint")
+	}
+
+	inLB := baseIn()
+	inLB.ActiveGroupID = "g-lb"
+	fpLB, _ := topologyFingerprint(inLB, false)
+	if fpBase == fpLB {
+		t.Fatalf("expected switching ActiveGroupID to loadbalance group to alter topologyFingerprint")
+	}
 }

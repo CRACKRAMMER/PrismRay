@@ -24,15 +24,16 @@ func (e *tun2socksEngine) Start(tunFD int, mixedPort int, mtu int) error {
 		return fmt.Errorf("invalid mixed port: %d", mixedPort)
 	}
 	if mtu <= 0 {
-		mtu = 1500
+		mtu = 8500
 	}
 	DefaultAppRoutingProxy.SetMixedPort(mixedPort)
 	engine.Insert(&engine.Key{
-		Device:     fmt.Sprintf("fd://%d", tunFD),
-		Proxy:      "prismray://local",
-		MTU:        mtu,
-		LogLevel:   "warning",
-		UDPTimeout: 60 * time.Second,
+		Device:                   fmt.Sprintf("fd://%d", tunFD),
+		Proxy:                    "prismray://local",
+		MTU:                      mtu,
+		LogLevel:                 "error",
+		UDPTimeout:               30 * time.Second,
+		TCPModerateReceiveBuffer: true,
 	})
 	engine.Start()
 	return nil

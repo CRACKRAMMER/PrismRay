@@ -56,10 +56,14 @@ type StorageConfig struct {
 
 // Default returns a Config with v1.0.0 defaults.
 func Default() *Config {
+	allowedOrigins := []string{"tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"}
+	if strings.TrimSpace(os.Getenv("PRISMRAY_DEV_CORS")) == "1" {
+		allowedOrigins = append(allowedOrigins, "http://localhost:1420", "http://127.0.0.1:1420")
+	}
 	return &Config{
 		Server: ServerConfig{
 			Host:           "127.0.0.1",
-			AllowedOrigins: []string{"http://localhost:1420", "http://127.0.0.1:1420", "tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"},
+			AllowedOrigins: allowedOrigins,
 			Port:           2178,
 		},
 		SingBox: SingBoxConfig{
@@ -67,7 +71,7 @@ func Default() *Config {
 			MixedPort:    10808,
 			ClashAPIPort: 9090,
 			RuleSetDir:   "rulesets",
-			AutoUpdate:   true,
+			AutoUpdate:   false,
 		},
 		Xray: XrayConfig{
 			ConfigPath: "xray-sidecar.json",

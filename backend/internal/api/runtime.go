@@ -18,7 +18,6 @@ import (
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/orchestrator"
 	sbcfg "github.com/CRACKRAMMER/PrismRay/backend/internal/singbox/config"
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/singbox/ruleset"
-	"github.com/CRACKRAMMER/PrismRay/backend/internal/storage"
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/tun"
 )
 
@@ -57,8 +56,8 @@ func (s *Server) ensureOrchestrator() *orchestrator.Orchestrator {
 		return s.orch
 	}
 	workDir := ""
-	sbBin := s.singBoxBinary
-	xrayBin := s.xrayBinary
+	sbBin := s.SingBoxBinary()
+	xrayBin := s.XrayBinary()
 	if s.cfg != nil {
 		workDir = s.cfg.RuntimeDir()
 		if sbBin == "" {
@@ -83,23 +82,41 @@ func (s *Server) ensureOrchestrator() *orchestrator.Orchestrator {
 	return s.orch
 }
 
+// SingBoxBinary returns the configured sing-box binary path safely.
+func (s *Server) SingBoxBinary() string {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.singBoxBinary
+}
+
+// XrayBinary returns the configured Xray binary path safely.
+func (s *Server) XrayBinary() string {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.xrayBinary
+}
+
 // SetSingBoxPath configures the managed sing-box binary path on both Server and Orchestrator.
 func (s *Server) SetSingBoxPath(path string) {
+	s.stateMu.Lock()
 	s.singBoxBinary = path
 	if s.cfg != nil {
 		s.cfg.SingBox.BinaryPath = path
 	}
+	s.stateMu.Unlock()
 	s.ensureOrchestrator().SetBinaries(path, "")
 }
 
 // SetXrayPath configures the managed Xray coprocessor binary path on Server, legacy PM, and Orchestrator.
 func (s *Server) SetXrayPath(path string) {
+	s.stateMu.Lock()
 	s.xrayBinary = path
-	if s.pm != nil {
-		s.pm.SetBinaryPath(path)
-	}
 	if s.cfg != nil {
 		s.cfg.Xray.BinaryPath = path
+	}
+	s.stateMu.Unlock()
+	if s.pm != nil {
+		s.pm.SetBinaryPath(path)
 	}
 	s.ensureOrchestrator().SetBinaries("", path)
 }
@@ -127,20 +144,35 @@ func (s *Server) ruleSetDir() string {
 	return filepath.Join(dataDir, "rulesets")
 }
 
+func (s *Server) isAndroidPowerMode() bool {
+	return s.mode == authservice.ModeAndroid || runtime.GOOS == "android"
+}
+
 func (s *Server) routingProfile() (ruleset.RoutingProfile, error) {
 	profile := ruleset.DefaultRoutingProfile()
+	if s.isAndroidPowerMode() {
+		// Suppress per-connection info log storms on Android by default while keeping warn/error
+		// outbound dial failures visible for passive fast failover and diagnostics.
+		profile.LogLevel = "warn"
+	}
 	if s.store == nil {
 		return profile, nil
 	}
-	rec, found, err := s.store.GetRoutingProfile("default")
+	profileID := s.activeRoutingProfileID()
+	rec, found, err := s.store.GetRoutingProfile(profileID)
 	if err != nil {
 		return profile, err
 	}
 	if !found || len(rec.Document) == 0 {
+		s.setCachedRoutingMode(profile.Mode)
 		return profile, nil
 	}
 	if err := json.Unmarshal(rec.Document, &profile); err != nil {
-		return ruleset.DefaultRoutingProfile(), err
+		fallback := ruleset.DefaultRoutingProfile()
+		if s.isAndroidPowerMode() {
+			fallback.LogLevel = "warn"
+		}
+		return fallback, err
 	}
 	profile.Normalize()
 	// One-time migration: replace legacy untouched default https://dns.google/dns-query with
@@ -153,35 +185,72 @@ func (s *Server) routingProfile() (ruleset.RoutingProfile, error) {
 		}
 		_ = s.store.PutSetting("migrations.remote_dns_cf_v1", true)
 	}
+	// One-time Android battery migration: shift legacy default info log level to warn once
+	// without overriding subsequent user changes back to info/debug.
+	if s.isAndroidPowerMode() {
+		var powerMigrated bool
+		if foundFlag, flagErr := s.store.GetSetting("migrations.android_power_v1", &powerMigrated); flagErr == nil && (!foundFlag || !powerMigrated) {
+			if strings.EqualFold(strings.TrimSpace(profile.LogLevel), "info") {
+				profile.LogLevel = "warn"
+				_ = s.saveRoutingProfile(profile)
+			}
+			_ = s.store.PutSetting("migrations.android_power_v1", true)
+		}
+	}
+	s.setCachedRoutingMode(profile.Mode)
 	return profile, nil
 }
 
 func (s *Server) saveRoutingProfile(profile ruleset.RoutingProfile) error {
-	profile.Normalize()
-	raw, err := json.Marshal(profile)
-	if err != nil {
-		return err
+	return s.saveRoutingProfileByID(s.activeRoutingProfileID(), profile)
+}
+
+const deletedBuiltinRuleSetsSettingKey = "rulesets.deleted_builtins"
+
+func (s *Server) deletedBuiltinRuleSetIDs() map[string]bool {
+	out := map[string]bool{}
+	if s.store == nil {
+		return out
 	}
+	var ids []string
+	if found, err := s.store.GetSetting(deletedBuiltinRuleSetsSettingKey, &ids); err == nil && found {
+		for _, id := range ids {
+			if clean := strings.TrimSpace(id); clean != "" {
+				out[clean] = true
+			}
+		}
+	}
+	return out
+}
+
+func (s *Server) setDeletedBuiltinRuleSetIDs(ids map[string]bool) error {
 	if s.store == nil {
 		return nil
 	}
-	return s.store.SaveRoutingProfile(storage.RoutingProfileRecord{
-		ID:       "default",
-		Document: raw,
-	})
+	list := make([]string, 0, len(ids))
+	for id, deleted := range ids {
+		if deleted && strings.TrimSpace(id) != "" {
+			list = append(list, strings.TrimSpace(id))
+		}
+	}
+	return s.store.PutSetting(deletedBuiltinRuleSetsSettingKey, list)
 }
 
 func (s *Server) effectiveRuleSets() ([]ruleset.RuleSetSpec, error) {
+	deletedBuiltins := s.deletedBuiltinRuleSetIDs()
 	builtins := ruleset.BuiltinRuleSets(s.ruleSetDir())
 	byID := make(map[string]int, len(builtins))
-	out := make([]ruleset.RuleSetSpec, len(builtins))
-	for i, spec := range builtins {
+	out := make([]ruleset.RuleSetSpec, 0, len(builtins))
+	for _, spec := range builtins {
+		if deletedBuiltins[spec.ID] {
+			continue
+		}
 		if info, err := os.Stat(spec.LocalPath); err == nil && !info.IsDir() && info.Size() > 0 {
 			spec.Synced = true
 			spec.SizeBytes = info.Size()
 		}
-		out[i] = spec
-		byID[spec.ID] = i
+		byID[spec.ID] = len(out)
+		out = append(out, spec)
 	}
 	if s.store == nil {
 		return out, nil
@@ -191,6 +260,9 @@ func (s *Server) effectiveRuleSets() ([]ruleset.RuleSetSpec, error) {
 		return nil, err
 	}
 	for _, r := range stored {
+		if deletedBuiltins[r.ID] {
+			continue
+		}
 		spec := ruleset.RuleSetSpec{
 			ID:             r.ID,
 			Tag:            r.Tag,
@@ -207,9 +279,17 @@ func (s *Server) effectiveRuleSets() ([]ruleset.RuleSetSpec, error) {
 			spec.LocalPath = filepath.Join(s.ruleSetDir(), spec.Tag+".srs")
 		}
 		if spec.LocalPath != "" {
-			if info, statErr := os.Stat(spec.LocalPath); statErr == nil && !info.IsDir() && info.Size() > 0 {
-				spec.Synced = true
-				spec.SizeBytes = info.Size()
+			// Defensively enforce that every ruleset path remains confined to s.ruleSetDir().
+			if safePath, pErr := sanitizeRuleSetPath(s.ruleSetDir(), spec.Tag, spec.LocalPath); pErr == nil {
+				spec.LocalPath = safePath
+				if info, statErr := os.Stat(spec.LocalPath); statErr == nil && !info.IsDir() && info.Size() > 0 {
+					spec.Synced = true
+					spec.SizeBytes = info.Size()
+				}
+			} else {
+				spec.LocalPath = ""
+				spec.Synced = false
+				spec.Enabled = false
 			}
 		}
 		if idx, ok := byID[spec.ID]; ok {
@@ -234,9 +314,11 @@ func (s *Server) effectiveSudoPassword() []byte {
 }
 
 func (s *Server) persistRuntimeSelection(nodeID, groupID string, tunEnabled bool) {
+	s.stateMu.Lock()
 	s.activeNodeID = nodeID
 	s.activeGroupID = groupID
 	s.tunEnabled = tunEnabled
+	s.stateMu.Unlock()
 	if s.store == nil {
 		return
 	}
@@ -246,14 +328,14 @@ func (s *Server) persistRuntimeSelection(nodeID, groupID string, tunEnabled bool
 }
 
 func (s *Server) persistWantRunning(want bool) {
-	s.wantRunning = want
+	s.setWantRunningState(want)
 	if s.store != nil {
 		_ = s.store.PutSetting("runtime.want_running", want)
 	}
 }
 
 func (s *Server) persistSystemProxyWanted(want bool) {
-	s.systemProxyWanted = want
+	s.setSystemProxyWantedState(want)
 	if s.store != nil {
 		_ = s.store.PutSetting("runtime.system_proxy_enabled", want)
 	}
@@ -264,6 +346,14 @@ func (s *Server) RestoreLastSession(ctx context.Context) {
 	if s.store == nil {
 		return
 	}
+	if s.isAndroidPowerMode() {
+		// On Android, traffic only routes through PrismRay when ProxyVpnService establishes the
+		// OS VpnService TUN interface and invokes /api/vpn/android/start. Never start a headless
+		// sing-box core on cold app launch without an active VpnService, which otherwise makes
+		// the UI falsely report an active global VPN. Boot/Always-on auto-connect is handled
+		// natively by BootCompletedReceiver and Android Always-on VPN starting ProxyVpnService.
+		return
+	}
 	if s.auth != nil {
 		initialized, unlocked := s.auth.Status()
 		if !initialized || !unlocked {
@@ -271,11 +361,12 @@ func (s *Server) RestoreLastSession(ctx context.Context) {
 		}
 	}
 	s.opMu.Lock()
-	want := s.wantRunning
-	wantTUN := s.tunEnabled
-	wantSys := s.systemProxyWanted
-	nodeID := s.activeNodeID
-	groupID := s.activeGroupID
+	rs := s.runtimeState()
+	want := rs.wantRunning
+	wantTUN := rs.tunEnabled
+	wantSys := rs.systemProxyWanted
+	nodeID := rs.activeNodeID
+	groupID := rs.activeGroupID
 	orch := s.ensureOrchestrator()
 	alreadyRunning := orch.Status().Running
 	s.opMu.Unlock()
@@ -299,7 +390,8 @@ func (s *Server) RestoreLastSession(ctx context.Context) {
 	s.opMu.Lock()
 	st, err := s.reconcileRuntime(ctx, nodeID, groupID, effectiveTUN)
 	if err == nil && wantTUN && !effectiveTUN {
-		s.persistRuntimeSelection(s.activeNodeID, s.activeGroupID, true)
+		rsAfter := s.runtimeState()
+		s.persistRuntimeSelection(rsAfter.activeNodeID, rsAfter.activeGroupID, true)
 	}
 	s.opMu.Unlock()
 
@@ -317,8 +409,17 @@ func (s *Server) RestoreLastSession(ctx context.Context) {
 	}
 }
 
+func (s *Server) setAndroidSocketPaths(protectPath, ownerPath string) {
+	s.stateMu.Lock()
+	s.protectPath = strings.TrimSpace(protectPath)
+	s.ownerPath = strings.TrimSpace(ownerPath)
+	s.stateMu.Unlock()
+}
+
 func (s *Server) effectiveProtectPath() string {
+	s.stateMu.RLock()
 	p := strings.TrimSpace(s.protectPath)
+	s.stateMu.RUnlock()
 	if p == "" {
 		return ""
 	}
@@ -329,7 +430,9 @@ func (s *Server) effectiveProtectPath() string {
 }
 
 func (s *Server) effectiveOwnerPath() string {
+	s.stateMu.RLock()
 	p := strings.TrimSpace(s.ownerPath)
+	s.stateMu.RUnlock()
 	if p == "" {
 		return ""
 	}
@@ -450,22 +553,35 @@ func (s *Server) reconcileRuntime(ctx context.Context, activeNodeID, activeGroup
 		clashSecret = s.cfg.SingBox.ClashAPISecret
 	}
 
+	hs, _ := s.healthSettings()
+	var tsCfgPtr *ruleset.TailscaleConfig
+	tsStateDir := ""
+	if tsCfg, tsErr := s.tailscaleConfig(true); tsErr == nil && tsCfg.Enabled {
+		tsCfgPtr = &tsCfg
+		tsStateDir = s.tailscaleStateDir()
+		_ = os.MkdirAll(tsStateDir, 0o700)
+	}
 	in := orchestrator.ApplyInput{
-		Nodes:          nodes,
-		Groups:         groups,
-		Listeners:      listeners,
-		Routing:        routing,
-		RuleSets:       ruleSets,
-		ActiveNodeID:   activeNodeID,
-		ActiveGroupID:  activeGroupID,
-		MixedPort:      mixedPort,
-		ClashAPIPort:   clashPort,
-		ClashAPISecret: clashSecret,
-		EnableTUN:      enableTUN,
-		TUNStack:       s.tunStack,
-		AndroidMode:    androidMode,
-		ProtectPath:    protectPath,
-		SudoPassword:   sudoPass,
+		Nodes:               nodes,
+		Groups:              groups,
+		Listeners:           listeners,
+		Routing:             routing,
+		RuleSets:            ruleSets,
+		ActiveNodeID:        activeNodeID,
+		ActiveGroupID:       activeGroupID,
+		MixedPort:           mixedPort,
+		ClashAPIPort:        clashPort,
+		ClashAPISecret:      clashSecret,
+		EnableTUN:           enableTUN,
+		TUNStack:            s.runtimeState().tunStack,
+		AndroidMode:         androidMode,
+		ProtectPath:         protectPath,
+		AndroidNetIfPath:    s.androidNetIfPath(),
+		SudoPassword:        sudoPass,
+		HighLatencyMS:       hs.HighLatencyMS,
+		Tailscale:           tsCfgPtr,
+		TailscaleStateDir:   tsStateDir,
+		TailscaleStatusPath: s.tailscaleStatusPath(),
 	}
 
 	st, err := orch.Apply(ctx, in)

@@ -11,6 +11,7 @@ import (
 
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/androiddns"
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/androidvpn"
+	"github.com/CRACKRAMMER/PrismRay/backend/internal/fileutil"
 )
 
 func (s *Server) ensureAndroidVPN() *androidvpn.Manager {
@@ -55,19 +56,33 @@ func (s *Server) androidSocketDir() string {
 	return os.TempDir()
 }
 
+func (s *Server) androidNetIfPath() string {
+	return filepath.Join(s.androidSocketDir(), "android-netif.json")
+}
+
 func (s *Server) handleAndroidVPNDNS(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	var req struct {
-		Servers []string `json:"servers"`
+		Servers    []string        `json:"servers"`
+		Interfaces json.RawMessage `json:"interfaces,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	updated := androiddns.SetSystemServers(req.Servers)
+	if len(req.Interfaces) > 0 {
+		var parsed []map[string]any
+		if json.Unmarshal(req.Interfaces, &parsed) == nil && len(parsed) > 0 {
+			if rawSnap, mErr := json.Marshal(map[string]any{"interfaces": parsed}); mErr == nil {
+				_ = fileutil.WritePrivate(s.androidNetIfPath(), rawSnap)
+				s.ensureOrchestrator().NotifyAndroidNetworkChanged()
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"system_servers": updated,
 		"active_servers": androiddns.ActiveServers(),
@@ -85,6 +100,12 @@ func (s *Server) handleAndroidVPNStatus(w http.ResponseWriter, r *http.Request) 
 	bypassLAN := true
 	allowLANBroadcast := false
 	ipv6Enabled := false
+	tailscaleEnabled := false
+	var tailscaleSubnets []string
+	if tsCfg, tsErr := s.tailscaleConfig(false); tsErr == nil && tsCfg.Enabled {
+		tailscaleEnabled = true
+		tailscaleSubnets = tsCfg.EffectiveSubnets()
+	}
 	profile, err := s.routingProfile()
 	if err == nil {
 		bypassLAN = profile.BypassLAN
@@ -106,12 +127,17 @@ func (s *Server) handleAndroidVPNStatus(w http.ResponseWriter, r *http.Request) 
 	if mixedPort <= 0 && s.cfg != nil {
 		mixedPort = s.cfg.SingBox.MixedPort
 	}
+	tunEngine := "hev"
+	if len(st.AppPackages) > 0 {
+		tunEngine = "tun2socks"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"active":              vpnStatus.Active,
 		"running":             st.Running,
 		"protect_path":        vpnStatus.ProtectPath,
 		"owner_path":          vpnStatus.OwnerPath,
 		"tun_socket_path":     tunBridge.SocketPath(),
+		"tun_engine":          tunEngine,
 		"tun_active":          tunBridge.Active(),
 		"tun_fd":              vpnStatus.TunFD,
 		"mixed_port":          mixedPort,
@@ -120,9 +146,113 @@ func (s *Server) handleAndroidVPNStatus(w http.ResponseWriter, r *http.Request) 
 		"bypass_lan":          bypassLAN,
 		"allow_lan_broadcast": allowLANBroadcast,
 		"ipv6_enabled":        ipv6Enabled,
-		"active_node_id":      s.activeNodeID,
-		"active_group_id":     s.activeGroupID,
+		"tailscale_enabled":   tailscaleEnabled,
+		"tailscale_subnets":   tailscaleSubnets,
+		"active_node_id":      s.runtimeState().activeNodeID,
+		"active_group_id":     s.runtimeState().activeGroupID,
 		"updated_at":          vpnStatus.UpdatedAt,
+	})
+}
+
+// handleAndroidVPNTelemetry returns a minimal low-overhead payload for Android VPN notifications
+// without serializing the full Clash API /proxies or /connections tables when not needed.
+func (s *Server) handleAndroidVPNTelemetry(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	includeTraffic := r.URL.Query().Get("include_traffic") == "1" || r.URL.Query().Get("include_traffic") == "true"
+
+	orch := s.ensureOrchestrator()
+	st := orch.Status()
+
+	rs := s.runtimeState()
+	activeNodeID := rs.activeNodeID
+	activeGroupID := rs.activeGroupID
+	if activeNodeID == "" {
+		activeNodeID = st.ActiveNodeID
+	}
+	if activeGroupID == "" {
+		activeGroupID = st.ActiveGroupID
+	}
+
+	activeLabel := ""
+	if activeGroupID != "" && s.store != nil {
+		var groupName, selectedNodeID string
+		if groups, err := s.store.ListGroups(); err == nil {
+			for _, g := range groups {
+				if g.ID == activeGroupID {
+					groupName = strings.TrimSpace(g.Name)
+					selectedNodeID = strings.TrimSpace(g.SelectedNodeID)
+					break
+				}
+			}
+		}
+		resolvedName := ""
+		if st.Running {
+			if leafTag := orch.ResolveLiveGroupSelection(r.Context(), "group-"+activeGroupID); strings.HasPrefix(leafTag, "node-") {
+				leafID := strings.TrimPrefix(leafTag, "node-")
+				if idx := strings.Index(leafID, "--via-"); idx > 0 {
+					leafID = leafID[:idx]
+				}
+				if n := s.store.Get(leafID); n != nil {
+					resolvedName = strings.TrimSpace(n.DisplayName())
+				}
+			}
+		}
+		if resolvedName == "" && selectedNodeID != "" {
+			if n := s.store.Get(selectedNodeID); n != nil {
+				resolvedName = strings.TrimSpace(n.DisplayName())
+			}
+		}
+		switch {
+		case groupName != "" && resolvedName != "" && resolvedName != groupName:
+			activeLabel = groupName + " → " + resolvedName
+		case groupName != "":
+			activeLabel = groupName
+		case resolvedName != "":
+			activeLabel = resolvedName
+		}
+	} else if activeNodeID != "" && s.store != nil {
+		if n := s.store.Get(activeNodeID); n != nil {
+			activeLabel = strings.TrimSpace(n.DisplayName())
+		}
+	}
+
+	var uploadTotal, downloadTotal int64
+	var splitRates TrafficRates
+	hasSplitRates := false
+	if includeTraffic && st.Running {
+		rates, upTot, downTot, ok := s.ensureConnectionsHub().TelemetryRates(r.Context(), st.SingBoxPID)
+		if ok {
+			splitRates = rates
+			uploadTotal = upTot
+			downloadTotal = downTot
+			hasSplitRates = true
+		} else if tunBridge := s.ensureAndroidTun(); tunBridge.Active() {
+			uploadTotal, downloadTotal = tunBridge.TrafficTotals()
+		}
+	} else if !st.Running {
+		s.androidTrafficMu.Lock()
+		if s.androidTrafficTracker != nil {
+			s.androidTrafficTracker.Reset()
+		}
+		s.androidTrafficPID = 0
+		s.androidTrafficMu.Unlock()
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"running":          st.Running,
+		"active_label":     activeLabel,
+		"upload_total":     uploadTotal,
+		"download_total":   downloadTotal,
+		"has_split_rates":  hasSplitRates,
+		"up_rate":          splitRates.Up,
+		"down_rate":        splitRates.Down,
+		"proxy_up_rate":    splitRates.ProxyUp,
+		"proxy_down_rate":  splitRates.ProxyDown,
+		"direct_up_rate":   splitRates.DirectUp,
+		"direct_down_rate": splitRates.DirectDown,
 	})
 }
 
@@ -162,13 +292,13 @@ func (s *Server) handleAndroidVPNStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.protectPath = strings.TrimSpace(cfg.ProtectPath)
-	s.ownerPath = strings.TrimSpace(cfg.OwnerPath)
+	s.setAndroidSocketPaths(cfg.ProtectPath, cfg.OwnerPath)
 	nodeID := strings.TrimSpace(cfg.ActiveNodeID)
 	groupID := strings.TrimSpace(cfg.ActiveGroupID)
 	if nodeID == "" && groupID == "" {
-		nodeID = s.activeNodeID
-		groupID = s.activeGroupID
+		rs := s.runtimeState()
+		nodeID = rs.activeNodeID
+		groupID = rs.activeGroupID
 	}
 
 	runtimeStatus, err := s.reconcileRuntime(r.Context(), nodeID, groupID, false)
@@ -183,16 +313,34 @@ func (s *Server) handleAndroidVPNStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tunSockPath := filepath.Join(sockDir, "tun.sock")
-	if _, listenErr := s.ensureAndroidTun().Listen(tunSockPath, runtimeStatus.MixedPort, 1500); listenErr != nil {
-		respondError(w, listenErr, http.StatusInternalServerError)
-		return
+	const androidTunMTU = 8500
+	hevAvailable := cfg.HevAvailable == nil || *cfg.HevAvailable
+	tunEngine := "hev"
+	tunSockPath := ""
+	if !hevAvailable || len(runtimeStatus.AppPackages) > 0 {
+		tunEngine = "tun2socks"
+		tunSockPath = filepath.Join(sockDir, "tun.sock")
+		if _, listenErr := s.ensureAndroidTun().Listen(tunSockPath, runtimeStatus.MixedPort, androidTunMTU); listenErr != nil {
+			respondError(w, listenErr, http.StatusInternalServerError)
+			return
+		}
+		s.syncAndroidAppRouting(runtimeStatus)
+	} else {
+		// Native C/lwIP hev-socks5-tunnel handles the VPN fd directly inside ProxyVpnService;
+		// stop any previous Go tun2socks listener and skip owner.sock overhead.
+		s.ensureAndroidTun().ConfigureAppRouting(androidvpn.AppRoutingConfig{})
+		s.ensureAndroidTun().Stop()
 	}
-	s.syncAndroidAppRouting(runtimeStatus)
 
 	bypassLAN := true
 	allowLANBroadcast := false
 	ipv6Enabled := false
+	tailscaleEnabled := false
+	var tailscaleSubnets []string
+	if tsCfg, tsErr := s.tailscaleConfig(false); tsErr == nil && tsCfg.Enabled {
+		tailscaleEnabled = true
+		tailscaleSubnets = tsCfg.EffectiveSubnets()
+	}
 	if currentProfile, pErr := s.routingProfile(); pErr == nil {
 		bypassLAN = currentProfile.BypassLAN
 		allowLANBroadcast = currentProfile.BypassLAN && currentProfile.AllowLANBroadcast
@@ -204,6 +352,8 @@ func (s *Server) handleAndroidVPNStart(w http.ResponseWriter, r *http.Request) {
 		"protect_path":        vpnStatus.ProtectPath,
 		"owner_path":          vpnStatus.OwnerPath,
 		"tun_socket_path":     tunSockPath,
+		"tun_engine":          tunEngine,
+		"mtu":                 androidTunMTU,
 		"tun_fd":              vpnStatus.TunFD,
 		"mixed_port":          vpnStatus.MixedPort,
 		"per_app_mode":        vpnStatus.PerAppMode,
@@ -211,6 +361,8 @@ func (s *Server) handleAndroidVPNStart(w http.ResponseWriter, r *http.Request) {
 		"bypass_lan":          bypassLAN,
 		"allow_lan_broadcast": allowLANBroadcast,
 		"ipv6_enabled":        ipv6Enabled,
+		"tailscale_enabled":   tailscaleEnabled,
+		"tailscale_subnets":   tailscaleSubnets,
 		"updated_at":          vpnStatus.UpdatedAt,
 	})
 }
@@ -222,9 +374,8 @@ func (s *Server) handleAndroidVPNStop(w http.ResponseWriter, r *http.Request) {
 	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
-	s.wantRunning = false
-	s.protectPath = ""
-	s.ownerPath = ""
+	s.persistWantRunning(false)
+	s.setAndroidSocketPaths("", "")
 	s.ensureAndroidTun().ConfigureAppRouting(androidvpn.AppRoutingConfig{})
 	s.ensureAndroidTun().Stop()
 	if err := s.ensureOrchestrator().Stop(); err != nil {

@@ -3,7 +3,6 @@
 package api
 
 import (
-	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -24,48 +23,23 @@ func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
 		defer conn.Close()
 
 		disconnected := watchDisconnect(conn)
-		ctx, cancel := context.WithCancel(r.Context())
-		defer cancel()
-
-		var snapCh <-chan clashapi.ConnectionsSnapshot
-		var errCh <-chan error
-		if client := s.ensureOrchestrator().ClashClient(); client != nil {
-			snapCh, errCh = client.StreamConnections(ctx, 1000)
-		} else {
-			_ = conn.WriteJSON(clashapi.ConnectionsSnapshot{Connections: []clashapi.ConnectionItem{}})
-		}
-
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
+		hub := s.ensureConnectionsHub()
+		snapCh, unsub := hub.SubscribeConnections()
+		defer unsub()
 
 		for {
 			select {
 			case <-disconnected:
 				return
-			case <-ctx.Done():
+			case <-r.Context().Done():
 				return
-			case snap, ok := <-snapCh:
-				if !ok {
-					snapCh = nil
-					continue
-				}
+			case snap := <-snapCh:
 				if snap.Connections == nil {
 					snap.Connections = []clashapi.ConnectionItem{}
 				}
+				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 				if err := conn.WriteJSON(snap); err != nil {
 					return
-				}
-			case <-errCh:
-				return
-			case <-ticker.C:
-				if snapCh == nil {
-					if client := s.ensureOrchestrator().ClashClient(); client != nil {
-						snapCh, errCh = client.StreamConnections(ctx, 1000)
-					} else {
-						if err := conn.WriteJSON(clashapi.ConnectionsSnapshot{Connections: []clashapi.ConnectionItem{}}); err != nil {
-							return
-						}
-					}
 				}
 			}
 		}

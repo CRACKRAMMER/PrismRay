@@ -185,9 +185,13 @@ func (s *Store) loadFile() ([]byte, bool, error) {
 		}
 		return nil, false, err
 	}
-	key, err := decodeKeyString(string(data))
+	key, err := unprotectFileKey(string(data))
 	if err != nil {
 		return nil, false, err
+	}
+	if runtime.GOOS == "windows" && !strings.HasPrefix(strings.TrimSpace(string(data)), "dpapi:") {
+		// Seamlessly re-seal legacy plaintext Windows .device.key using DPAPI.
+		_ = s.saveFile(key)
 	}
 	return key, true, nil
 }
@@ -197,7 +201,10 @@ func (s *Store) saveFile(key []byte) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	encoded := base64.RawStdEncoding.EncodeToString(key) + "\n"
+	encoded, err := protectFileKey(key)
+	if err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(dir, ".device-key-*")
 	if err != nil {
 		return err
@@ -279,7 +286,10 @@ func (s *Store) saveOS(key []byte) error {
 		cmd.Stdin = strings.NewReader(encoded)
 		return cmd.Run()
 	case "darwin":
-		cmd := exec.Command("security", "add-generic-password", "-U", "-s", s.service, "-a", s.account, "-w", encoded)
+		// Use `security -i` over stdin so the base64 master key never appears in process argv.
+		cmd := exec.Command("security", "-i")
+		line := fmt.Sprintf("add-generic-password -U -s %q -a %q -w %q\n", s.service, s.account, encoded)
+		cmd.Stdin = strings.NewReader(line)
 		return cmd.Run()
 	default:
 		return errors.New("unsupported OS keyring")

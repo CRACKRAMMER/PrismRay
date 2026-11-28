@@ -18,6 +18,8 @@ Thumbs.db
 # ===========================
 # Compiled binary
 backend/server
+/backend/singbox-android/singbox-android
+/backend/singbox-android/singbox-android.exe
 
 # Xray core binary (downloaded at runtime)
 backend/xray

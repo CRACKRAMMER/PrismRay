@@ -111,7 +111,8 @@ func (s *Server) handlePreferences(w http.ResponseWriter, r *http.Request) {
 	running := s.ensureOrchestrator().Status().Running
 	var applyErr error
 	if running {
-		_, applyErr = s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, s.tunEnabled)
+		rs := s.runtimeState()
+		_, applyErr = s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled)
 		if applyErr != nil {
 			_ = s.store.PutSetting("app.preferences", oldPrefs)
 			_ = s.saveRoutingProfile(oldProfile)

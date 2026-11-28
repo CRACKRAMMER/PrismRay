@@ -57,7 +57,14 @@ func targetBinaryName(osName string) string {
 // Download fetches, SHA-256 verifies, and extracts the requested sing-box binary
 // (returning binaryPath, resolvedVersionTag, error).
 func Download(ctx context.Context, destination, requestedVersion string) (string, string, error) {
-	client := &http.Client{Timeout: 5 * time.Minute}
+	return DownloadWithClient(ctx, nil, destination, requestedVersion)
+}
+
+// DownloadWithClient behaves like Download but uses the provided HTTP client (e.g. local proxy fallback).
+func DownloadWithClient(ctx context.Context, client *http.Client, destination, requestedVersion string) (string, string, error) {
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Minute}
+	}
 	version := strings.TrimPrefix(requestedVersion, "v")
 	latest := requestedVersion == "" || requestedVersion == "latest"
 	if !latest && !versionPattern.MatchString(version) {

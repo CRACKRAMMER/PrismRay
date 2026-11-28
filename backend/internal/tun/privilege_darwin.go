@@ -47,15 +47,12 @@ func hasSetuidRoot(path string) bool {
 	return false
 }
 
-// CheckPrivilege reports macOS utun privilege readiness (root or setuid-root sing-box).
+// CheckPrivilege reports macOS utun privilege readiness without relying on unsafe setuid-root binaries.
 func CheckPrivilege(singBoxBinary string) PrivilegeInfo {
 	info := PrivilegeInfo{
 		OS:          runtime.GOOS,
 		SingBoxPath: singBoxBinary,
 		IsRoot:      os.Geteuid() == 0,
-	}
-	if _, err := exec.LookPath("osascript"); err == nil {
-		info.CanPkexec = true
 	}
 	if info.IsRoot {
 		info.HasCapAdmin = true
@@ -64,12 +61,15 @@ func CheckPrivilege(singBoxBinary string) PrivilegeInfo {
 		return info
 	}
 	if hasSetuidRoot(singBoxBinary) {
-		info.HasCapAdmin = true
-		info.ReadyWithoutPassword = true
-		info.Detail = "macOS kernel utun transparent proxy ready via setuid-root sing-box (intentionally does not appear under System Settings → VPN)"
+		// Legacy setuid-root sing-box is unsafe (world-executable root config reader/writer).
+		// Require clearing the legacy setuid bit or using cached sudo password per session.
+		if _, err := exec.LookPath("osascript"); err == nil {
+			info.CanPkexec = true
+		}
+		info.Detail = "Detected legacy setuid-root sing-box; click Authorize to safely revoke setuid and use sudo cache for macOS utun"
 		return info
 	}
-	info.Detail = "macOS kernel utun transparent proxy requires one-time administrator authorization (setuid root) or cached sudo password"
+	info.Detail = "macOS kernel utun transparent proxy requires caching your administrator sudo password in Security settings or running as root"
 	return info
 }
 
@@ -77,8 +77,9 @@ func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
-// AuthorizeWithPkexec prompts the native macOS administrator dialog via osascript
-// to grant setuid-root ownership on the sing-box binary for passwordless utun creation.
+// AuthorizeWithPkexec on macOS no longer grants world-executable setuid-root (chmod 4755).
+// If a legacy setuid-root sing-box binary is present, it revokes the setuid bit safely;
+// otherwise it guides callers to use cached sudo credentials for TUN sessions.
 func AuthorizeWithPkexec(ctx context.Context, singBoxBinary string) error {
 	if strings.TrimSpace(singBoxBinary) == "" {
 		return fmt.Errorf("sing-box binary path is empty")
@@ -87,25 +88,26 @@ func AuthorizeWithPkexec(ctx context.Context, singBoxBinary string) error {
 	if err != nil {
 		resolved = singBoxBinary
 	}
+	if filepath.Base(resolved) != "sing-box" {
+		return fmt.Errorf("refusing privilege operation on non-sing-box binary %q", filepath.Base(resolved))
+	}
 	if _, err := os.Stat(resolved); err != nil {
 		return fmt.Errorf("sing-box binary not found: %w", err)
 	}
-	if _, err := exec.LookPath("osascript"); err != nil {
-		return fmt.Errorf("osascript not available on macOS")
-	}
-	quotedPath := shellSingleQuote(resolved)
-	shellCmd := fmt.Sprintf("chown root:wheel %s && chmod 4755 %s", quotedPath, quotedPath)
-	appleScript := fmt.Sprintf("do shell script %q with administrator privileges", shellCmd)
-	cmd := exec.CommandContext(ctx, "osascript", "-e", appleScript)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg != "" {
-			return fmt.Errorf("macOS authorization failed: %s", msg)
+	if hasSetuidRoot(resolved) {
+		if _, err := exec.LookPath("osascript"); err != nil {
+			return fmt.Errorf("osascript not available to revoke legacy setuid-root bit")
 		}
-		return fmt.Errorf("macOS authorization failed: %w", err)
+		quotedPath := shellSingleQuote(resolved)
+		shellCmd := fmt.Sprintf("chmod 0755 %s", quotedPath)
+		appleScript := fmt.Sprintf("do shell script %q with administrator privileges", shellCmd)
+		cmd := exec.CommandContext(ctx, "osascript", "-e", appleScript)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to revoke legacy setuid bit: %s", strings.TrimSpace(string(out)))
+		}
+		return nil
 	}
-	return nil
+	return fmt.Errorf("为防止本地提权，macOS 已禁用对 sing-box 设置 setuid root；请在设置中缓存 sudo 密码后开启 TUN")
 }
 
 // HasMarkCapability reports false on macOS (no Linux SO_MARK).

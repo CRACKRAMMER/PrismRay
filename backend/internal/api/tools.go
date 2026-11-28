@@ -4,12 +4,16 @@ package api
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"runtime"
 	"strings"
 
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/appconfig"
+	authservice "github.com/CRACKRAMMER/PrismRay/backend/internal/auth"
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/config"
+	sbcfg "github.com/CRACKRAMMER/PrismRay/backend/internal/singbox/config"
+	"github.com/CRACKRAMMER/PrismRay/backend/internal/singbox/ruleset"
 )
 
 func (s *Server) SetSettingsPath(path string) { s.settingsPath = path }
@@ -19,16 +23,36 @@ func isLoopbackHost(host string) bool {
 	return h == "127.0.0.1" || h == "localhost" || h == "::1"
 }
 
+func isValidBindHost(host string) bool {
+	h := strings.TrimSpace(host)
+	if h == "" {
+		return false
+	}
+	if isLoopbackHost(h) || h == "0.0.0.0" || h == "::" {
+		return true
+	}
+	return net.ParseIP(strings.Trim(h, "[]")) != nil
+}
+
+func sanitizeSettingsForResponse(in *appconfig.Config) appconfig.Config {
+	if in == nil {
+		return appconfig.Config{}
+	}
+	cp := *in
+	cp.SingBox.ClashAPISecret = ""
+	return cp
+}
+
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		if s.store != nil {
 			var stored appconfig.Config
 			if found, err := s.store.GetSetting("app.settings", &stored); err == nil && found {
-				writeJSON(w, http.StatusOK, &stored)
+				writeJSON(w, http.StatusOK, sanitizeSettingsForResponse(&stored))
 				return
 			}
 		}
-		writeJSON(w, http.StatusOK, s.cfg)
+		writeJSON(w, http.StatusOK, sanitizeSettingsForResponse(s.cfg))
 		return
 	}
 	if r.Method != http.MethodPut {
@@ -41,7 +65,27 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if !isLoopbackHost(cfg.Server.Host) {
+	// Preserve server-controlled binary, storage, secret, and origin security fields; never allow
+	// client JSON to redirect sing-box/xray paths toward arbitrary binaries or alter CORS origins.
+	if s.cfg != nil {
+		cfg.SingBox.BinaryPath = s.cfg.SingBox.BinaryPath
+		cfg.SingBox.ConfigPath = s.cfg.SingBox.ConfigPath
+		cfg.SingBox.RuleSetDir = s.cfg.SingBox.RuleSetDir
+		if strings.TrimSpace(cfg.SingBox.ClashAPISecret) == "" {
+			cfg.SingBox.ClashAPISecret = s.cfg.SingBox.ClashAPISecret
+		}
+		cfg.Xray.BinaryPath = s.cfg.Xray.BinaryPath
+		cfg.Xray.ConfigPath = s.cfg.Xray.ConfigPath
+		cfg.Storage.DatabasePath = s.cfg.Storage.DatabasePath
+		cfg.Storage.NodesFile = s.cfg.Storage.NodesFile
+		cfg.Server.AllowedOrigins = append([]string(nil), s.cfg.Server.AllowedOrigins...)
+	}
+	if s.mode == authservice.ModeWeb {
+		if !isValidBindHost(cfg.Server.Host) {
+			http.Error(w, "无效的监听地址（请使用 0.0.0.0、127.0.0.1 或本机 IP）", http.StatusBadRequest)
+			return
+		}
+	} else if !isLoopbackHost(cfg.Server.Host) {
 		http.Error(w, "API 必须绑定本机回环地址", http.StatusBadRequest)
 		return
 	}
@@ -76,7 +120,151 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	// Do not mutate live runtime s.cfg ports/addresses until restart.
 	writeJSON(w, http.StatusOK, map[string]any{
 		"restart_required": true,
-		"saved":            cfg,
+		"saved":            sanitizeSettingsForResponse(&cfg),
+	})
+}
+
+var redactedConfigKeys = map[string]bool{
+	"password":            true,
+	"uuid":                true,
+	"private_key":         true,
+	"auth_key":            true,
+	"secret":              true,
+	"token":               true,
+	"pre_shared_key":      true,
+	"obfs_password":       true,
+	"short_id":            true,
+	"credential":          true,
+	"authorization":       true,
+	"proxy-authorization": true,
+	"cookie":              true,
+	"set-cookie":          true,
+	"x-api-key":           true,
+	"x-auth-token":        true,
+	"api-key":             true,
+}
+
+func redactCompiledJSONValue(v any) any {
+	switch typed := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for k, val := range typed {
+			if redactedConfigKeys[strings.ToLower(k)] {
+				switch vv := val.(type) {
+				case string:
+					if strings.TrimSpace(vv) != "" {
+						out[k] = "***REDACTED***"
+						continue
+					}
+				case []any:
+					if len(vv) > 0 {
+						redactedArr := make([]any, len(vv))
+						for i, item := range vv {
+							if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+								redactedArr[i] = "***REDACTED***"
+							} else {
+								redactedArr[i] = item
+							}
+						}
+						out[k] = redactedArr
+						continue
+					}
+				}
+			}
+			out[k] = redactCompiledJSONValue(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = redactCompiledJSONValue(item)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func (s *Server) handleCompiledConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	nodes := s.store.List()
+	groups, _ := s.store.ListGroups()
+	listeners := s.store.ListListeners()
+	routing, err := s.routingProfile()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	ruleSets, _ := s.effectiveRuleSets()
+	rs := s.runtimeState()
+	androidMode, protectPath := s.androidRuntimeSettings()
+
+	mixedPort := 10808
+	clashPort := 9090
+	if s.cfg != nil {
+		if s.cfg.SingBox.MixedPort > 0 {
+			mixedPort = s.cfg.SingBox.MixedPort
+		}
+		if s.cfg.SingBox.ClashAPIPort > 0 {
+			clashPort = s.cfg.SingBox.ClashAPIPort
+		}
+	}
+	hs, _ := s.healthSettings()
+	xrayBridgePorts := map[string]int{}
+	for _, n := range nodes {
+		if n != nil && n.ID != "" && n.RequiresXray() {
+			xrayBridgePorts[n.ID] = 41000 + len(xrayBridgePorts)
+		}
+	}
+	var tsCfgPtr *ruleset.TailscaleConfig
+	tsStateDir := ""
+	if tsCfg, tsErr := s.tailscaleConfig(false); tsErr == nil && tsCfg.Enabled {
+		tsCfgPtr = &tsCfg
+		tsStateDir = s.tailscaleStateDir()
+	}
+	compiled, err := sbcfg.Compile(sbcfg.CompileInput{
+		Nodes:             nodes,
+		Groups:            groups,
+		Listeners:         listeners,
+		Routing:           routing,
+		RuleSets:          ruleSets,
+		ActiveNodeID:      rs.activeNodeID,
+		ActiveGroupID:     rs.activeGroupID,
+		MixedPort:         mixedPort,
+		ClashAPIPort:      clashPort,
+		ClashAPISecret:    "***REDACTED***",
+		EnableTUN:         rs.tunEnabled,
+		TUNStack:          rs.tunStack,
+		AndroidMode:       androidMode,
+		ProtectPath:       protectPath,
+		XrayBridgePorts:   xrayBridgePorts,
+		HighLatencyMS:     hs.HighLatencyMS,
+		Tailscale:         tsCfgPtr,
+		TailscaleStateDir: tsStateDir,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var parsed any
+	if err := json.Unmarshal(compiled.Raw, &parsed); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	redacted := redactCompiledJSONValue(parsed)
+	formatted, err := json.MarshalIndent(redacted, "", "  ")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"engine":     "sing-box",
+		"active_tag": compiled.ActiveTag,
+		"redacted":   true,
+		"config":     string(formatted),
 	})
 }
 

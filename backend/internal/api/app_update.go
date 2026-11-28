@@ -6,9 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
-	"net/url"
 	"os"
+	"path"
 	"runtime"
 	"strconv"
 	"strings"
@@ -28,6 +29,7 @@ type AppUpdateAsset struct {
 	Name        string `json:"name"`
 	DownloadURL string `json:"download_url"`
 	Size        int64  `json:"size"`
+	SHA256      string `json:"sha256,omitempty"`
 }
 
 type AppUpdateCheckResult struct {
@@ -210,7 +212,7 @@ func pickRecommendedAsset(assets []AppUpdateAsset, goos, goarch, mode string, is
 				},
 				func(n string) bool { return strings.HasSuffix(n, "-full.appimage") },
 			)
-			return asset, "sudo pacman -Syu prismray"
+			return asset, ""
 		}
 		return findByMatchers(
 			func(n string) bool { return strings.HasSuffix(n, "-full.appimage") },
@@ -224,48 +226,75 @@ func pickRecommendedAsset(assets []AppUpdateAsset, goos, goarch, mode string, is
 	}
 }
 
-func (s *Server) fetchGitHubJSON(ctx context.Context, endpoint string) (int, []byte, error) {
+func (s *Server) fetchGitHubURL(ctx context.Context, endpoint, accept string, limit int64) (int, []byte, error) {
 	doReq := func(client *http.Client) (int, []byte, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return 0, nil, err
 		}
 		req.Header.Set("User-Agent", "PrismRay/"+AppVersion)
-		req.Header.Set("Accept", "application/vnd.github+json")
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return 0, nil, err
 		}
 		defer resp.Body.Close()
-		var buf [1]byte
-		_ = buf
-		raw := make([]byte, 0, 8192)
-		tmp := make([]byte, 4096)
-		for len(raw) < 2<<20 {
-			n, rErr := resp.Body.Read(tmp)
-			if n > 0 {
-				raw = append(raw, tmp[:n]...)
-			}
-			if rErr != nil {
-				break
-			}
+		raw, rErr := io.ReadAll(io.LimitReader(resp.Body, limit))
+		if rErr != nil {
+			return resp.StatusCode, raw, rErr
 		}
 		return resp.StatusCode, raw, nil
 	}
 
-	statusCode, body, err := doReq(safeHTTPClient(12 * time.Second))
+	direct := s.safeHTTPClient(12 * time.Second)
+	defer closeClientIdleConnections(direct)
+	statusCode, body, err := doReq(direct)
 	if err != nil {
 		if st := s.ensureOrchestrator().Status(); st.Running && st.MixedPort > 0 {
-			if proxyURL, parseErr := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", st.MixedPort)); parseErr == nil {
-				proxied := safeHTTPClient(12 * time.Second)
-				proxied.Transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
-				if pCode, pBody, pErr := doReq(proxied); pErr == nil {
-					return pCode, pBody, nil
-				}
+			proxied := s.safeProxyHTTPClient(12*time.Second, st.MixedPort)
+			defer closeClientIdleConnections(proxied)
+			if pCode, pBody, pErr := doReq(proxied); pErr == nil {
+				return pCode, pBody, nil
 			}
 		}
 	}
 	return statusCode, body, err
+}
+
+func (s *Server) fetchGitHubJSON(ctx context.Context, endpoint string) (int, []byte, error) {
+	return s.fetchGitHubURL(ctx, endpoint, "application/vnd.github+json", 2<<20)
+}
+
+func parseSHA256Sums(body []byte) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(string(body), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 2 {
+			continue
+		}
+		digest := strings.ToLower(strings.TrimSpace(fields[0]))
+		if len(digest) != 64 {
+			continue
+		}
+		validHex := true
+		for _, ch := range digest {
+			if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+				validHex = false
+				break
+			}
+		}
+		if !validHex {
+			continue
+		}
+		name := strings.TrimPrefix(strings.TrimSpace(fields[1]), "*")
+		name = path.Base(strings.ReplaceAll(name, "\\", "/"))
+		if name != "" && name != "." && name != "/" {
+			out[name] = digest
+		}
+	}
+	return out
 }
 
 func (s *Server) fetchLatestAppRelease(ctx context.Context, includePrerelease bool) (*ghReleasePayload, int, error) {
@@ -354,6 +383,18 @@ func (s *Server) handleAppUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		result.ReleaseURL = fmt.Sprintf("https://github.com/%s/releases/tag/%s", AppRepository, rel.TagName)
 	}
 
+	shaByName := map[string]string{}
+	for _, a := range rel.Assets {
+		low := strings.ToLower(strings.TrimSpace(a.Name))
+		if (low == "sha256sums.txt" || low == "checksums.txt" || strings.HasSuffix(low, ".sha256")) && strings.TrimSpace(a.BrowserDownloadURL) != "" {
+			if code, body, cErr := s.fetchGitHubURL(r.Context(), a.BrowserDownloadURL, "text/plain", 256<<10); cErr == nil && code == http.StatusOK {
+				for k, v := range parseSHA256Sums(body) {
+					shaByName[k] = v
+				}
+			}
+		}
+	}
+
 	assets := make([]AppUpdateAsset, 0, len(rel.Assets))
 	for _, a := range rel.Assets {
 		if strings.TrimSpace(a.Name) == "" || strings.TrimSpace(a.BrowserDownloadURL) == "" {
@@ -363,6 +404,7 @@ func (s *Server) handleAppUpdateCheck(w http.ResponseWriter, r *http.Request) {
 			Name:        a.Name,
 			DownloadURL: a.BrowserDownloadURL,
 			Size:        a.Size,
+			SHA256:      shaByName[a.Name],
 		})
 	}
 	result.Assets = assets

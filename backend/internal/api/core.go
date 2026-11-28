@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	authservice "github.com/CRACKRAMMER/PrismRay/backend/internal/auth"
@@ -19,6 +21,68 @@ import (
 	sbinstall "github.com/CRACKRAMMER/PrismRay/backend/internal/singbox/install"
 	"github.com/CRACKRAMMER/PrismRay/backend/internal/xray/install"
 )
+
+type cachedCoreMeta struct {
+	modTime int64
+	size    int64
+	version string
+	unified bool
+}
+
+var (
+	coreMetaCacheMu sync.Mutex
+	coreMetaCache   = map[string]cachedCoreMeta{}
+)
+
+func detectCoreVersionInfo(binPath string) (version string, unified bool) {
+	binPath = strings.TrimSpace(binPath)
+	if binPath == "" {
+		return "", false
+	}
+	st, err := os.Stat(binPath)
+	if err != nil || st.IsDir() {
+		return "", false
+	}
+	coreMetaCacheMu.Lock()
+	if cached, ok := coreMetaCache[binPath]; ok && cached.modTime == st.ModTime().UnixNano() && cached.size == st.Size() {
+		coreMetaCacheMu.Unlock()
+		return cached.version, cached.unified
+	}
+	coreMetaCacheMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, binPath, "version").CombinedOutput()
+	text := string(out)
+	if strings.Contains(text, "(prismray-core)") {
+		unified = true
+	}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if strings.HasPrefix(line, "sing-box version ") && len(fields) >= 3 {
+			version = fields[2]
+			break
+		}
+		if strings.HasPrefix(line, "Xray ") && len(fields) >= 2 {
+			version = fields[1]
+			break
+		}
+	}
+
+	coreMetaCacheMu.Lock()
+	coreMetaCache[binPath] = cachedCoreMeta{
+		modTime: st.ModTime().UnixNano(),
+		size:    st.Size(),
+		version: version,
+		unified: unified,
+	}
+	coreMetaCacheMu.Unlock()
+	return version, unified
+}
 
 func (s *Server) isAndroidBundledCoreMode() bool {
 	return s.mode == authservice.ModeAndroid || runtime.GOOS == "android" || strings.TrimSpace(os.Getenv("PRISMRAY_NATIVE_LIB_DIR")) != ""
@@ -89,29 +153,46 @@ func (s *Server) handleEnsureCores(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-func latestCoreVersion(ctx context.Context, repository string) (string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/"+repository+"/releases/latest", nil)
-	req.Header.Set("User-Agent", "PrismRay/1.0.1")
-	resp, err := client.Do(req)
+func (s *Server) latestCoreVersion(ctx context.Context, repository string) (string, error) {
+	lookup := func(client *http.Client) (string, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/"+repository+"/releases/latest", nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("User-Agent", "PrismRay/"+AppVersion)
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("release lookup failed: %s", resp.Status)
+		}
+		var release struct {
+			TagName string `json:"tag_name"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+			return "", err
+		}
+		return release.TagName, nil
+	}
+	direct := s.safeHTTPClient(10 * time.Second)
+	defer closeClientIdleConnections(direct)
+	ver, err := lookup(direct)
 	if err != nil {
-		return "", err
+		if st := s.ensureOrchestrator().Status(); st.Running && st.MixedPort > 0 {
+			proxied := s.safeProxyHTTPClient(12*time.Second, st.MixedPort)
+			defer closeClientIdleConnections(proxied)
+			if pVer, pErr := lookup(proxied); pErr == nil {
+				return pVer, nil
+			}
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("release lookup failed: %s", resp.Status)
-	}
-	var release struct {
-		TagName string `json:"tag_name"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
-		return "", err
-	}
-	return release.TagName, nil
+	return ver, err
 }
 
 func (s *Server) maintainCoreUpdates(ctx context.Context) {
-	if s.isAndroidBundledCoreMode() {
+	if s.isAndroidBundledCoreMode() || s.isVaultLocked() {
 		return
 	}
 	s.coreMu.Lock()
@@ -120,19 +201,25 @@ func (s *Server) maintainCoreUpdates(ctx context.Context) {
 		return
 	}
 	s.lastCoreCheck = time.Now()
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
 	if s.ensureOrchestrator().Status().Running {
 		return
 	}
 	settings := s.updateSettings()
 	if settings.SingBox {
-		if version, err := latestCoreVersion(ctx, "SagerNet/sing-box"); err == nil && version != "" {
-			if _, _, err := s.installCore(ctx, "sing-box", version, true); err == nil {
-				s.lastCoreCheck = time.Now()
+		// Never overwrite PrismRay's unified sing-box wrapper with upstream SagerNet/sing-box,
+		// which lacks PRISMRAY_CORE_CTRL_ADDR / PRISMRAY_TAILSCALE_STATUS_PATH.
+		if _, isUnified := detectCoreVersionInfo(s.SingBoxBinary()); !isUnified {
+			if version, err := s.latestCoreVersion(ctx, "SagerNet/sing-box"); err == nil && version != "" {
+				if _, _, err := s.installCore(ctx, "sing-box", version, true); err == nil {
+					s.lastCoreCheck = time.Now()
+				}
 			}
 		}
 	}
 	if settings.Xray {
-		if version, err := latestCoreVersion(ctx, "XTLS/Xray-core"); err == nil && version != "" {
+		if version, err := s.latestCoreVersion(ctx, "XTLS/Xray-core"); err == nil && version != "" {
 			if _, _, err := s.installCore(ctx, "xray", version, true); err == nil {
 				s.lastCoreCheck = time.Now()
 			}
@@ -187,8 +274,8 @@ func (s *Server) updateSettings() coreUpdateSettings {
 func (s *Server) handleCores(w http.ResponseWriter, r *http.Request) {
 	orch := s.ensureOrchestrator()
 	if r.Method == http.MethodGet {
-		sbPath := strings.TrimSpace(s.singBoxBinary)
-		xrayPath := strings.TrimSpace(s.xrayBinary)
+		sbPath := strings.TrimSpace(s.SingBoxBinary())
+		xrayPath := strings.TrimSpace(s.XrayBinary())
 		sbVersions, err := installedVersions(s.coreDir("sing-box"))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -202,8 +289,15 @@ func (s *Server) handleCores(w http.ResponseWriter, r *http.Request) {
 		sbAvail := executableFile(sbPath)
 		xrayAvail := executableFile(xrayPath)
 		cronet := false
+		sbVer := ""
+		sbUnified := false
 		if sbAvail {
 			cronet = sbcfg.CronetAvailable(sbPath)
+			sbVer, sbUnified = detectCoreVersionInfo(sbPath)
+		}
+		xrayVer := ""
+		if xrayAvail {
+			xrayVer, _ = detectCoreVersionInfo(xrayPath)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"managed_by_apk": s.isAndroidBundledCoreMode(),
@@ -211,6 +305,8 @@ func (s *Server) handleCores(w http.ResponseWriter, r *http.Request) {
 				"installed":        sbAvail,
 				"available":        sbAvail,
 				"binary":           sbPath,
+				"version":          sbVer,
+				"unified":          sbUnified,
 				"versions":         sbVersions,
 				"cronet_available": cronet,
 			},
@@ -218,6 +314,7 @@ func (s *Server) handleCores(w http.ResponseWriter, r *http.Request) {
 				"installed": xrayAvail,
 				"available": xrayAvail,
 				"binary":    xrayPath,
+				"version":   xrayVer,
 				"versions":  xrayVersions,
 			},
 			"auto_update": s.updateSettings(),
@@ -229,6 +326,8 @@ func (s *Server) handleCores(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.coreMu.Lock()
+	defer s.coreMu.Unlock()
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	if orch.Status().Running {
@@ -237,10 +336,11 @@ func (s *Server) handleCores(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Core       string              `json:"core"`
-		Version    string              `json:"version"`
-		Download   bool                `json:"download"`
-		AutoUpdate *coreUpdateSettings `json:"auto_update"`
+		Core          string              `json:"core"`
+		Version       string              `json:"version"`
+		Download      bool                `json:"download"`
+		ForceUpstream bool                `json:"force_upstream"`
+		AutoUpdate    *coreUpdateSettings `json:"auto_update"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -258,6 +358,12 @@ func (s *Server) handleCores(w http.ResponseWriter, r *http.Request) {
 	if req.Core != "xray" && req.Core != "sing-box" {
 		http.Error(w, "core must be xray or sing-box", http.StatusBadRequest)
 		return
+	}
+	if req.Core == "sing-box" && req.Download && !req.ForceUpstream {
+		if _, isUnified := detectCoreVersionInfo(s.SingBoxBinary()); isUnified {
+			http.Error(w, "当前已启用 PrismRay 内置 Unified sing-box 包装核（支持 Tailscale 控制面）；下载上游 SagerNet/sing-box 将降级内置 Tailscale 控制功能", http.StatusConflict)
+			return
+		}
 	}
 
 	version, binary, err := s.installCore(r.Context(), req.Core, req.Version, req.Download)
@@ -334,13 +440,22 @@ func (s *Server) installCore(ctx context.Context, name, requested string, downlo
 
 	if name == "sing-box" {
 		if version == "latest" {
-			latest, err := latestCoreVersion(ctx, "SagerNet/sing-box")
+			latest, err := s.latestCoreVersion(ctx, "SagerNet/sing-box")
 			if err == nil && latest != "" {
 				version = latest
 			}
 		}
 		targetDir := filepath.Join(s.coreDir(name), version)
 		binary, resolvedVersion, err := sbinstall.Download(ctx, targetDir, version)
+		if err != nil {
+			if st := s.ensureOrchestrator().Status(); st.Running && st.MixedPort > 0 {
+				proxied := s.safeProxyHTTPClient(5*time.Minute, st.MixedPort)
+				defer closeClientIdleConnections(proxied)
+				if pBin, pVer, pErr := sbinstall.DownloadWithClient(ctx, proxied, targetDir, version); pErr == nil {
+					binary, resolvedVersion, err = pBin, pVer, nil
+				}
+			}
+		}
 		if err != nil {
 			return "", "", err
 		}
@@ -352,7 +467,7 @@ func (s *Server) installCore(ctx context.Context, name, requested string, downlo
 	}
 
 	if version == "latest" {
-		latest, err := latestCoreVersion(ctx, "XTLS/Xray-core")
+		latest, err := s.latestCoreVersion(ctx, "XTLS/Xray-core")
 		if err != nil {
 			return "", "", err
 		}
@@ -360,6 +475,15 @@ func (s *Server) installCore(ctx context.Context, name, requested string, downlo
 	}
 	targetDir := filepath.Join(s.coreDir(name), version)
 	binary, err := install.DownloadXrayVersion(targetDir, version)
+	if err != nil {
+		if st := s.ensureOrchestrator().Status(); st.Running && st.MixedPort > 0 {
+			proxied := s.safeProxyHTTPClient(5*time.Minute, st.MixedPort)
+			defer closeClientIdleConnections(proxied)
+			if pBin, pErr := install.DownloadXrayVersionWithClient(proxied, targetDir, version); pErr == nil {
+				binary, err = pBin, nil
+			}
+		}
+	}
 	if err != nil {
 		return "", "", err
 	}

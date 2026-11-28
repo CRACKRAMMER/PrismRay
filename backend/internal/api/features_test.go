@@ -77,6 +77,8 @@ func TestDesktopTokenProtectsAPI(t *testing.T) {
 
 func TestSubscriptionRefreshDedupeAndFailurePreservesNodes(t *testing.T) {
 	s := newDesktopTestServer(t)
+	safeHTTPAllowLoopbackForTest.Store(true)
+	t.Cleanup(func() { safeHTTPAllowLoopbackForTest.Store(false) })
 	var mode atomic.Int32
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		switch mode.Load() {

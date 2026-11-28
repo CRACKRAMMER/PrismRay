@@ -95,6 +95,7 @@ func (s *Server) probeNodesAndPersist(
 		AllGroups:    allGroups,
 	})
 	ordered := make([]orchestrator.ProbeResult, 0, len(targets))
+	batchUpdates := make([]storage.NodeProbeMetricUpdate, 0, len(targets))
 	for _, n := range targets {
 		res, ok := rawResults[n.ID]
 		if !ok {
@@ -145,9 +146,18 @@ func (s *Server) probeNodesAndPersist(
 				}
 				latPtr = &lv
 			}
-			_ = s.store.UpdateNodeProbeMetrics(n.ID, latPtr, pingPtr, downPtr, upPtr)
+			batchUpdates = append(batchUpdates, storage.NodeProbeMetricUpdate{
+				ID:        n.ID,
+				LatencyMS: latPtr,
+				PingMS:    pingPtr,
+				DownMbps:  downPtr,
+				UpMbps:    upPtr,
+			})
 		}
 		ordered = append(ordered, res)
+	}
+	if s.store != nil && len(batchUpdates) > 0 {
+		_ = s.store.UpdateNodesProbeMetricsBatch(batchUpdates)
 	}
 	return ordered, rawResults
 }
@@ -200,11 +210,19 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	downURL := strings.TrimSpace(req.SpeedDownURL)
+	downURL, err := validateOptionalHTTPSURL(req.SpeedDownURL)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if downURL == "" {
 		downURL = hs.SpeedDownURL
 	}
-	upURL := strings.TrimSpace(req.SpeedUpURL)
+	upURL, err := validateOptionalHTTPSURL(req.SpeedUpURL)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	if upURL == "" {
 		upURL = hs.SpeedUpURL
 	}

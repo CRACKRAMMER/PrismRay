@@ -5,9 +5,11 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -89,18 +91,20 @@ func (s *Server) handleRouting(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "per_app_mode must be all, whitelist, or blacklist", http.StatusBadRequest)
 		return
 	}
+	s.opMu.Lock()
 	prev, _ := s.routingProfile()
 	if err := s.saveRoutingProfile(profile); err != nil {
+		s.opMu.Unlock()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	profile, _ = s.routingProfile()
 
-	s.opMu.Lock()
 	running := s.ensureOrchestrator().Status().Running
 	var applyErr error
 	if running {
-		_, applyErr = s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, s.tunEnabled)
+		rs := s.runtimeState()
+		_, applyErr = s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled)
 		if applyErr != nil {
 			_ = s.saveRoutingProfile(prev)
 		}
@@ -142,9 +146,7 @@ func (s *Server) handleRoutingSimulate(w http.ResponseWriter, r *http.Request) {
 		if groups, gErr := s.store.ListGroups(); gErr == nil {
 			targetGroupID := res.Outbound
 			if targetGroupID == "proxy" {
-				s.opMu.Lock()
-				targetGroupID = s.activeGroupID
-				s.opMu.Unlock()
+				targetGroupID = s.runtimeState().activeGroupID
 			}
 			for _, g := range groups {
 				if g.ID == targetGroupID && storage.CanonicalGroupStrategy(g.Strategy) == "loadbalance" {
@@ -157,8 +159,9 @@ func (s *Server) handleRoutingSimulate(w http.ResponseWriter, r *http.Request) {
 					if len(healthyIDs) == 0 {
 						healthyIDs = append(healthyIDs, g.NodeIDs...)
 					}
-					if len(healthyIDs) > sbcfg.MaxLoadBalanceShards {
-						healthyIDs = healthyIDs[:sbcfg.MaxLoadBalanceShards]
+					shardLimit := sbcfg.EffectiveLoadBalanceShards(g)
+					if len(healthyIDs) > shardLimit {
+						healthyIDs = healthyIDs[:shardLimit]
 					}
 					if idx := sbcfg.DomainHashShardIndex(in.Domain, len(healthyIDs)); idx >= 0 && idx < len(healthyIDs) {
 						label := healthyIDs[idx]
@@ -252,6 +255,10 @@ func (s *Server) handleRuleSets(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		if deleted := s.deletedBuiltinRuleSetIDs(); deleted[spec.ID] {
+			delete(deleted, spec.ID)
+			_ = s.setDeletedBuiltinRuleSetIDs(deleted)
+		}
 		specs, err := s.effectiveRuleSets()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -264,15 +271,7 @@ func (s *Server) handleRuleSets(w http.ResponseWriter, r *http.Request) {
 }
 
 func safeProxyHTTPClient(timeout time.Duration, proxyPort int) *http.Client {
-	client := safeHTTPClient(timeout)
-	if proxyPort > 0 {
-		if proxyURL, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort)); err == nil {
-			tr := http.DefaultTransport.(*http.Transport).Clone()
-			tr.Proxy = http.ProxyURL(proxyURL)
-			client.Transport = tr
-		}
-	}
-	return client
+	return safeProxyHTTPClientWithPolicy(timeout, proxyPort, false)
 }
 
 func (s *Server) syncRuleSetsInternal(ctx context.Context, wantIDs map[string]bool) ([]ruleset.RuleSetSpec, map[string]string, int, bool, error) {
@@ -288,15 +287,21 @@ func (s *Server) syncRuleSetsInternal(ctx context.Context, wantIDs map[string]bo
 	// 1. Local proxy (if core is currently running) — bypasses GitHub Raw throttling/blocking on mobile/CN networks.
 	// 2. Direct connection — works when proxy is stopped or local network reaches GitHub directly.
 	// 3. Built-in CDN mirrors (e.g. jsDelivr for raw.githubusercontent.com) via direct/proxy.
+	allowLAN := s.allowLANSubscriptionFetch()
 	orchStatus := s.ensureOrchestrator().Status()
 	var proxyClient *http.Client
 	if orchStatus.Running && orchStatus.MixedPort > 0 {
-		proxyClient = safeProxyHTTPClient(15*time.Second, orchStatus.MixedPort)
+		proxyClient = s.safeProxyHTTPClient(15*time.Second, orchStatus.MixedPort)
+		defer closeClientIdleConnections(proxyClient)
 	}
-	directClient := safeHTTPClient(15 * time.Second)
+	directClient := s.safeHTTPClient(15 * time.Second)
+	defer closeClientIdleConnections(directClient)
 
 	syncWithFallback := func(spec ruleset.RuleSetSpec) (ruleset.RuleSetSpec, error) {
 		canonicalURL := spec.URL
+		if err := validateFetchTargetURL(ctx, canonicalURL, allowLAN); err != nil {
+			return spec, err
+		}
 		type attempt struct {
 			client *http.Client
 			url    string
@@ -307,6 +312,9 @@ func (s *Server) syncRuleSetsInternal(ctx context.Context, wantIDs map[string]bo
 		}
 		attempts = append(attempts, attempt{client: directClient, url: canonicalURL})
 		for _, mirror := range ruleset.MirrorURLs(canonicalURL) {
+			if validateFetchTargetURL(ctx, mirror, allowLAN) != nil {
+				continue
+			}
 			attempts = append(attempts, attempt{client: directClient, url: mirror})
 			if proxyClient != nil {
 				attempts = append(attempts, attempt{client: proxyClient, url: mirror})
@@ -322,6 +330,9 @@ func (s *Server) syncRuleSetsInternal(ctx context.Context, wantIDs map[string]bo
 				// Preserve canonical source URL in persisted metadata.
 				synced.URL = canonicalURL
 				return synced, nil
+			}
+			if errors.Is(syncErr, errSSRFBlocked) {
+				return spec, syncErr
 			}
 			lastErr = syncErr
 		}
@@ -388,7 +399,8 @@ func (s *Server) syncRuleSetsInternal(ctx context.Context, wantIDs map[string]bo
 	if syncedCount > 0 {
 		s.opMu.Lock()
 		if s.ensureOrchestrator().Status().Running {
-			if _, recErr := s.reconcileRuntime(ctx, s.activeNodeID, s.activeGroupID, s.tunEnabled); recErr == nil {
+			rs := s.runtimeState()
+			if _, recErr := s.reconcileRuntime(ctx, rs.activeNodeID, rs.activeGroupID, rs.tunEnabled); recErr == nil {
 				reloaded = true
 			} else {
 				s.ensureOrchestrator().AppendLog("system", "warn", "规则集同步后热重载失败: "+recErr.Error())
@@ -468,4 +480,156 @@ func (s *Server) handleSyncRuleSets(w http.ResponseWriter, r *http.Request) {
 		"synced_count": syncedCount,
 		"reloaded":     reloaded,
 	})
+}
+
+func (s *Server) handleDeleteRuleSet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		http.Error(w, "rule set id is required", http.StatusBadRequest)
+		return
+	}
+	specs, err := s.effectiveRuleSets()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var target *ruleset.RuleSetSpec
+	for i := range specs {
+		if specs[i].ID == id {
+			cp := specs[i]
+			target = &cp
+			break
+		}
+	}
+	if target == nil {
+		http.Error(w, "rule set not found", http.StatusNotFound)
+		return
+	}
+	if strings.HasPrefix(id, "builtin-") {
+		deleted := s.deletedBuiltinRuleSetIDs()
+		deleted[id] = true
+		if err := s.setDeletedBuiltinRuleSetIDs(deleted); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := s.store.DeleteRuleSet(id); err != nil && !errors.Is(err, os.ErrNotExist) {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		if err := s.store.DeleteRuleSet(id); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				http.Error(w, "rule set not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if target.LocalPath != "" {
+		if safePath, pErr := sanitizeRuleSetPath(s.ruleSetDir(), target.Tag, target.LocalPath); pErr == nil {
+			_ = os.Remove(safePath)
+		}
+	}
+	s.opMu.Lock()
+	if s.ensureOrchestrator().Status().Running {
+		rs := s.runtimeState()
+		_, _ = s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled)
+	}
+	s.opMu.Unlock()
+
+	updated, err := s.effectiveRuleSets()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) handleRestoreBuiltinRuleSets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.setDeletedBuiltinRuleSetIDs(nil); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.opMu.Lock()
+	if s.ensureOrchestrator().Status().Running {
+		rs := s.runtimeState()
+		_, _ = s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled)
+	}
+	s.opMu.Unlock()
+
+	updated, err := s.effectiveRuleSets()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func parseRuleSetUpdateInterval(raw string) time.Duration {
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil || d <= 0 {
+		return 24 * time.Hour
+	}
+	if d < time.Hour {
+		return time.Hour
+	}
+	if d > 30*24*time.Hour {
+		return 30 * 24 * time.Hour
+	}
+	return d
+}
+
+// maintainRuleSets periodically refreshes stale enabled remote .srs rule sets according to their update_interval.
+func (s *Server) maintainRuleSets(ctx context.Context) {
+	if s.store == nil {
+		return
+	}
+	s.stateMu.Lock()
+	if !s.lastRuleSetCheck.IsZero() && time.Since(s.lastRuleSetCheck) < 10*time.Minute {
+		s.stateMu.Unlock()
+		return
+	}
+	s.lastRuleSetCheck = time.Now()
+	s.stateMu.Unlock()
+
+	specs, err := s.effectiveRuleSets()
+	if err != nil {
+		return
+	}
+	now := time.Now().UTC()
+	dueIDs := map[string]bool{}
+	for _, spec := range specs {
+		if !spec.Enabled || spec.SourceType != "remote" {
+			continue
+		}
+		interval := parseRuleSetUpdateInterval(spec.UpdateInterval)
+		if !spec.Synced || strings.TrimSpace(spec.LastSyncedAt) == "" {
+			if s.ensureOrchestrator().Status().Running {
+				dueIDs[spec.ID] = true
+			}
+			continue
+		}
+		lastSynced, pErr := time.Parse(time.RFC3339, spec.LastSyncedAt)
+		if pErr != nil || now.Sub(lastSynced) >= interval {
+			dueIDs[spec.ID] = true
+		}
+	}
+	if len(dueIDs) == 0 {
+		return
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	_, _, syncedCount, reloaded, syncErr := s.syncRuleSetsInternal(syncCtx, dueIDs)
+	if syncErr == nil && syncedCount > 0 {
+		s.ensureOrchestrator().AppendLog("system", "info", fmt.Sprintf("后台定时更新了 %d 个 .srs 规则集 (热重载=%v)", syncedCount, reloaded))
+	}
 }

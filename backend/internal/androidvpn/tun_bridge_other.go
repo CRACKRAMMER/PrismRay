@@ -18,6 +18,8 @@ func (b *TunBridge) Listen(_ string, _ int, _ int) (string, error) {
 
 func (b *TunBridge) ConfigureAppRouting(_ AppRoutingConfig) {}
 
+func (b *TunBridge) TrafficTotals() (int64, int64) { return 0, 0 }
+
 func (b *TunBridge) Active() bool { return false }
 
 func (b *TunBridge) SocketPath() string { return "" }

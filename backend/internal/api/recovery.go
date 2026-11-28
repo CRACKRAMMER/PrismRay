@@ -163,7 +163,7 @@ func (s *Server) activate(n *config.Node) error {
 	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
-	_, err := s.reconcileRuntime(context.Background(), n.ID, "", s.tunEnabled)
+	_, err := s.reconcileRuntime(context.Background(), n.ID, "", s.runtimeState().tunEnabled)
 	return err
 }
 
@@ -180,48 +180,73 @@ func (s *Server) maintainHealth(ctx context.Context) {
 	}
 	s.lastHealth = time.Now()
 	if err := s.refreshListenerHealth(ctx, v); err != nil {
-		s.listenerHealth = err.Error()
+		s.setListenerHealthState(err.Error())
 	} else {
-		s.listenerHealth = ""
+		s.setListenerHealthState("")
 	}
 	if !v.Failover && !v.Recover {
 		return
 	}
 
-	s.opMu.Lock()
-	activeID := s.activeNodeID
-	activeGroupID := s.activeGroupID
+	rs := s.runtimeState()
+	activeID := rs.activeNodeID
+	activeGroupID := rs.activeGroupID
 	running := s.ensureOrchestrator().Status().Running
-	s.opMu.Unlock()
-	if !s.wantRunning {
+	if !rs.wantRunning {
 		return
 	}
 
 	if v.Recover && !running && (activeID != "" || activeGroupID != "") {
 		if activeGroupID != "" {
 			s.opMu.Lock()
-			_, _ = s.reconcileRuntime(context.Background(), "", activeGroupID, s.tunEnabled)
+			_, _ = s.reconcileRuntime(context.Background(), "", activeGroupID, s.runtimeState().tunEnabled)
 			s.opMu.Unlock()
 		} else if n := s.store.Get(activeID); n != nil {
 			_ = s.activate(n)
 		}
 	}
 
-	if !v.Failover {
-		if activeGroupID != "" {
-			if groups, err := s.store.ListGroups(); err == nil {
-				for _, g := range groups {
-					if g.ID == activeGroupID && effectiveGroupAutoFailover(g, false) {
-						_, _, _, _ = s.probeAndReorderGroup(ctx, activeGroupID, "urltest", "", v, false)
+	if activeGroupID != "" {
+		if groups, err := s.store.ListGroups(); err == nil {
+			for _, g := range groups {
+				if g.ID != activeGroupID {
+					continue
+				}
+				strat := storage.CanonicalGroupStrategy(g.Strategy)
+				if strat == "urltest" || strat == "failover" {
+					// sing-box natively manages urltest/failover health with idle_timeout so the mobile
+					// radio can sleep when idle. Avoid redundant full-group probes from Go every 120s.
+					if !g.ManualPin || strings.TrimSpace(g.SelectedNodeID) == "" {
 						return
 					}
+					// When manually pinned, probe ONLY the single pinned node and auto-revert according to trigger.
+					pinned := s.store.Get(g.SelectedNodeID)
+					if pinned == nil {
+						_ = s.revertPinnedGroupToAuto(ctx, g.ID, "手动锁定节点已不存在")
+						return
+					}
+					trigger := effectiveGroupFailoverTrigger(g)
+					highLatMS := effectiveGroupHighLatencyMS(g, v)
+					if lat, pErr := s.probe(ctx, pinned, v.URL); pErr == nil && lat > 0 {
+						if trigger == "unavailable_only" || lat < highLatMS {
+							return
+						}
+						_ = s.revertPinnedGroupToAuto(ctx, g.ID, fmt.Sprintf("延迟过高 (%dms ≥ %dms)", lat, highLatMS))
+						return
+					}
+					_ = s.revertPinnedGroupToAuto(ctx, g.ID, "不可达")
+					return
 				}
+				if !v.Failover && !effectiveGroupAutoFailover(g, false) {
+					return
+				}
+				_, _, _, _ = s.probeAndReorderGroup(ctx, activeGroupID, "urltest", "", v, false)
+				return
 			}
 		}
 		return
 	}
-	if activeGroupID != "" {
-		_, _, _, _ = s.probeAndReorderGroup(ctx, activeGroupID, "urltest", "", v, false)
+	if !v.Failover {
 		return
 	}
 	if activeID == "" {
@@ -372,22 +397,35 @@ func (s *Server) incrementKillSwitchFailures() int {
 }
 
 func (s *Server) maintainKillSwitch(ctx context.Context) {
+	orch := s.ensureOrchestrator()
+	st := orch.Status()
+	androidPassive := s.isAndroidPowerMode()
+
 	// Adaptive battery-friendly probing:
-	// - Healthy baseline: probe every 60s to avoid waking mobile radios every 15s.
-	// - After any failure or while tripped: probe every 15s for fast failover/recovery.
+	// - Android: passive event-driven when healthy (0 active HTTPS wakeups while idle/screen-off;
+	//   still checks unexpected core exit immediately, and probes every 30s while tripped/recovering).
+	// - Desktop: probe every 60s when healthy, every 15s after failure or while tripped.
 	s.ksMu.Lock()
-	interval := 60 * time.Second
-	if s.killSwitchFailures > 0 || s.killSwitchTripped {
-		interval = 15 * time.Second
+	trippedOrFailing := s.killSwitchFailures > 0 || s.killSwitchTripped
+	if androidPassive && st.Running && !trippedOrFailing {
+		s.ksMu.Unlock()
+		return
 	}
-	if !s.lastKillSwitchCheck.IsZero() && time.Since(s.lastKillSwitchCheck) < interval {
+	interval := 60 * time.Second
+	if trippedOrFailing {
+		if androidPassive {
+			interval = 30 * time.Second
+		} else {
+			interval = 15 * time.Second
+		}
+	}
+	if st.Running && !s.lastKillSwitchCheck.IsZero() && time.Since(s.lastKillSwitchCheck) < interval {
 		s.ksMu.Unlock()
 		return
 	}
 	s.lastKillSwitchCheck = time.Now()
 	s.ksMu.Unlock()
 
-	orch := s.ensureOrchestrator()
 	clash := orch.ClashClient()
 	var probeFn func(context.Context, string, string, int) (int, error)
 	if clash != nil {
@@ -402,12 +440,11 @@ func (s *Server) evaluateKillSwitchOnce(ctx context.Context, probeDelay func(con
 		return
 	}
 
-	s.opMu.Lock()
-	wantRunning := s.wantRunning
-	activeNodeID := s.activeNodeID
-	activeGroupID := s.activeGroupID
-	tunEnabled := s.tunEnabled
-	s.opMu.Unlock()
+	rs := s.runtimeState()
+	wantRunning := rs.wantRunning
+	activeNodeID := rs.activeNodeID
+	activeGroupID := rs.activeGroupID
+	tunEnabled := rs.tunEnabled
 
 	orch := s.ensureOrchestrator()
 	st := orch.Status()
@@ -416,6 +453,7 @@ func (s *Server) evaluateKillSwitchOnce(ctx context.Context, probeDelay func(con
 		if tripped, _, intended := s.killSwitchSnapshot(); tripped {
 			if wantRunning && st.Running && intended != "" {
 				_ = orch.HotSwitch(ctx, "proxy", intended)
+				orch.RestoreAllLBShards(ctx)
 			}
 			s.clearKillSwitch()
 		}
@@ -425,7 +463,7 @@ func (s *Server) evaluateKillSwitchOnce(ctx context.Context, probeDelay func(con
 	if !st.Running {
 		var recErr error
 		s.opMu.Lock()
-		if s.wantRunning && !orch.Status().Running {
+		if s.runtimeState().wantRunning && !orch.Status().Running {
 			_, recErr = s.reconcileRuntime(ctx, activeNodeID, activeGroupID, tunEnabled)
 		}
 		s.opMu.Unlock()
@@ -460,6 +498,7 @@ func (s *Server) evaluateKillSwitchOnce(ctx context.Context, probeDelay func(con
 	if probeErr == nil && delay > 0 {
 		if s.resetKillSwitchFailures() {
 			if err := orch.HotSwitch(ctx, "proxy", probeTag); err == nil {
+				orch.RestoreAllLBShards(ctx)
 				s.setKillSwitchBaseline(probeTag)
 				orch.AppendLog("system", "info", fmt.Sprintf("Kill Switch 已恢复：主代理已切回 %s (%dms)", probeTag, delay))
 			}
@@ -483,6 +522,9 @@ func (s *Server) evaluateKillSwitchOnce(ctx context.Context, probeDelay func(con
 		s.setKillSwitchTripped(probeTag, reason)
 		orch.AppendLog("system", "error", reason)
 		_ = orch.HotSwitch(ctx, "proxy", sbcfg.BlockOutboundTag)
+		if strings.HasPrefix(probeTag, "group-") {
+			orch.SetLBShardsBlocked(ctx, strings.TrimPrefix(probeTag, "group-"), true)
+		}
 		if clash := orch.ClashClient(); clash != nil {
 			_ = clash.CloseAllConnections(ctx)
 		}
@@ -578,7 +620,35 @@ func (s *Server) handleOutboundFailureEvent(outboundTag, _ string) {
 			failoverSelectorGroups = append(failoverSelectorGroups, g)
 		}
 	}
-	if len(pinnedAutoGroups) == 0 && len(failoverSelectorGroups) == 0 {
+
+	passiveKillSwitch := false
+	if s.isAndroidPowerMode() {
+		if profile, pErr := s.routingProfile(); pErr == nil && profile.KillSwitchEnabled() && profile.Mode != "direct" {
+			rs := s.runtimeState()
+			activeNodeID := rs.activeNodeID
+			activeGroupID := rs.activeGroupID
+			wantRunning := rs.wantRunning
+			if wantRunning {
+				if activeGroupID == "" && activeNodeID == nodeID {
+					passiveKillSwitch = true
+				} else if activeGroupID != "" {
+					for _, g := range groups {
+						if g.ID == activeGroupID {
+							for _, mid := range g.NodeIDs {
+								if mid == nodeID {
+									passiveKillSwitch = true
+									break
+								}
+							}
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if len(pinnedAutoGroups) == 0 && len(failoverSelectorGroups) == 0 && !passiveKillSwitch {
 		return
 	}
 
@@ -605,27 +675,43 @@ func (s *Server) handleOutboundFailureEvent(outboundTag, _ string) {
 		AllGroups:   groups,
 	})
 	res, ok := results[nodeID]
-	highLatMS := int64(hs.HighLatencyMS)
-	if highLatMS <= 0 {
-		highLatMS = defaultHighLatencyMS
-	}
+	unreachable := true
 	if ok && res.Error == "" && res.LatencyMS > 0 {
+		unreachable = false
 		_ = s.store.UpdateLatency(nodeID, int(res.LatencyMS))
-		if res.LatencyMS < highLatMS {
-			return
-		}
 	} else {
 		_ = s.store.UpdateLatency(nodeID, -1)
 	}
 
-	reason := "连续报错且快速复测不可达"
-	if ok && res.Error == "" && res.LatencyMS >= highLatMS {
-		reason = fmt.Sprintf("连续报错且延迟过高 (%dms ≥ %dms)", res.LatencyMS, highLatMS)
-	}
+	reverted := false
 	for _, g := range pinnedAutoGroups {
-		_ = s.revertPinnedGroupToAuto(probeCtx, g.ID, reason)
+		trigger := effectiveGroupFailoverTrigger(g)
+		highLatMS := effectiveGroupHighLatencyMS(g, hs)
+		if !unreachable && (trigger == "unavailable_only" || res.LatencyMS < highLatMS) {
+			continue
+		}
+		reason := "连续报错且快速复测不可达"
+		if !unreachable {
+			reason = fmt.Sprintf("连续报错且延迟过高 (%dms ≥ %dms)", res.LatencyMS, highLatMS)
+		}
+		if s.revertPinnedGroupToAuto(probeCtx, g.ID, reason) {
+			reverted = true
+		}
 	}
 	for _, g := range failoverSelectorGroups {
-		_, _, _, _ = s.probeAndReorderGroup(probeCtx, g.ID, "urltest", "", hs, false)
+		trigger := effectiveGroupFailoverTrigger(g)
+		highLatMS := effectiveGroupHighLatencyMS(g, hs)
+		if !unreachable && (trigger == "unavailable_only" || res.LatencyMS < highLatMS) {
+			continue
+		}
+		_, _, sw, _ := s.probeAndReorderGroup(probeCtx, g.ID, "urltest", "", hs, false)
+		if sw {
+			reverted = true
+		}
+	}
+	if passiveKillSwitch && unreachable && !reverted {
+		if clash := s.ensureOrchestrator().ClashClient(); clash != nil {
+			s.evaluateKillSwitchOnce(probeCtx, clash.ProbeDelay)
+		}
 	}
 }

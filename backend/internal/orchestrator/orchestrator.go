@@ -56,21 +56,26 @@ type Options struct {
 
 // ApplyInput captures the complete runtime snapshot compiled and reconciled by the Orchestrator.
 type ApplyInput struct {
-	Nodes          []*config.Node
-	Groups         []storage.Group
-	Listeners      []*config.ListenConfig
-	Routing        ruleset.RoutingProfile
-	RuleSets       []ruleset.RuleSetSpec
-	ActiveNodeID   string
-	ActiveGroupID  string
-	MixedPort      int
-	ClashAPIPort   int
-	ClashAPISecret string
-	EnableTUN      bool
-	TUNStack       string
-	AndroidMode    bool
-	ProtectPath    string
-	SudoPassword   []byte
+	Nodes               []*config.Node
+	Groups              []storage.Group
+	Listeners           []*config.ListenConfig
+	Routing             ruleset.RoutingProfile
+	RuleSets            []ruleset.RuleSetSpec
+	ActiveNodeID        string
+	ActiveGroupID       string
+	MixedPort           int
+	ClashAPIPort        int
+	ClashAPISecret      string
+	EnableTUN           bool
+	TUNStack            string
+	AndroidMode         bool
+	ProtectPath         string
+	AndroidNetIfPath    string
+	SudoPassword        []byte
+	HighLatencyMS       int
+	Tailscale           *ruleset.TailscaleConfig
+	TailscaleStateDir   string
+	TailscaleStatusPath string
 }
 
 // Status summarizes the live state of sing-box and the on-demand Xray coprocessor.
@@ -261,28 +266,32 @@ type Orchestrator struct {
 	singBoxProc *managedProc
 	xrayProc    *managedProc
 
-	running         bool
-	startedAt       time.Time
-	stopping        bool
-	topologyHash    string
-	includedTags    map[string]bool
-	groupSelections map[string]string
-	activeNodeID    string
-	activeGroupID   string
-	activeTag       string
-	tunEnabled      bool
-	androidMode     bool
-	mixedPort       int
-	appSocksPort    int
-	appSocksSecret  string
-	appPackages     []string
-	clashAPIPort    int
-	clashAPISecret  string
-	clash           *clashapi.Client
-	skippedNaive    []string
-	lastError       string
-	resolvedSB      string
-	resolvedXray    string
+	running              bool
+	startedAt            time.Time
+	stopping             bool
+	topologyHash         string
+	includedTags         map[string]bool
+	groupSelections      map[string]string
+	lbShardTargets       map[string][]string
+	activeNodeID         string
+	activeGroupID        string
+	activeTag            string
+	tunEnabled           bool
+	androidMode          bool
+	mixedPort            int
+	appSocksPort         int
+	appSocksSecret       string
+	appPackages          []string
+	clashAPIPort         int
+	clashAPISecret       string
+	clash                *clashapi.Client
+	coreCtrlAddr         string
+	coreCtrlToken        string
+	tailscaleStatusToken string
+	skippedNaive         []string
+	lastError            string
+	resolvedSB           string
+	resolvedXray         string
 
 	// Redacted structured log ring buffer + pub/sub
 	logMu             sync.Mutex
@@ -294,8 +303,62 @@ type Orchestrator struct {
 	subSeq            atomic.Uint64
 	secretsMu         sync.RWMutex
 	secrets           []string
+	secretReplacer    atomic.Pointer[strings.Replacer]
 	failHandlerMu     sync.RWMutex
 	onOutboundFailure func(outboundTag, errLine string)
+	failThrottleMu    sync.Mutex
+	lastFailEmit      map[string]time.Time
+
+	tsStatusMu   sync.RWMutex
+	tsAuthURL    string
+	tsLastError  string
+	tsUpdatedAt  time.Time
+	tsStatusPath string
+}
+
+// CoreControlEndpoint returns the authenticated local control-plane address and token
+// for PrismRay's unified sing-box wrapper (used for live Tailscale Exit Node / Ping / Logout / Taildrop).
+func (o *Orchestrator) CoreControlEndpoint() (addr, token string) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if !o.running {
+		return "", ""
+	}
+	return o.coreCtrlAddr, o.coreCtrlToken
+}
+
+// TailscaleStatusToken returns the per-launch token embedded in tailscale-status.json so
+// sudo-elevated TUN launches match live Tailscale snapshots reliably even when sbProc.pid is sudo's PID.
+func (o *Orchestrator) TailscaleStatusToken() string {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if !o.running {
+		return ""
+	}
+	return o.tailscaleStatusToken
+}
+
+// TailscaleLogTelemetry returns the latest Tailscale authentication URL and error extracted from sing-box logs.
+func (o *Orchestrator) TailscaleLogTelemetry() (authURL, lastError string, updatedAt time.Time) {
+	o.tsStatusMu.RLock()
+	defer o.tsStatusMu.RUnlock()
+	return o.tsAuthURL, o.tsLastError, o.tsUpdatedAt
+}
+
+func (o *Orchestrator) resetTailscaleTelemetry(statusPath string) {
+	o.tsStatusMu.Lock()
+	prevPath := o.tsStatusPath
+	o.tsAuthURL = ""
+	o.tsLastError = ""
+	o.tsUpdatedAt = time.Time{}
+	o.tsStatusPath = strings.TrimSpace(statusPath)
+	o.tsStatusMu.Unlock()
+	if prevPath != "" {
+		_ = os.Remove(prevPath)
+	}
+	if statusPath != "" && statusPath != prevPath {
+		_ = os.Remove(statusPath)
+	}
 }
 
 // SetOutboundFailureHandler registers an asynchronous callback notified when sing-box logs
@@ -405,6 +468,9 @@ func ResolveBinary(name, configured, envVar, androidSOName string) (string, erro
 	}
 	if cwd, err := os.Getwd(); err == nil {
 		dirs = append(dirs, cwd, filepath.Join(cwd, "cores"), filepath.Join(cwd, "backend", "cores"))
+	}
+	if runtime.GOOS == "linux" {
+		dirs = append(dirs, "/usr/lib/prismray-server", "/usr/lib/prismray")
 	}
 
 	candidates := []string{name}
@@ -567,6 +633,9 @@ func (o *Orchestrator) Apply(ctx context.Context, in ApplyInput) (Status, error)
 		}
 	}
 
+	if in.Tailscale != nil && in.Tailscale.AuthKey != "" {
+		o.registerLiteralSecret(in.Tailscale.AuthKey)
+	}
 	compiled, err := sbcfg.Compile(sbcfg.CompileInput{
 		Nodes:                 in.Nodes,
 		Groups:                in.Groups,
@@ -588,6 +657,9 @@ func (o *Orchestrator) Apply(ctx context.Context, in ApplyInput) (Status, error)
 		XrayBridgePorts:       bridgePorts,
 		IncludeNaive:          includeNaive,
 		CacheFilePath:         filepath.Join(o.workDir, "cache.db"),
+		HighLatencyMS:         in.HighLatencyMS,
+		Tailscale:             in.Tailscale,
+		TailscaleStateDir:     in.TailscaleStateDir,
 	})
 	if err != nil {
 		msg := o.redactString(err.Error())
@@ -609,6 +681,11 @@ func (o *Orchestrator) Apply(ctx context.Context, in ApplyInput) (Status, error)
 
 	// Preflight succeeded; tear down any currently running processes cleanly before starting the new topology.
 	o.stopLocked()
+	if in.Tailscale != nil && in.Tailscale.Enabled {
+		o.resetTailscaleTelemetry(in.TailscaleStatusPath)
+	} else {
+		o.resetTailscaleTelemetry("")
+	}
 
 	if in.EnableTUN && !in.AndroidMode {
 		_ = tun.CleanupStaleRoutes(ctx, in.SudoPassword)
@@ -637,12 +714,73 @@ func (o *Orchestrator) Apply(ctx context.Context, in ApplyInput) (Status, error)
 	}
 
 	var sbProc *managedProc
-	if in.EnableTUN && !in.AndroidMode && (runtime.GOOS == "linux" || runtime.GOOS == "darwin") && !tun.CheckPrivilege(sbBin).ReadyWithoutPassword && len(in.SudoPassword) > 0 {
-		sbProc, err = o.startProcessWithSudo("sing-box", sbBin, []string{"run", "-c", sbCfgPath}, in.SudoPassword)
+	var sbExtraEnv []string
+	var coreCtrlAddr, coreCtrlToken, coreCtrlTokenFile, tsStatusToken string
+	cacheDBPath := filepath.Join(o.workDir, "cache.db")
+	if in.AndroidMode {
+		if strings.TrimSpace(in.ProtectPath) != "" {
+			sbExtraEnv = append(sbExtraEnv, "PRISMRAY_PROTECT_PATH="+strings.TrimSpace(in.ProtectPath))
+		}
+		if strings.TrimSpace(in.AndroidNetIfPath) != "" {
+			sbExtraEnv = append(sbExtraEnv, "PRISMRAY_ANDROID_NETIF_PATH="+strings.TrimSpace(in.AndroidNetIfPath))
+		}
+	}
+	useSudo := in.EnableTUN && !in.AndroidMode && (runtime.GOOS == "linux" || runtime.GOOS == "darwin") && !tun.CheckPrivilege(sbBin).ReadyWithoutPassword && len(in.SudoPassword) > 0
+	if !useSudo {
+		if f, oErr := os.OpenFile(cacheDBPath, os.O_RDWR, 0); oErr != nil {
+			if os.IsPermission(oErr) {
+				// Stale root-owned cache.db from an abruptly terminated sudo TUN session would wedge non-sudo startup.
+				_ = os.Remove(cacheDBPath)
+			}
+		} else {
+			_ = f.Close()
+		}
 	} else {
-		sbProc, err = o.startProcess("sing-box", sbBin, []string{"run", "-c", sbCfgPath})
+		sbExtraEnv = append(sbExtraEnv, "PRISMRAY_CACHE_DB_PATH="+cacheDBPath)
+	}
+	if in.Tailscale != nil && in.Tailscale.Enabled {
+		tsStatusToken = randomHexSecret(16)
+		sbExtraEnv = append(sbExtraEnv, "PRISMRAY_TAILSCALE_STATUS_TOKEN="+tsStatusToken)
+		if strings.TrimSpace(in.TailscaleStatusPath) != "" {
+			sbExtraEnv = append(sbExtraEnv, "PRISMRAY_TAILSCALE_STATUS_PATH="+strings.TrimSpace(in.TailscaleStatusPath))
+		}
+		if strings.TrimSpace(in.TailscaleStateDir) != "" {
+			sbExtraEnv = append(sbExtraEnv, "PRISMRAY_TAILSCALE_STATE_DIR="+strings.TrimSpace(in.TailscaleStateDir))
+		}
+		if ctrlPort, portErr := freePort(); portErr == nil && ctrlPort > 0 {
+			coreCtrlAddr = fmt.Sprintf("127.0.0.1:%d", ctrlPort)
+			coreCtrlToken = randomHexSecret(32)
+			o.registerLiteralSecret(coreCtrlToken)
+			sbExtraEnv = append(sbExtraEnv, "PRISMRAY_CORE_CTRL_ADDR="+coreCtrlAddr)
+			if useSudo {
+				// Never pass the bearer secret in sudo argv (visible via ps / auth.log); write a 0600 temp file
+				// that the unified sing-box wrapper reads and immediately unlinks on startup.
+				tokPath := filepath.Join(o.workDir, ".core-ctrl-"+randomHexSecret(6))
+				if wErr := fileutil.WritePrivate(tokPath, []byte(coreCtrlToken)); wErr == nil {
+					coreCtrlTokenFile = tokPath
+					sbExtraEnv = append(sbExtraEnv, "PRISMRAY_CORE_CTRL_TOKEN_FILE="+tokPath)
+				}
+			} else {
+				sbExtraEnv = append(sbExtraEnv, "PRISMRAY_CORE_CTRL_TOKEN="+coreCtrlToken)
+			}
+		}
+	}
+	if useSudo {
+		// Pass non-secret paths & addr via env wrapper when elevating with sudo.
+		if len(sbExtraEnv) > 0 {
+			sudoArgs := append([]string{}, sbExtraEnv...)
+			sudoArgs = append(sudoArgs, sbBin, "run", "-c", sbCfgPath)
+			sbProc, err = o.startProcessWithSudo("sing-box", "/usr/bin/env", sudoArgs, in.SudoPassword)
+		} else {
+			sbProc, err = o.startProcessWithSudo("sing-box", sbBin, []string{"run", "-c", sbCfgPath}, in.SudoPassword)
+		}
+	} else {
+		sbProc, err = o.startProcessWithEnv("sing-box", sbBin, []string{"run", "-c", sbCfgPath}, sbExtraEnv)
 	}
 	if err != nil {
+		if coreCtrlTokenFile != "" {
+			_ = os.Remove(coreCtrlTokenFile)
+		}
 		_ = terminateAndWait(xProc, 2*time.Second)
 		msg := o.redactString(fmt.Sprintf("failed to start sing-box: %v", err))
 		o.setLastError(msg)
@@ -651,12 +789,18 @@ func (o *Orchestrator) Apply(ctx context.Context, in ApplyInput) (Status, error)
 
 	clashClient := clashapi.New(fmt.Sprintf("127.0.0.1:%d", in.ClashAPIPort), in.ClashAPISecret)
 	if err := waitClashReady(ctx, clashClient, o.readyTimeout, sbProc.doneCh); err != nil {
+		if coreCtrlTokenFile != "" {
+			_ = os.Remove(coreCtrlTokenFile)
+		}
 		_ = terminateAndWait(sbProc, 2*time.Second)
 		_ = terminateAndWait(xProc, 2*time.Second)
 		msg := o.redactString(fmt.Sprintf("sing-box failed to start: %v", err))
 		o.AppendLog("sing-box", "error", msg)
 		o.setLastError(msg)
 		return o.Status(), errors.New(msg)
+	}
+	if coreCtrlTokenFile != "" {
+		_ = os.Remove(coreCtrlTokenFile)
 	}
 
 	selMap := make(map[string]string, len(in.Groups))
@@ -675,6 +819,7 @@ func (o *Orchestrator) Apply(ctx context.Context, in ApplyInput) (Status, error)
 	o.topologyHash = topoHash
 	o.includedTags = compiled.IncludedTags
 	o.groupSelections = selMap
+	o.lbShardTargets = compiled.LBShardTargets
 	o.activeNodeID = in.ActiveNodeID
 	o.activeGroupID = in.ActiveGroupID
 	o.activeTag = compiled.ActiveTag
@@ -687,6 +832,9 @@ func (o *Orchestrator) Apply(ctx context.Context, in ApplyInput) (Status, error)
 	o.clashAPIPort = in.ClashAPIPort
 	o.clashAPISecret = in.ClashAPISecret
 	o.clash = clashClient
+	o.coreCtrlAddr = coreCtrlAddr
+	o.coreCtrlToken = coreCtrlToken
+	o.tailscaleStatusToken = tsStatusToken
 	o.skippedNaive = compiled.SkippedNaive
 	o.resolvedSB = sbBin
 	o.resolvedXray = xrayBin
@@ -841,6 +989,62 @@ func (o *Orchestrator) HotSwitch(ctx context.Context, selectorTag, targetTag str
 	return nil
 }
 
+// SetLBShardsBlocked switches every shard selector wrapper of the specified load-balance group
+// to block-out (when blocked=true) or back to its primary healthy shard member (when blocked=false).
+func (o *Orchestrator) SetLBShardsBlocked(ctx context.Context, groupID string, blocked bool) {
+	groupID = strings.TrimSpace(groupID)
+	if groupID == "" {
+		return
+	}
+	o.mu.RLock()
+	running := o.running
+	clash := o.clash
+	included := o.includedTags
+	targets := append([]string(nil), o.lbShardTargets[groupID]...)
+	o.mu.RUnlock()
+	if !running || clash == nil || len(targets) == 0 {
+		return
+	}
+	for i, memberTag := range targets {
+		selTag := sbcfg.LBShardSelectorTag(groupID, i)
+		if !included[selTag] {
+			continue
+		}
+		desired := memberTag
+		if blocked {
+			desired = sbcfg.BlockOutboundTag
+		}
+		if !included[desired] {
+			continue
+		}
+		_ = clash.SelectProxy(ctx, selTag, desired)
+	}
+}
+
+// RestoreAllLBShards unblocks every load-balance shard selector back to its default healthy member.
+func (o *Orchestrator) RestoreAllLBShards(ctx context.Context) {
+	o.mu.RLock()
+	running := o.running
+	clash := o.clash
+	included := o.includedTags
+	snapshot := make(map[string][]string, len(o.lbShardTargets))
+	for gid, targets := range o.lbShardTargets {
+		snapshot[gid] = append([]string(nil), targets...)
+	}
+	o.mu.RUnlock()
+	if !running || clash == nil || len(snapshot) == 0 {
+		return
+	}
+	for gid, targets := range snapshot {
+		for i, memberTag := range targets {
+			selTag := sbcfg.LBShardSelectorTag(gid, i)
+			if included[selTag] && included[memberTag] {
+				_ = clash.SelectProxy(ctx, selTag, memberTag)
+			}
+		}
+	}
+}
+
 // Stop terminates both sing-box and any active Xray coprocessor cleanly.
 func (o *Orchestrator) Stop() error {
 	o.opMu.Lock()
@@ -855,6 +1059,7 @@ func (o *Orchestrator) Close() error {
 }
 
 func (o *Orchestrator) stopLocked() {
+	o.resetTailscaleTelemetry("")
 	o.mu.Lock()
 	sbProc := o.singBoxProc
 	xProc := o.xrayProc
@@ -866,6 +1071,7 @@ func (o *Orchestrator) stopLocked() {
 	o.clash = nil
 	o.topologyHash = ""
 	o.includedTags = map[string]bool{}
+	o.lbShardTargets = nil
 	o.tunEnabled = false
 	o.activeTag = ""
 	o.appSocksPort = 0
@@ -1009,9 +1215,15 @@ func (o *Orchestrator) ResolveAllGroupSelections(ctx context.Context) map[string
 }
 
 func collectAndroidRulePackages(routing ruleset.RoutingProfile) []string {
+	if !routing.CustomRulesEnabledOrDefault() {
+		return nil
+	}
 	seen := map[string]bool{}
 	var out []string
 	for _, cr := range routing.CustomRules {
+		if !cr.Enabled {
+			continue
+		}
 		for _, pkg := range cr.PackageName {
 			clean := strings.TrimSpace(pkg)
 			if clean == "" || seen[clean] {
@@ -1073,6 +1285,8 @@ var (
 	bareSGRRE = regexp.MustCompile(`\[(?:\d{1,3}(?:;\d{1,3})*)m`)
 	// Matches sing-box outbound node tags in log lines (e.g. outbound/vless[node-xxx]: ...).
 	outboundNodeLogRE = regexp.MustCompile(`outbound/[a-zA-Z0-9_-]+\[(node-[^\]]+)\]`)
+	// Matches Tailscale interactive login URLs logged by sing-box endpoint/tailscale.
+	tailscaleAuthURLRE = regexp.MustCompile(`Waiting for authentication:\s*(https?://\S+)`)
 )
 
 func isOutboundFailureLine(level, msg string) bool {
@@ -1091,6 +1305,8 @@ func isOutboundFailureLine(level, msg string) bool {
 	}
 	return level == "error" && (strings.Contains(low, "dial ") || strings.Contains(low, "eof") || strings.Contains(low, "timeout"))
 }
+
+var singBoxTimestampPrefixRE = regexp.MustCompile(`^(?:[+-]\d{4}\s+)?\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\s+(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\s+`)
 
 // StripANSI removes ANSI terminal escape codes and orphaned SGR color fragments from log lines.
 func StripANSI(s string) string {
@@ -1116,6 +1332,13 @@ func (o *Orchestrator) AppendLog(core, level, msg string) {
 	if level == "" {
 		level = inferLogLevel(msg)
 	}
+	// Remove redundant leading sing-box timestamp + level prefix (e.g. "+0000 2026-11-26 18:06:01 ERROR ")
+	// because PrismRay already tags every log entry with local-timezone Timestamp and structured Level.
+	if core == "sing-box" {
+		if trimmed := strings.TrimSpace(singBoxTimestampPrefixRE.ReplaceAllString(msg, "")); trimmed != "" {
+			msg = trimmed
+		}
+	}
 	entry := LogEntry{
 		Seq:       o.logSeq.Add(1),
 		Timestamp: time.Now().Format(time.RFC3339),
@@ -1139,15 +1362,51 @@ func (o *Orchestrator) AppendLog(core, level, msg string) {
 	}
 	o.logMu.Unlock()
 
+	if core == "sing-box" {
+		o.inspectTailscaleLog(entry.Level, msg)
+	}
 	if core == "sing-box" && isOutboundFailureLine(entry.Level, msg) {
 		if m := outboundNodeLogRE.FindStringSubmatch(msg); len(m) == 2 {
-			o.failHandlerMu.RLock()
-			fn := o.onOutboundFailure
-			o.failHandlerMu.RUnlock()
-			if fn != nil {
-				go fn(m[1], msg)
+			tag := m[1]
+			now := time.Now()
+			o.failThrottleMu.Lock()
+			if o.lastFailEmit == nil {
+				o.lastFailEmit = make(map[string]time.Time)
+			}
+			allowEmit := now.Sub(o.lastFailEmit[tag]) >= 500*time.Millisecond
+			if allowEmit {
+				o.lastFailEmit[tag] = now
+			}
+			o.failThrottleMu.Unlock()
+			if allowEmit {
+				o.failHandlerMu.RLock()
+				fn := o.onOutboundFailure
+				o.failHandlerMu.RUnlock()
+				if fn != nil {
+					go fn(tag, msg)
+				}
 			}
 		}
+	}
+}
+
+func (o *Orchestrator) inspectTailscaleLog(level, msg string) {
+	low := strings.ToLower(msg)
+	if !strings.Contains(low, "tailscale") && !strings.Contains(low, "tsnet") {
+		return
+	}
+	if m := tailscaleAuthURLRE.FindStringSubmatch(msg); len(m) == 2 {
+		o.tsStatusMu.Lock()
+		o.tsAuthURL = strings.TrimSpace(m[1])
+		o.tsUpdatedAt = time.Now().UTC()
+		o.tsStatusMu.Unlock()
+		return
+	}
+	if level == "error" || level == "fatal" || strings.Contains(low, "fatal[") || strings.Contains(low, "post-start endpoint/tailscale") {
+		o.tsStatusMu.Lock()
+		o.tsLastError = msg
+		o.tsUpdatedAt = time.Now().UTC()
+		o.tsStatusMu.Unlock()
 	}
 }
 
@@ -1279,7 +1538,14 @@ func (o *Orchestrator) ProbeNodesWithOptions(ctx context.Context, nodes []*confi
 		}
 	}
 
-	for _, uRaw := range []string{testURL} {
+	urlsToCheck := []string{testURL}
+	if speedDownURL != "" {
+		urlsToCheck = append(urlsToCheck, speedDownURL)
+	}
+	if speedUpURL != "" {
+		urlsToCheck = append(urlsToCheck, speedUpURL)
+	}
+	for _, uRaw := range urlsToCheck {
 		parsedURL, parseErr := url.Parse(uRaw)
 		if parseErr != nil || parsedURL.Scheme != "https" || parsedURL.Host == "" {
 			for _, n := range validNodes {
@@ -1838,7 +2104,11 @@ func (o *Orchestrator) probeInSingleSandbox(
 }
 
 func (o *Orchestrator) startProcess(core, bin string, args []string) (*managedProc, error) {
-	return spawnRaw(core, bin, args, func(line string) {
+	return o.startProcessWithEnv(core, bin, args, nil)
+}
+
+func (o *Orchestrator) startProcessWithEnv(core, bin string, args []string, extraEnv []string) (*managedProc, error) {
+	return spawnCmdWithEnv(core, bin, args, nil, extraEnv, func(line string) {
 		o.AppendLog(core, "", line)
 	})
 }
@@ -1866,23 +2136,93 @@ func spawnRaw(core, bin string, args []string, onLine func(string)) (*managedPro
 	return spawnCmd(core, bin, args, nil, onLine)
 }
 
+func upsertEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
+}
+
+func scrubSecretEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "PRISMRAY_BIOMETRIC_") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+func androidCoreEnv(core string) []string {
+	if runtime.GOOS != "android" {
+		return nil
+	}
+	env := scrubSecretEnv(os.Environ())
+	env = upsertEnv(env, "GOGC", "200")
+	// Explicitly override parent libprismray.so's GOMEMLIMIT=96MiB so sing-box receives
+	// 160MiB for geo rule-sets + Tailscale tsnet while Xray stays bounded at 96MiB.
+	limit := "160MiB"
+	if strings.Contains(strings.ToLower(core), "xray") {
+		limit = "96MiB"
+	}
+	env = upsertEnv(env, "GOMEMLIMIT", limit)
+	return env
+}
+
 func spawnCmd(core, bin string, args []string, stdinData []byte, onLine func(string)) (*managedProc, error) {
+	return spawnCmdWithEnv(core, bin, args, stdinData, nil, onLine)
+}
+
+func spawnCmdWithEnv(core, bin string, args []string, stdinData []byte, extraEnv []string, onLine func(string)) (*managedProc, error) {
 	cmd := exec.Command(bin, args...)
+	env := androidCoreEnv(core)
+	if len(env) == 0 {
+		env = scrubSecretEnv(os.Environ())
+	}
+	if len(extraEnv) > 0 {
+		env = append(env, extraEnv...)
+	}
+	cmd.Env = env
 	bindParent(cmd)
+	var stdinPipe io.WriteCloser
+	var err error
 	if len(stdinData) > 0 {
-		cmd.Stdin = bytes.NewReader(stdinData)
+		stdinPipe, err = cmd.StdinPipe()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		if stdinPipe != nil {
+			_ = stdinPipe.Close()
+		}
 		return nil, err
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
+		if stdinPipe != nil {
+			_ = stdinPipe.Close()
+		}
 		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
+		if stdinPipe != nil {
+			_ = stdinPipe.Close()
+		}
 		return nil, err
+	}
+	if stdinPipe != nil {
+		// Synchronously deliver credentials and close stdin before caller zeroes stdinData,
+		// eliminating the Go data race with os/exec's async stdin copy goroutine.
+		_, _ = stdinPipe.Write(stdinData)
+		_ = stdinPipe.Close()
 	}
 
 	var ioWG sync.WaitGroup
@@ -1974,8 +2314,14 @@ func terminateAndWait(proc *managedProc, grace time.Duration) error {
 		if err := proc.cmd.Process.Kill(); err != nil && len(proc.sudoPass) > 0 {
 			sudoKill(proc.sudoPass, "-KILL", proc.pid)
 		}
-		err := <-proc.doneCh
-		return err
+		killTimer := time.NewTimer(5 * time.Second)
+		defer killTimer.Stop()
+		select {
+		case err := <-proc.doneCh:
+			return err
+		case <-killTimer.C:
+			return fmt.Errorf("process pid %d did not exit within 5s after SIGKILL", proc.pid)
+		}
 	}
 }
 
@@ -1986,7 +2332,10 @@ func sudoKill(password []byte, sig string, pid int) {
 	buf := make([]byte, len(password)+1)
 	copy(buf, password)
 	buf[len(password)] = '\n'
-	cmd := exec.Command("sudo", "-S", "-p", "", "kill", sig, fmt.Sprintf("%d", pid))
+	// Terminate both the process group (-pid) and any child sing-box spawned under sudo/env
+	// so elevated sing-box never leaks as an orphaned root daemon.
+	script := fmt.Sprintf("pkill %s -P %d 2>/dev/null || true; kill %s -- -%d %d 2>/dev/null || true", sig, pid, sig, pid, pid)
+	cmd := exec.Command("sudo", "-S", "-p", "", "/bin/sh", "-c", script)
 	cmd.Stdin = bytes.NewReader(buf)
 	_ = cmd.Run()
 	for i := range buf {
@@ -2112,14 +2461,38 @@ func (o *Orchestrator) setLastError(msg string) {
 	o.mu.Unlock()
 }
 
+func buildSecretReplacer(secrets []string) *strings.Replacer {
+	if len(secrets) == 0 {
+		return nil
+	}
+	pairs := make([]string, 0, len(secrets)*2)
+	for _, sec := range secrets {
+		if sec != "" {
+			pairs = append(pairs, sec, "[REDACTED]")
+		}
+	}
+	if len(pairs) == 0 {
+		return nil
+	}
+	return strings.NewReplacer(pairs...)
+}
+
 func (o *Orchestrator) registerSecrets(in ApplyInput) {
+	seen := make(map[string]bool)
 	var list []string
-	if in.ClashAPISecret != "" {
-		list = append(list, in.ClashAPISecret)
+	add := func(cand string) {
+		if len(cand) >= 4 && !seen[cand] {
+			seen[cand] = true
+			list = append(list, cand)
+		}
+	}
+	add(in.ClashAPISecret)
+	if in.Tailscale != nil {
+		add(in.Tailscale.AuthKey)
 	}
 	for _, l := range in.Listeners {
-		if l != nil && len(l.Password) >= 4 {
-			list = append(list, l.Password)
+		if l != nil {
+			add(l.Password)
 		}
 	}
 	for _, n := range in.Nodes {
@@ -2129,26 +2502,13 @@ func (o *Orchestrator) registerSecrets(in ApplyInput) {
 		for _, cand := range []string{
 			n.UUID, n.Password, n.PrivateKey, n.PreSharedKey, n.ObfsPassword, n.ShortID, n.VLESSEncryption,
 		} {
-			if len(cand) >= 4 {
-				list = append(list, cand)
-			}
+			add(cand)
 		}
-	}
-	if len(list) == 0 {
-		return
 	}
 	sort.Slice(list, func(i, j int) bool { return len(list[i]) > len(list[j]) })
 	o.secretsMu.Lock()
-	seen := make(map[string]bool, len(o.secrets)+len(list))
-	merged := make([]string, 0, len(o.secrets)+len(list))
-	for _, s := range append(o.secrets, list...) {
-		if s != "" && !seen[s] {
-			seen[s] = true
-			merged = append(merged, s)
-		}
-	}
-	sort.Slice(merged, func(i, j int) bool { return len(merged[i]) > len(merged[j]) })
-	o.secrets = merged
+	o.secrets = list
+	o.secretReplacer.Store(buildSecretReplacer(list))
 	o.secretsMu.Unlock()
 }
 
@@ -2165,6 +2525,7 @@ func (o *Orchestrator) registerLiteralSecret(s string) {
 	}
 	o.secrets = append(o.secrets, s)
 	sort.Slice(o.secrets, func(i, j int) bool { return len(o.secrets[i]) > len(o.secrets[j]) })
+	o.secretReplacer.Store(buildSecretReplacer(o.secrets))
 }
 
 var (
@@ -2173,14 +2534,8 @@ var (
 )
 
 func (o *Orchestrator) redactString(s string) string {
-	o.secretsMu.RLock()
-	secrets := append([]string(nil), o.secrets...)
-	o.secretsMu.RUnlock()
-
-	for _, sec := range secrets {
-		if sec != "" && strings.Contains(s, sec) {
-			s = strings.ReplaceAll(s, sec, "[REDACTED]")
-		}
+	if repl := o.secretReplacer.Load(); repl != nil {
+		s = repl.Replace(s)
 	}
 	s = uuidRegex.ReplaceAllString(s, "[REDACTED-UUID]")
 	s = kvSecretRegex.ReplaceAllString(s, `${1}[REDACTED]`)
@@ -2205,14 +2560,17 @@ func inferLogLevel(msg string) string {
 // ignoring latency measurements and selector SelectedNodeID so node switches remain hot-swappable.
 func topologyFingerprint(in ApplyInput, includeNaive bool) (string, error) {
 	type fpGroup struct {
-		ID          string
-		Strategy    string
-		Filter      string
-		ToleranceMS int
-		Interval    string
-		DetourID    string
-		SortOrder   int
-		NodeIDs     []string
+		ID                string
+		Strategy          string
+		Filter            string
+		ToleranceMS       int
+		Interval          string
+		FailoverTrigger   string
+		HighLatencyMS     int
+		LoadBalanceShards int
+		DetourID          string
+		SortOrder         int
+		NodeIDs           []string
 	}
 	nodes := make([]config.Node, 0, len(in.Nodes))
 	for _, n := range in.Nodes {
@@ -2223,7 +2581,13 @@ func topologyFingerprint(in ApplyInput, includeNaive bool) (string, error) {
 		cp.Name = ""
 		cp.UserAlias = ""
 		cp.Favorite = false
-		cp.Latency = 0
+		// Preserve only unhealthy (<0) vs healthy (>=0) boolean state so LoadBalance dead-shard
+		// eviction triggers a reload while ordinary latency fluctuations remain hot-swappable.
+		if cp.Latency < 0 {
+			cp.Latency = -1
+		} else {
+			cp.Latency = 0
+		}
 		cp.PingMS = 0
 		cp.DownSpeedMbps = 0
 		cp.UpSpeedMbps = 0
@@ -2232,43 +2596,59 @@ func topologyFingerprint(in ApplyInput, includeNaive bool) (string, error) {
 		cp.Tags = nil
 		nodes = append(nodes, cp)
 	}
+	activeLBGroupID := ""
 	groups := make([]fpGroup, 0, len(in.Groups))
 	for _, g := range in.Groups {
+		strat := storage.CanonicalGroupStrategy(g.Strategy)
+		if g.ID == in.ActiveGroupID && strat == "loadbalance" {
+			activeLBGroupID = g.ID
+		}
 		groups = append(groups, fpGroup{
-			ID:          g.ID,
-			Strategy:    storage.CanonicalGroupStrategy(g.Strategy),
-			Filter:      g.Filter,
-			ToleranceMS: g.ToleranceMS,
-			Interval:    g.Interval,
-			DetourID:    g.DetourID,
-			SortOrder:   g.SortOrder,
-			NodeIDs:     g.NodeIDs,
+			ID:                g.ID,
+			Strategy:          strat,
+			Filter:            g.Filter,
+			ToleranceMS:       g.ToleranceMS,
+			Interval:          g.Interval,
+			FailoverTrigger:   storage.CanonicalFailoverTrigger(g.FailoverTrigger),
+			HighLatencyMS:     g.HighLatencyMS,
+			LoadBalanceShards: g.LoadBalanceShards,
+			DetourID:          g.DetourID,
+			SortOrder:         g.SortOrder,
+			NodeIDs:           g.NodeIDs,
 		})
 	}
 	payload := struct {
-		Nodes        []config.Node
-		Groups       []fpGroup
-		Listeners    []*config.ListenConfig
-		Routing      ruleset.RoutingProfile
-		RuleSets     []ruleset.RuleSetSpec
-		MixedPort    int
-		EnableTUN    bool
-		TUNStack     string
-		AndroidMode  bool
-		ProtectPath  string
-		IncludeNaive bool
+		Nodes             []config.Node
+		Groups            []fpGroup
+		Listeners         []*config.ListenConfig
+		Routing           ruleset.RoutingProfile
+		RuleSets          []ruleset.RuleSetSpec
+		ActiveLBGroupID   string
+		HighLatencyMS     int
+		MixedPort         int
+		EnableTUN         bool
+		TUNStack          string
+		AndroidMode       bool
+		ProtectPath       string
+		IncludeNaive      bool
+		Tailscale         *ruleset.TailscaleConfig
+		TailscaleStateDir string
 	}{
-		Nodes:        nodes,
-		Groups:       groups,
-		Listeners:    in.Listeners,
-		Routing:      in.Routing,
-		RuleSets:     in.RuleSets,
-		MixedPort:    in.MixedPort,
-		EnableTUN:    in.EnableTUN,
-		TUNStack:     in.TUNStack,
-		AndroidMode:  in.AndroidMode,
-		ProtectPath:  in.ProtectPath,
-		IncludeNaive: includeNaive,
+		Nodes:             nodes,
+		Groups:            groups,
+		Listeners:         in.Listeners,
+		Routing:           in.Routing,
+		RuleSets:          in.RuleSets,
+		ActiveLBGroupID:   activeLBGroupID,
+		HighLatencyMS:     in.HighLatencyMS,
+		MixedPort:         in.MixedPort,
+		EnableTUN:         in.EnableTUN,
+		TUNStack:          in.TUNStack,
+		AndroidMode:       in.AndroidMode,
+		ProtectPath:       in.ProtectPath,
+		IncludeNaive:      includeNaive,
+		Tailscale:         in.Tailscale,
+		TailscaleStateDir: in.TailscaleStateDir,
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {

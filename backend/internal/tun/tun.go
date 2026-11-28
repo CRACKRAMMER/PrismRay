@@ -2,7 +2,6 @@
 package tun
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -144,20 +143,36 @@ func (m *Manager) StartWithPassword(binary, path string, b, password []byte) err
 	}
 	cmd := exec.Command(binary, "run", "-c", path)
 	var credentialInput []byte
+	var stdinPipe io.WriteCloser
 	if len(password) > 0 {
 		cmd = exec.Command("sudo", "-S", "-p", "", "--", binary, "run", "-c", path)
 		credentialInput = append(append([]byte(nil), password...), '\n')
-		cmd.Stdin = bytes.NewReader(credentialInput)
-	}
-	defer func() {
-		for i := range credentialInput {
-			credentialInput[i] = 0
+		var pErr error
+		stdinPipe, pErr = cmd.StdinPipe()
+		if pErr != nil {
+			for i := range credentialInput {
+				credentialInput[i] = 0
+			}
+			return pErr
 		}
-	}()
+	}
 	diagnostic := &cappedBuffer{limit: 16 << 10}
 	cmd.Stderr = io.MultiWriter(os.Stderr, diagnostic)
 	if e := cmd.Start(); e != nil {
+		if stdinPipe != nil {
+			_ = stdinPipe.Close()
+		}
+		for i := range credentialInput {
+			credentialInput[i] = 0
+		}
 		return e
+	}
+	if stdinPipe != nil {
+		_, _ = stdinPipe.Write(credentialInput)
+		_ = stdinPipe.Close()
+		for i := range credentialInput {
+			credentialInput[i] = 0
+		}
 	}
 	m.cmd = cmd
 	m.done = make(chan struct{})

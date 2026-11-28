@@ -287,3 +287,82 @@ func TestV10GroupsSubscriptionsRuleSetsAndSettings(t *testing.T) {
 		t.Fatalf("groups not persisted: %#v %v", groups, err)
 	}
 }
+
+func TestGroupFailoverTriggerAndBatchedListGroupsOrder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "groups.db")
+	s, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	for _, id := range []string{"n1", "n2", "n3"} {
+		if err := s.Add(&config.Node{ID: id, Name: id, Protocol: config.ProtocolSocks, Address: "198.51.100.1", Port: 1080}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SaveGroup(Group{
+		ID:              "g1",
+		Name:            "Failover One",
+		Strategy:        "failover",
+		FailoverTrigger: "unavailable_only",
+		HighLatencyMS:   450,
+		SortOrder:       1,
+		NodeIDs:         []string{"n3", "n1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveGroup(Group{
+		ID:              "g2",
+		Name:            "Selector Two",
+		Strategy:        "selector",
+		FailoverTrigger: "high_latency_or_unavailable",
+		HighLatencyMS:   900,
+		SortOrder:       2,
+		NodeIDs:         []string{"n2", "n3", "n1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	listed, err := s.ListGroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(listed))
+	}
+	if listed[0].ID != "g1" || listed[0].FailoverTrigger != "unavailable_only" || listed[0].HighLatencyMS != 450 {
+		t.Fatalf("unexpected g1: %+v", listed[0])
+	}
+	if len(listed[0].NodeIDs) != 2 || listed[0].NodeIDs[0] != "n3" || listed[0].NodeIDs[1] != "n1" {
+		t.Fatalf("batched ListGroups lost member order for g1: %v", listed[0].NodeIDs)
+	}
+	if listed[1].ID != "g2" || len(listed[1].NodeIDs) != 3 || listed[1].NodeIDs[0] != "n2" || listed[1].NodeIDs[2] != "n1" {
+		t.Fatalf("batched ListGroups lost member order for g2: %+v", listed[1])
+	}
+
+	// Verify LoadBalanceShards persists cleanly (custom value & clamped upper bound).
+	if err := s.SaveGroup(Group{
+		ID:                "g-lb-custom",
+		Name:              "Custom LB",
+		Strategy:          "loadbalance",
+		LoadBalanceShards: 8,
+		SortOrder:         3,
+		NodeIDs:           []string{"n1", "n2", "n3"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	listed2, err := s.ListGroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed2) != 3 || listed2[2].LoadBalanceShards != 8 {
+		t.Fatalf("expected persisted LoadBalanceShards=8, got %+v", listed2)
+	}
+	if EffectiveGroupLoadBalanceShards(0) != DefaultLoadBalanceShards {
+		t.Fatalf("expected default effective shards=%d, got %d", DefaultLoadBalanceShards, EffectiveGroupLoadBalanceShards(0))
+	}
+	if EffectiveGroupLoadBalanceShards(99) != MaxLoadBalanceShardsLimit {
+		t.Fatalf("expected clamped effective shards=%d, got %d", MaxLoadBalanceShardsLimit, EffectiveGroupLoadBalanceShards(99))
+	}
+}

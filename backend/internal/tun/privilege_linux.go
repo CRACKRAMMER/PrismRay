@@ -139,6 +139,10 @@ func AuthorizeWithPkexec(ctx context.Context, singBoxBinary string) error {
 	if err != nil || st.IsDir() {
 		return fmt.Errorf("sing-box binary not found at %s", realPath)
 	}
+	baseName := filepath.Base(realPath)
+	if baseName != "sing-box" && !strings.HasPrefix(baseName, "sing-box-") {
+		return fmt.Errorf("refusing to grant network capabilities to unexpected binary %q", baseName)
+	}
 	if strings.HasPrefix(filepath.ToSlash(realPath), "/tmp/.mount_") {
 		return fmt.Errorf("cannot set capabilities on read-only AppImage mount %s; stage sing-box into a persistent directory first", realPath)
 	}
@@ -162,49 +166,59 @@ func AuthorizeWithPkexec(ctx context.Context, singBoxBinary string) error {
 	return nil
 }
 
+func runPrivilegedCmd(ctx context.Context, sudoPassword []byte, argv ...string) error {
+	if len(argv) == 0 {
+		return nil
+	}
+	if os.Geteuid() == 0 || len(sudoPassword) == 0 {
+		return exec.CommandContext(ctx, argv[0], argv[1:]...).Run()
+	}
+	cmd := exec.CommandContext(ctx, "sudo", append([]string{"-S", "-p", ""}, argv...)...)
+	buf := make([]byte, len(sudoPassword)+1)
+	copy(buf, sudoPassword)
+	buf[len(sudoPassword)] = '\n'
+	cmd.Stdin = bytes.NewReader(buf)
+	err := cmd.Run()
+	for i := range buf {
+		buf[i] = 0
+	}
+	return err
+}
+
 // CleanupStaleRoutes idempotently tears down leftover prismray0 TUN interface or
-// iproute2 table 2178 / rule 7000 artifacts left behind by an unclean crash.
+// iproute2 table 2178 / rule 7000 artifacts (both IPv4 and IPv6) left behind by an unclean crash.
 func CleanupStaleRoutes(ctx context.Context, sudoPassword []byte) error {
 	ipBin := findAdminTool("ip")
 	if ipBin == "" {
 		return nil
 	}
 	linkExists := exec.CommandContext(ctx, ipBin, "link", "show", "prismray0").Run() == nil
-	ruleOut, _ := exec.CommandContext(ctx, ipBin, "rule", "show").Output()
-	ruleExists := bytes.Contains(ruleOut, []byte("2178"))
-	if !linkExists && !ruleExists {
+	rule4Out, _ := exec.CommandContext(ctx, ipBin, "-4", "rule", "show").Output()
+	rule4Exists := bytes.Contains(rule4Out, []byte("2178"))
+	rule6Out, _ := exec.CommandContext(ctx, ipBin, "-6", "rule", "show").Output()
+	rule6Exists := bytes.Contains(rule6Out, []byte("2178"))
+	if !linkExists && !rule4Exists && !rule6Exists {
 		return nil
 	}
 
-	cmds := [][]string{}
 	if linkExists {
-		cmds = append(cmds, []string{ipBin, "link", "del", "prismray0"})
+		_ = runPrivilegedCmd(ctx, sudoPassword, ipBin, "link", "del", "prismray0")
 	}
-	if ruleExists {
-		cmds = append(cmds,
-			[]string{ipBin, "rule", "del", "table", "2178"},
-			[]string{ipBin, "route", "flush", "table", "2178"},
-		)
-	}
-	for _, argv := range cmds {
-		if os.Geteuid() == 0 {
-			_ = exec.CommandContext(ctx, argv[0], argv[1:]...).Run()
-			continue
-		}
-		if len(sudoPassword) > 0 {
-			cmd := exec.CommandContext(ctx, "sudo", append([]string{"-S", "-p", ""}, argv...)...)
-			buf := make([]byte, len(sudoPassword)+1)
-			copy(buf, sudoPassword)
-			buf[len(sudoPassword)] = '\n'
-			cmd.Stdin = bytes.NewReader(buf)
-			_ = cmd.Run()
-			for i := range buf {
-				buf[i] = 0
+	if rule4Exists {
+		for i := 0; i < 16; i++ {
+			if err := runPrivilegedCmd(ctx, sudoPassword, ipBin, "-4", "rule", "del", "table", "2178"); err != nil {
+				break
 			}
-			continue
 		}
-		// Fallback attempt without password in case passwordless sudo exists for ip.
-		_ = exec.CommandContext(ctx, argv[0], argv[1:]...).Run()
+		_ = runPrivilegedCmd(ctx, sudoPassword, ipBin, "-4", "route", "flush", "table", "2178")
+	}
+	if rule6Exists {
+		for i := 0; i < 16; i++ {
+			if err := runPrivilegedCmd(ctx, sudoPassword, ipBin, "-6", "rule", "del", "table", "2178"); err != nil {
+				break
+			}
+		}
+		_ = runPrivilegedCmd(ctx, sudoPassword, ipBin, "-6", "route", "flush", "table", "2178")
 	}
 	return nil
 }

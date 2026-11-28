@@ -56,7 +56,7 @@ func AuthorizeWithPkexec(_ context.Context, _ string) error {
 	if isWindowsAdmin() {
 		return nil
 	}
-	return fmt.Errorf("Windows 开启 TUN 需要管理员权限，请右键 PrismRay 选择「以管理员身份运行」")
+	return fmt.Errorf("Windows TUN (Wintun) requires Administrator privileges; right-click PrismRay and select Run as administrator")
 }
 
 // HasMarkCapability reports false on Windows (no Linux SO_MARK).

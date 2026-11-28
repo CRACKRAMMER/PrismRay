@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -234,8 +235,12 @@ func TestTUNRequiresCachedSudoBeforeChangingRuntime(t *testing.T) {
 	dir := t.TempDir()
 	cfg := appconfig.Default()
 	cfg.Storage.DatabasePath = filepath.Join(dir, "prismray.db")
-	// Do not point at any pre-authorized binary with cap_net_admin
-	cfg.SingBox.BinaryPath = filepath.Join(dir, "missing-sing-box")
+	// Point explicitly at an isolated unprivileged mock binary so host-installed cap_net_admin binaries do not mask 428.
+	unprivBin := filepath.Join(dir, "unpriv-sing-box")
+	if wErr := os.WriteFile(unprivBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); wErr != nil {
+		t.Fatal(wErr)
+	}
+	cfg.SingBox.BinaryPath = unprivBin
 	store, err := storage.NewStore(cfg.Storage.DatabasePath)
 	if err != nil {
 		t.Fatal(err)

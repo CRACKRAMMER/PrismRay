@@ -159,15 +159,36 @@ func TestAndroidVPNRoutesLifecycle(t *testing.T) {
 		Sni:      "android.example",
 	})
 
+	// 1. Default start (without custom package_name rules) selects native hev-socks5-tunnel (MTU 8500, no tun.sock).
 	start := request(s, http.MethodPost, "/api/vpn/android/start", `{"tun_fd":77,"per_app_mode":"whitelist","per_app_packages":["com.example.browser"],"active_node_id":"n1"}`)
 	if start.Code != http.StatusOK {
 		t.Fatalf("POST /api/vpn/android/start failed: %d %s", start.Code, start.Body.String())
 	}
 	var startBody map[string]any
 	_ = json.Unmarshal(start.Body.Bytes(), &startBody)
-	tunSock, _ := startBody["tun_socket_path"].(string)
+	if startBody["tun_engine"] != "hev" {
+		t.Fatalf("expected default tun_engine=hev, got %+v", startBody)
+	}
+	if startBody["mtu"] != float64(8500) {
+		t.Fatalf("expected mtu=8500, got %+v", startBody)
+	}
+	if tunSock, _ := startBody["tun_socket_path"].(string); tunSock != "" {
+		t.Fatalf("expected empty tun_socket_path in hev mode, got %q", tunSock)
+	}
+
+	// 2. Fallback start (hev_available=false) switches cleanly to Go tun2socks with an active tun.sock.
+	fbStart := request(s, http.MethodPost, "/api/vpn/android/start", `{"tun_fd":77,"hev_available":false,"per_app_mode":"whitelist","per_app_packages":["com.example.browser"],"active_node_id":"n1"}`)
+	if fbStart.Code != http.StatusOK {
+		t.Fatalf("POST /api/vpn/android/start (fallback) failed: %d %s", fbStart.Code, fbStart.Body.String())
+	}
+	var fbBody map[string]any
+	_ = json.Unmarshal(fbStart.Body.Bytes(), &fbBody)
+	if fbBody["tun_engine"] != "tun2socks" {
+		t.Fatalf("expected fallback tun_engine=tun2socks, got %+v", fbBody)
+	}
+	tunSock, _ := fbBody["tun_socket_path"].(string)
 	if !filepath.IsAbs(tunSock) {
-		t.Fatalf("expected absolute tun_socket_path, got %q", tunSock)
+		t.Fatalf("expected absolute tun_socket_path in tun2socks mode, got %q", tunSock)
 	}
 	if _, err := os.Stat(tunSock); err != nil {
 		t.Fatalf("expected tun_socket_path to exist at %q: %v", tunSock, err)

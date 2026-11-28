@@ -40,29 +40,41 @@ type sealedDocument struct {
 	Data      string `json:"data"`
 }
 
+const (
+	// DefaultLoadBalanceShards is the default concurrent exit count for domain-hash load-balance groups.
+	DefaultLoadBalanceShards = 4
+	// MaxLoadBalanceShardsLimit caps custom load-balance shard counts to the 36-char domain-hash alphabet [a-z0-9].
+	MaxLoadBalanceShardsLimit = 36
+)
+
 // Group defines a proxy selection, latency test, failover, or domain-hash loadbalance group.
 type Group struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	Strategy       string   `json:"strategy"` // selector | urltest | failover | loadbalance
-	SelectedNodeID string   `json:"selected_node_id,omitempty"`
-	ManualPin      bool     `json:"manual_pin,omitempty"`
-	Filter         string   `json:"filter,omitempty"`
-	ToleranceMS    int      `json:"tolerance_ms,omitempty"`
-	Interval       string   `json:"interval,omitempty"`
-	PriorityRule   string   `json:"priority_rule,omitempty"` // "" (inherit global) | latency_first | speed_first | hybrid_score
-	AutoFailover   *bool    `json:"auto_failover,omitempty"`
-	DetourID       string   `json:"detour_id,omitempty"`
-	SortOrder      int      `json:"sort_order"`
-	NodeIDs        []string `json:"node_ids"`
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	Strategy          string   `json:"strategy"` // selector | urltest | failover | loadbalance
+	SelectedNodeID    string   `json:"selected_node_id,omitempty"`
+	ManualPin         bool     `json:"manual_pin,omitempty"`
+	Filter            string   `json:"filter,omitempty"`
+	ToleranceMS       int      `json:"tolerance_ms,omitempty"`
+	Interval          string   `json:"interval,omitempty"`
+	PriorityRule      string   `json:"priority_rule,omitempty"`       // "" (inherit global) | latency_first | speed_first | hybrid_score
+	AutoFailover      *bool    `json:"auto_failover,omitempty"`       // only applies to selector strategy
+	FailoverTrigger   string   `json:"failover_trigger,omitempty"`    // "" (default high_latency_or_unavailable) | high_latency_or_unavailable | unavailable_only
+	HighLatencyMS     int      `json:"high_latency_ms,omitempty"`     // 0 = inherit global healthSettings.HighLatencyMS
+	LoadBalanceShards int      `json:"load_balance_shards,omitempty"` // 0 = default (4), 1..36 custom shard count for loadbalance strategy
+	DetourID          string   `json:"detour_id,omitempty"`
+	SortOrder         int      `json:"sort_order"`
+	NodeIDs           []string `json:"node_ids"`
 }
 
 // SubscriptionRecord stores encrypted subscription source URLs, quota telemetry,
-// and the structured import/skip diagnostic report.
+// optional regex filters, and the structured import/skip diagnostic report.
 type SubscriptionRecord struct {
 	ID              string   `json:"id"`
 	Name            string   `json:"name"`
 	URL             string   `json:"url"`
+	IncludeRegex    string   `json:"include_regex,omitempty"`
+	ExcludeRegex    string   `json:"exclude_regex,omitempty"`
 	UploadBytes     int64    `json:"upload_bytes"`
 	DownloadBytes   int64    `json:"download_bytes"`
 	TotalBytes      int64    `json:"total_bytes"`
@@ -72,6 +84,16 @@ type SubscriptionRecord struct {
 	SkippedCount    int      `json:"skipped_count"`
 	Warnings        []string `json:"warnings"`
 	LastUpdatedAt   string   `json:"last_updated_at"`
+}
+
+// TrafficBucket stores aggregated proxy vs. direct upload/download bytes for a time bucket.
+type TrafficBucket struct {
+	BucketUnix  int64  `json:"bucket_unix"`
+	Granularity string `json:"granularity"` // "hour" | "day"
+	ProxyUp     int64  `json:"proxy_up"`
+	ProxyDown   int64  `json:"proxy_down"`
+	DirectUp    int64  `json:"direct_up"`
+	DirectDown  int64  `json:"direct_down"`
 }
 
 // RuleSetRecord stores metadata for local/remote .srs rule sets.
@@ -155,6 +177,8 @@ func (s *Store) initialize() error {
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
 			url_sealed BLOB NOT NULL,
+			include_regex TEXT NOT NULL DEFAULT '',
+			exclude_regex TEXT NOT NULL DEFAULT '',
 			upload_bytes INTEGER NOT NULL DEFAULT 0,
 			download_bytes INTEGER NOT NULL DEFAULT 0,
 			total_bytes INTEGER NOT NULL DEFAULT 0,
@@ -186,6 +210,9 @@ func (s *Store) initialize() error {
 			interval TEXT NOT NULL DEFAULT '5m',
 			priority_rule TEXT NOT NULL DEFAULT '',
 			auto_failover INTEGER NOT NULL DEFAULT -1,
+			failover_trigger TEXT NOT NULL DEFAULT '',
+			high_latency_ms INTEGER NOT NULL DEFAULT 0,
+			load_balance_shards INTEGER NOT NULL DEFAULT 0,
 			detour_id TEXT NOT NULL DEFAULT '',
 			sort_order INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -214,11 +241,57 @@ func (s *Store) initialize() error {
 			last_synced_at TEXT NOT NULL DEFAULT '',
 			size_bytes INTEGER NOT NULL DEFAULT 0
 		);
+		CREATE TABLE IF NOT EXISTS traffic_buckets(
+			bucket_unix INTEGER NOT NULL,
+			granularity TEXT NOT NULL,
+			proxy_up INTEGER NOT NULL DEFAULT 0,
+			proxy_down INTEGER NOT NULL DEFAULT 0,
+			direct_up INTEGER NOT NULL DEFAULT 0,
+			direct_down INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(bucket_unix, granularity)
+		);
+		CREATE INDEX IF NOT EXISTS traffic_buckets_gran_idx ON traffic_buckets(granularity, bucket_unix);
 	`, schemaVersion))
 	if err != nil {
 		return err
 	}
-	return s.ensureGroupsColumns()
+	if err := s.ensureGroupsColumns(); err != nil {
+		return err
+	}
+	return s.ensureSubscriptionsColumns()
+}
+
+func (s *Store) ensureSubscriptionsColumns() error {
+	rows, err := s.db.Query(`PRAGMA table_info(subscriptions)`)
+	if err != nil {
+		return err
+	}
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt any
+		if err = rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		cols[name] = true
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	if !cols["include_regex"] {
+		if _, err = s.db.Exec(`ALTER TABLE subscriptions ADD COLUMN include_regex TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !cols["exclude_regex"] {
+		if _, err = s.db.Exec(`ALTER TABLE subscriptions ADD COLUMN exclude_regex TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) ensureGroupsColumns() error {
@@ -258,6 +331,21 @@ func (s *Store) ensureGroupsColumns() error {
 	}
 	if !cols["manual_pin"] {
 		if _, err = s.db.Exec(`ALTER TABLE groups ADD COLUMN manual_pin INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if !cols["failover_trigger"] {
+		if _, err = s.db.Exec(`ALTER TABLE groups ADD COLUMN failover_trigger TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	if !cols["high_latency_ms"] {
+		if _, err = s.db.Exec(`ALTER TABLE groups ADD COLUMN high_latency_ms INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if !cols["load_balance_shards"] {
+		if _, err = s.db.Exec(`ALTER TABLE groups ADD COLUMN load_balance_shards INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
 	}
@@ -904,42 +992,92 @@ func (s *Store) UpdateLatency(id string, latency int) error {
 	return s.UpdateNodeProbeMetrics(id, &latency, nil, nil, nil)
 }
 
+// NodeProbeMetricUpdate holds selective telemetry fields for batched SQLite updates.
+type NodeProbeMetricUpdate struct {
+	ID        string
+	LatencyMS *int
+	PingMS    *int
+	DownMbps  *float64
+	UpMbps    *float64
+}
+
 // UpdateNodeProbeMetrics atomically updates probe latency, TCP ping, and bandwidth metrics.
 func (s *Store) UpdateNodeProbeMetrics(id string, latencyMS, pingMS *int, downMbps, upMbps *float64) error {
+	return s.UpdateNodesProbeMetricsBatch([]NodeProbeMetricUpdate{{
+		ID:        id,
+		LatencyMS: latencyMS,
+		PingMS:    pingMS,
+		DownMbps:  downMbps,
+		UpMbps:    upMbps,
+	}})
+}
+
+// UpdateNodesProbeMetricsBatch updates probe metrics for multiple nodes in a single SQLite
+// transaction to eliminate per-node fsync stalls during batch probing.
+func (s *Store) UpdateNodesProbeMetricsBatch(updates []NodeProbeMetricUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var currentLatency int
-	var body []byte
-	err := s.db.QueryRow(`SELECT latency_ms, sealed_credentials FROM nodes WHERE id=?`, id).Scan(&currentLatency, &body)
-	if errors.Is(err, sql.ErrNoRows) {
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var notFound bool
+	for _, u := range updates {
+		var currentLatency int
+		var body []byte
+		err := tx.QueryRow(`SELECT latency_ms, sealed_credentials FROM nodes WHERE id=?`, u.ID).Scan(&currentLatency, &body)
+		if errors.Is(err, sql.ErrNoRows) {
+			if len(updates) == 1 {
+				notFound = true
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		n, err := s.decodeNode(u.ID, body)
+		if err != nil {
+			return err
+		}
+		if u.LatencyMS != nil {
+			n.Latency = *u.LatencyMS
+			currentLatency = *u.LatencyMS
+		}
+		if u.PingMS != nil {
+			n.PingMS = *u.PingMS
+		}
+		if u.DownMbps != nil {
+			n.DownSpeedMbps = *u.DownMbps
+		}
+		if u.UpMbps != nil {
+			n.UpSpeedMbps = *u.UpMbps
+		}
+		updatedBody, err := s.encodeNode(n)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE nodes SET latency_ms=?, sealed_credentials=? WHERE id=?`, currentLatency, updatedBody, u.ID); err != nil {
+			return err
+		}
+	}
+	if notFound {
 		return os.ErrNotExist
 	}
-	if err != nil {
+	if err := tx.Commit(); err != nil {
 		return err
 	}
-	n, err := s.decodeNode(id, body)
-	if err != nil {
-		return err
-	}
-	if latencyMS != nil {
-		n.Latency = *latencyMS
-		currentLatency = *latencyMS
-	}
-	if pingMS != nil {
-		n.PingMS = *pingMS
-	}
-	if downMbps != nil {
-		n.DownSpeedMbps = *downMbps
-	}
-	if upMbps != nil {
-		n.UpSpeedMbps = *upMbps
-	}
-	updatedBody, err := s.encodeNode(n)
-	if err != nil {
-		return err
-	}
-	_, err = s.db.Exec(`UPDATE nodes SET latency_ms=?, sealed_credentials=? WHERE id=?`, currentLatency, updatedBody, id)
-	return err
+	tx = nil
+	return nil
 }
 
 // SyncSubscriptionNodes synchronizes all nodes owned by a subscription while
@@ -1022,6 +1160,9 @@ func (s *Store) syncNodes(subID, idPrefix string, nodes []*config.Node) error {
 			}
 			if !n.Favorite {
 				n.Favorite = prev.Favorite
+			}
+			if n.DetourID == "" {
+				n.DetourID = prev.DetourID
 			}
 			if n.EnginePref == "" {
 				n.EnginePref = prev.EnginePref
@@ -1319,6 +1460,51 @@ func normalizeGroupPriorityRule(raw string) string {
 	}
 }
 
+// CanonicalFailoverTrigger normalizes per-group failover trigger selection.
+func CanonicalFailoverTrigger(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "unavailable_only", "fail_only":
+		return "unavailable_only"
+	case "high_latency_or_unavailable", "latency_or_fail":
+		return "high_latency_or_unavailable"
+	default:
+		return ""
+	}
+}
+
+func normalizeGroupHighLatencyMS(ms int) int {
+	if ms <= 0 {
+		return 0
+	}
+	if ms < 100 {
+		return 100
+	}
+	if ms > 10000 {
+		return 10000
+	}
+	return ms
+}
+
+// NormalizeGroupLoadBalanceShards clamps stored per-group load-balance shard count (0 = default 4).
+func NormalizeGroupLoadBalanceShards(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	if n > MaxLoadBalanceShardsLimit {
+		return MaxLoadBalanceShardsLimit
+	}
+	return n
+}
+
+// EffectiveGroupLoadBalanceShards resolves the effective concurrent shard count (defaults to 4 when unset).
+func EffectiveGroupLoadBalanceShards(n int) int {
+	norm := NormalizeGroupLoadBalanceShards(n)
+	if norm <= 0 {
+		return DefaultLoadBalanceShards
+	}
+	return norm
+}
+
 func validateGroup(g Group) error {
 	if strings.TrimSpace(g.ID) == "" || strings.TrimSpace(g.Name) == "" {
 		return fmt.Errorf("group ID and name are required")
@@ -1331,25 +1517,30 @@ func validateGroup(g Group) error {
 	}
 }
 
-// ListGroups returns all proxy groups along with their ordered member node IDs.
+// ListGroups returns all proxy groups along with their ordered member node IDs (batched, no N+1 queries).
 func (s *Store) ListGroups() ([]Group, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT id, name, strategy, selected_node_id, manual_pin, filter, tolerance_ms, interval, priority_rule, auto_failover, detour_id, sort_order FROM groups ORDER BY sort_order, name`)
+	rows, err := s.db.Query(`SELECT id, name, strategy, selected_node_id, manual_pin, filter, tolerance_ms, interval, priority_rule, auto_failover, failover_trigger, high_latency_ms, load_balance_shards, detour_id, sort_order FROM groups ORDER BY sort_order, name`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []Group{}
+	indexByID := map[string]int{}
 	for rows.Next() {
 		var g Group
 		var manualPinRaw int
 		var autoFailoverRaw int
-		if err = rows.Scan(&g.ID, &g.Name, &g.Strategy, &g.SelectedNodeID, &manualPinRaw, &g.Filter, &g.ToleranceMS, &g.Interval, &g.PriorityRule, &autoFailoverRaw, &g.DetourID, &g.SortOrder); err != nil {
+		if err = rows.Scan(&g.ID, &g.Name, &g.Strategy, &g.SelectedNodeID, &manualPinRaw, &g.Filter, &g.ToleranceMS, &g.Interval, &g.PriorityRule, &autoFailoverRaw, &g.FailoverTrigger, &g.HighLatencyMS, &g.LoadBalanceShards, &g.DetourID, &g.SortOrder); err != nil {
 			return nil, err
 		}
 		g.ManualPin = manualPinRaw != 0
 		g.AutoFailover = decodeGroupAutoFailover(autoFailoverRaw)
+		g.FailoverTrigger = CanonicalFailoverTrigger(g.FailoverTrigger)
+		g.HighLatencyMS = normalizeGroupHighLatencyMS(g.HighLatencyMS)
+		g.LoadBalanceShards = NormalizeGroupLoadBalanceShards(g.LoadBalanceShards)
+		indexByID[g.ID] = len(out)
 		out = append(out, g)
 	}
 	if err = rows.Close(); err != nil {
@@ -1358,21 +1549,25 @@ func (s *Store) ListGroups() ([]Group, error) {
 	if err = rows.Err(); err != nil {
 		return nil, err
 	}
-	for i := range out {
-		g := &out[i]
-		memberRows, err := s.db.Query(`SELECT node_id FROM group_members WHERE group_id=? ORDER BY sort_order, node_id`, g.ID)
-		if err != nil {
+	if len(out) == 0 {
+		return out, nil
+	}
+	memberRows, err := s.db.Query(`SELECT group_id, node_id FROM group_members ORDER BY group_id, sort_order, node_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer memberRows.Close()
+	for memberRows.Next() {
+		var gid, nid string
+		if err = memberRows.Scan(&gid, &nid); err != nil {
 			return nil, err
 		}
-		for memberRows.Next() {
-			var id string
-			if err = memberRows.Scan(&id); err != nil {
-				memberRows.Close()
-				return nil, err
-			}
-			g.NodeIDs = append(g.NodeIDs, id)
+		if idx, ok := indexByID[gid]; ok {
+			out[idx].NodeIDs = append(out[idx].NodeIDs, nid)
 		}
-		memberRows.Close()
+	}
+	if err = memberRows.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -1383,6 +1578,9 @@ func (s *Store) SaveGroup(g Group) error {
 		return err
 	}
 	g.PriorityRule = normalizeGroupPriorityRule(g.PriorityRule)
+	g.FailoverTrigger = CanonicalFailoverTrigger(g.FailoverTrigger)
+	g.HighLatencyMS = normalizeGroupHighLatencyMS(g.HighLatencyMS)
+	g.LoadBalanceShards = NormalizeGroupLoadBalanceShards(g.LoadBalanceShards)
 	if g.ToleranceMS <= 0 {
 		g.ToleranceMS = 50
 	}
@@ -1401,8 +1599,8 @@ func (s *Store) SaveGroup(g Group) error {
 		manualPinInt = 1
 	}
 	if _, err = tx.Exec(`
-		INSERT INTO groups(id, name, strategy, selected_node_id, manual_pin, filter, tolerance_ms, interval, priority_rule, auto_failover, detour_id, sort_order)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO groups(id, name, strategy, selected_node_id, manual_pin, filter, tolerance_ms, interval, priority_rule, auto_failover, failover_trigger, high_latency_ms, load_balance_shards, detour_id, sort_order)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name,
 			strategy=excluded.strategy,
@@ -1413,9 +1611,12 @@ func (s *Store) SaveGroup(g Group) error {
 			interval=excluded.interval,
 			priority_rule=excluded.priority_rule,
 			auto_failover=excluded.auto_failover,
+			failover_trigger=excluded.failover_trigger,
+			high_latency_ms=excluded.high_latency_ms,
+			load_balance_shards=excluded.load_balance_shards,
 			detour_id=excluded.detour_id,
 			sort_order=excluded.sort_order
-	`, g.ID, strings.TrimSpace(g.Name), g.Strategy, g.SelectedNodeID, manualPinInt, g.Filter, g.ToleranceMS, g.Interval, g.PriorityRule, encodeGroupAutoFailover(g.AutoFailover), strings.TrimSpace(g.DetourID), g.SortOrder); err != nil {
+	`, g.ID, strings.TrimSpace(g.Name), g.Strategy, g.SelectedNodeID, manualPinInt, g.Filter, g.ToleranceMS, g.Interval, g.PriorityRule, encodeGroupAutoFailover(g.AutoFailover), g.FailoverTrigger, g.HighLatencyMS, g.LoadBalanceShards, strings.TrimSpace(g.DetourID), g.SortOrder); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(`DELETE FROM group_members WHERE group_id=?`, g.ID); err != nil {
@@ -1562,9 +1763,9 @@ func (s *Store) ReplaceGroups(groups []Group) error {
 			pinInt = 1
 		}
 		if _, err = tx.Exec(`
-			INSERT INTO groups(id, name, strategy, selected_node_id, manual_pin, filter, tolerance_ms, interval, priority_rule, auto_failover, detour_id, sort_order)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-		`, group.ID, strings.TrimSpace(group.Name), group.Strategy, group.SelectedNodeID, pinInt, group.Filter, tol, interval, normalizeGroupPriorityRule(group.PriorityRule), encodeGroupAutoFailover(group.AutoFailover), strings.TrimSpace(group.DetourID), group.SortOrder); err != nil {
+			INSERT INTO groups(id, name, strategy, selected_node_id, manual_pin, filter, tolerance_ms, interval, priority_rule, auto_failover, failover_trigger, high_latency_ms, load_balance_shards, detour_id, sort_order)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		`, group.ID, strings.TrimSpace(group.Name), group.Strategy, group.SelectedNodeID, pinInt, group.Filter, tol, interval, normalizeGroupPriorityRule(group.PriorityRule), encodeGroupAutoFailover(group.AutoFailover), CanonicalFailoverTrigger(group.FailoverTrigger), normalizeGroupHighLatencyMS(group.HighLatencyMS), NormalizeGroupLoadBalanceShards(group.LoadBalanceShards), strings.TrimSpace(group.DetourID), group.SortOrder); err != nil {
 			return err
 		}
 		for i, id := range group.NodeIDs {
@@ -1581,7 +1782,7 @@ func (s *Store) ListSubscriptions() ([]SubscriptionRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.Query(`
-		SELECT id, name, url_sealed, upload_bytes, download_bytes, total_bytes, expire_unix,
+		SELECT id, name, url_sealed, include_regex, exclude_regex, upload_bytes, download_bytes, total_bytes, expire_unix,
 		       auto_update_hours, imported_count, skipped_count, warnings_json, last_updated_at
 		FROM subscriptions ORDER BY rowid ASC
 	`)
@@ -1595,7 +1796,7 @@ func (s *Store) ListSubscriptions() ([]SubscriptionRecord, error) {
 		var urlSealed []byte
 		var warningsJSON string
 		if err = rows.Scan(
-			&rec.ID, &rec.Name, &urlSealed, &rec.UploadBytes, &rec.DownloadBytes, &rec.TotalBytes, &rec.ExpireUnix,
+			&rec.ID, &rec.Name, &urlSealed, &rec.IncludeRegex, &rec.ExcludeRegex, &rec.UploadBytes, &rec.DownloadBytes, &rec.TotalBytes, &rec.ExpireUnix,
 			&rec.AutoUpdateHours, &rec.ImportedCount, &rec.SkippedCount, &warningsJSON, &rec.LastUpdatedAt,
 		); err != nil {
 			return nil, err
@@ -1621,11 +1822,11 @@ func (s *Store) GetSubscription(id string) (*SubscriptionRecord, bool, error) {
 	var urlSealed []byte
 	var warningsJSON string
 	err := s.db.QueryRow(`
-		SELECT id, name, url_sealed, upload_bytes, download_bytes, total_bytes, expire_unix,
+		SELECT id, name, url_sealed, include_regex, exclude_regex, upload_bytes, download_bytes, total_bytes, expire_unix,
 		       auto_update_hours, imported_count, skipped_count, warnings_json, last_updated_at
 		FROM subscriptions WHERE id=?
 	`, id).Scan(
-		&rec.ID, &rec.Name, &urlSealed, &rec.UploadBytes, &rec.DownloadBytes, &rec.TotalBytes, &rec.ExpireUnix,
+		&rec.ID, &rec.Name, &urlSealed, &rec.IncludeRegex, &rec.ExcludeRegex, &rec.UploadBytes, &rec.DownloadBytes, &rec.TotalBytes, &rec.ExpireUnix,
 		&rec.AutoUpdateHours, &rec.ImportedCount, &rec.SkippedCount, &warningsJSON, &rec.LastUpdatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1665,12 +1866,14 @@ func (s *Store) SaveSubscription(rec SubscriptionRecord) error {
 	}
 	_, err = s.db.Exec(`
 		INSERT INTO subscriptions(
-			id, name, url_sealed, upload_bytes, download_bytes, total_bytes, expire_unix,
+			id, name, url_sealed, include_regex, exclude_regex, upload_bytes, download_bytes, total_bytes, expire_unix,
 			auto_update_hours, imported_count, skipped_count, warnings_json, last_updated_at
-		) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+		) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name,
 			url_sealed=excluded.url_sealed,
+			include_regex=excluded.include_regex,
+			exclude_regex=excluded.exclude_regex,
 			upload_bytes=excluded.upload_bytes,
 			download_bytes=excluded.download_bytes,
 			total_bytes=excluded.total_bytes,
@@ -1680,7 +1883,7 @@ func (s *Store) SaveSubscription(rec SubscriptionRecord) error {
 			skipped_count=excluded.skipped_count,
 			warnings_json=excluded.warnings_json,
 			last_updated_at=excluded.last_updated_at
-	`, rec.ID, rec.Name, urlSealed, rec.UploadBytes, rec.DownloadBytes, rec.TotalBytes, rec.ExpireUnix,
+	`, rec.ID, rec.Name, urlSealed, rec.IncludeRegex, rec.ExcludeRegex, rec.UploadBytes, rec.DownloadBytes, rec.TotalBytes, rec.ExpireUnix,
 		rec.AutoUpdateHours, rec.ImportedCount, rec.SkippedCount, string(warningsBody), rec.LastUpdatedAt)
 	return err
 }
@@ -1799,4 +2002,84 @@ func (s *Store) GetRoutingProfile(id string) (*RoutingProfileRecord, bool, error
 		return nil, false, err
 	}
 	return &RoutingProfileRecord{ID: id, Document: json.RawMessage(doc), UpdatedAt: updatedAt}, true, nil
+}
+
+// DeleteRoutingProfile deletes a named routing profile document by ID.
+func (s *Store) DeleteRoutingProfile(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`DELETE FROM routing_profiles WHERE id=?`, id)
+	return err
+}
+
+// AddTrafficBucketDeltas atomically accumulates proxy/direct byte deltas into SQLite traffic_buckets.
+func (s *Store) AddTrafficBucketDeltas(buckets []TrafficBucket) error {
+	if len(buckets) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, b := range buckets {
+		if b.Granularity == "" || (b.ProxyUp == 0 && b.ProxyDown == 0 && b.DirectUp == 0 && b.DirectDown == 0) {
+			continue
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO traffic_buckets(bucket_unix, granularity, proxy_up, proxy_down, direct_up, direct_down)
+			VALUES(?,?,?,?,?,?)
+			ON CONFLICT(bucket_unix, granularity) DO UPDATE SET
+				proxy_up = traffic_buckets.proxy_up + excluded.proxy_up,
+				proxy_down = traffic_buckets.proxy_down + excluded.proxy_down,
+				direct_up = traffic_buckets.direct_up + excluded.direct_up,
+				direct_down = traffic_buckets.direct_down + excluded.direct_down
+		`, b.BucketUnix, b.Granularity, b.ProxyUp, b.ProxyDown, b.DirectUp, b.DirectDown); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ListTrafficBuckets returns aggregated buckets for the requested granularity since sinceUnix (inclusive).
+func (s *Store) ListTrafficBuckets(granularity string, sinceUnix int64) ([]TrafficBucket, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`
+		SELECT bucket_unix, granularity, proxy_up, proxy_down, direct_up, direct_down
+		FROM traffic_buckets
+		WHERE granularity=? AND bucket_unix>=?
+		ORDER BY bucket_unix ASC
+	`, granularity, sinceUnix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []TrafficBucket{}
+	for rows.Next() {
+		var b TrafficBucket
+		if err := rows.Scan(&b.BucketUnix, &b.Granularity, &b.ProxyUp, &b.ProxyDown, &b.DirectUp, &b.DirectDown); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// PruneTrafficBuckets deletes traffic buckets older than beforeUnix for a granularity.
+func (s *Store) PruneTrafficBuckets(granularity string, beforeUnix int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`DELETE FROM traffic_buckets WHERE granularity=? AND bucket_unix<?`, granularity, beforeUnix)
+	return err
+}
+
+// ClearTrafficBuckets removes all recorded traffic history buckets.
+func (s *Store) ClearTrafficBuckets() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`DELETE FROM traffic_buckets`)
+	return err
 }

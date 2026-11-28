@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -50,6 +51,8 @@ type AppRoutingProxy struct {
 	appClients     map[string]*socks5.Socks5
 	cacheMu        sync.Mutex
 	flowCache      map[flowKey]flowCacheEntry
+	txBytes        atomic.Int64
+	rxBytes        atomic.Int64
 }
 
 // NewAppRoutingProxy initializes a dynamic Android app-aware proxy wrapper.
@@ -219,27 +222,130 @@ func (p *AppRoutingProxy) lookupPackageCached(ownerSock string, proto int, srcIP
 	return pkg
 }
 
-// QueryConnectionOwner asks Kotlin ProxyVpnService's owner.sock for the Android package owning a flow.
-func QueryConnectionOwner(ownerSockPath string, proto int, srcIP netip.Addr, srcPort uint16, dstIP netip.Addr, dstPort uint16) string {
-	if strings.TrimSpace(ownerSockPath) == "" {
-		return ""
-	}
-	conn, err := net.DialTimeout("unix", ownerSockPath, 120*time.Millisecond)
-	if err != nil {
-		return ""
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(150 * time.Millisecond))
+var (
+	ownerSockMu   sync.Mutex
+	ownerSockPath string
+	ownerSockConn net.Conn
+	ownerSockRdr  *bufio.Reader
+)
 
+func closeOwnerConnLocked() {
+	if ownerSockConn != nil {
+		_ = ownerSockConn.Close()
+		ownerSockConn = nil
+		ownerSockRdr = nil
+		ownerSockPath = ""
+	}
+}
+
+// QueryConnectionOwner asks Kotlin ProxyVpnService's owner.sock for the Android package owning a flow,
+// reusing a persistent multiplexed Unix domain socket connection across queries.
+func QueryConnectionOwner(sockPath string, proto int, srcIP netip.Addr, srcPort uint16, dstIP netip.Addr, dstPort uint16) string {
+	sockPath = strings.TrimSpace(sockPath)
+	if sockPath == "" {
+		return ""
+	}
 	line := fmt.Sprintf("%d,%s,%d,%s,%d\n", proto, srcIP.String(), srcPort, dstIP.String(), dstPort)
-	if _, err := conn.Write([]byte(line)); err != nil {
-		return ""
+
+	ownerSockMu.Lock()
+	defer ownerSockMu.Unlock()
+
+	for attempt := 0; attempt < 2; attempt++ {
+		if ownerSockConn == nil || ownerSockPath != sockPath {
+			closeOwnerConnLocked()
+			conn, err := net.DialTimeout("unix", sockPath, 120*time.Millisecond)
+			if err != nil {
+				return ""
+			}
+			ownerSockConn = conn
+			ownerSockRdr = bufio.NewReader(conn)
+			ownerSockPath = sockPath
+		}
+		_ = ownerSockConn.SetDeadline(time.Now().Add(150 * time.Millisecond))
+		if _, err := ownerSockConn.Write([]byte(line)); err != nil {
+			closeOwnerConnLocked()
+			continue
+		}
+		resp, err := ownerSockRdr.ReadString('\n')
+		if err != nil {
+			closeOwnerConnLocked()
+			if len(resp) == 0 {
+				continue
+			}
+		}
+		return strings.TrimSpace(resp)
 	}
-	resp, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil && len(resp) == 0 {
-		return ""
+	return ""
+}
+
+// TrafficTotals returns cumulative uploaded (tx) and downloaded (rx) byte counters
+// observed across active tun2socks TCP and UDP flows.
+func (p *AppRoutingProxy) TrafficTotals() (tx int64, rx int64) {
+	return p.txBytes.Load(), p.rxBytes.Load()
+}
+
+// ResetTrafficTotals zeroes the cumulative byte counters for a fresh VPN session.
+func (p *AppRoutingProxy) ResetTrafficTotals() {
+	p.txBytes.Store(0)
+	p.rxBytes.Store(0)
+}
+
+type countingConn struct {
+	net.Conn
+	tx *atomic.Int64
+	rx *atomic.Int64
+}
+
+func (c *countingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.rx.Add(int64(n))
 	}
-	return strings.TrimSpace(resp)
+	return n, err
+}
+
+func (c *countingConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.tx.Add(int64(n))
+	}
+	return n, err
+}
+
+func (c *countingConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func (c *countingConn) CloseRead() error {
+	if cr, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return nil
+}
+
+type countingPacketConn struct {
+	net.PacketConn
+	tx *atomic.Int64
+	rx *atomic.Int64
+}
+
+func (c *countingPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(p)
+	if n > 0 {
+		c.rx.Add(int64(n))
+	}
+	return n, addr, err
+}
+
+func (c *countingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	n, err := c.PacketConn.WriteTo(p, addr)
+	if n > 0 {
+		c.tx.Add(int64(n))
+	}
+	return n, err
 }
 
 // DialContext implements tun2socks proxy.Proxy for TCP flows.
@@ -248,7 +354,11 @@ func (p *AppRoutingProxy) DialContext(ctx context.Context, md *M.Metadata) (net.
 	if err != nil {
 		return nil, err
 	}
-	return client.DialContext(ctx, md)
+	conn, err := client.DialContext(ctx, md)
+	if err != nil {
+		return nil, err
+	}
+	return &countingConn{Conn: conn, tx: &p.txBytes, rx: &p.rxBytes}, nil
 }
 
 // DialUDP implements tun2socks proxy.Proxy for UDP flows.
@@ -257,5 +367,9 @@ func (p *AppRoutingProxy) DialUDP(md *M.Metadata) (net.PacketConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return client.DialUDP(md)
+	pc, err := client.DialUDP(md)
+	if err != nil {
+		return nil, err
+	}
+	return &countingPacketConn{PacketConn: pc, tx: &p.txBytes, rx: &p.rxBytes}, nil
 }

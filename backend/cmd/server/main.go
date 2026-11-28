@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -125,7 +126,32 @@ func resolveBundledCore(baseName string) string {
 	return ""
 }
 
+func initLocalTimezone() {
+	if tz := strings.TrimSpace(os.Getenv("TZ")); tz != "" {
+		if loc, err := time.LoadLocation(tz); err == nil {
+			time.Local = loc
+			return
+		}
+	}
+	if rawOff := strings.TrimSpace(os.Getenv("PRISMRAY_TZ_OFFSET_SEC")); rawOff != "" {
+		if off, err := strconv.Atoi(rawOff); err == nil && off >= -14*3600 && off <= 14*3600 {
+			name := strings.TrimSpace(os.Getenv("PRISMRAY_TZ_NAME"))
+			if name == "" {
+				sign := "+"
+				absOff := off
+				if absOff < 0 {
+					sign = "-"
+					absOff = -absOff
+				}
+				name = fmt.Sprintf("UTC%s%02d:%02d", sign, absOff/3600, (absOff%3600)/60)
+			}
+			time.Local = time.FixedZone(name, off)
+		}
+	}
+}
+
 func main() {
+	initLocalTimezone()
 	log.SetOutput(os.Stderr)
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
@@ -193,6 +219,19 @@ func main() {
 	}
 	cfg.Storage.DatabasePath = dbPath
 	cfg.Storage.NodesFile = dbPath
+
+	if mode == authservice.ModeAndroid || runtime.GOOS == "android" {
+		unlockInstance, lockErr := acquireSingleInstanceLock(filepath.Dir(dbPath))
+		if lockErr != nil {
+			if errors.Is(lockErr, errInstanceAlreadyRunning) {
+				slog.Info("another Android backend instance already holds backend.lock; exiting cleanly")
+				os.Exit(0)
+			}
+			slog.Warn("failed to acquire single-instance lock", "err", lockErr)
+		} else {
+			defer unlockInstance()
+		}
+	}
 
 	if err := api.RecoverBackup(cfg); err != nil {
 		slog.Error("backup recovery failed", "err", err)

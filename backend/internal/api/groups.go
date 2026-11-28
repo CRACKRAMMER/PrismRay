@@ -43,11 +43,33 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 		group.ID = newRandomID("grp-")
 	}
 	group.DetourID = strings.TrimSpace(group.DetourID)
-	if storage.CanonicalGroupStrategy(group.Strategy) == "loadbalance" {
+	strat := storage.CanonicalGroupStrategy(group.Strategy)
+	if strat != "selector" {
+		// AutoFailover toggle only governs selector groups; non-selector strategies manage failover natively.
+		group.AutoFailover = nil
+	}
+	rawTrigger := strings.TrimSpace(group.FailoverTrigger)
+	group.FailoverTrigger = storage.CanonicalFailoverTrigger(rawTrigger)
+	if rawTrigger != "" && group.FailoverTrigger == "" {
+		http.Error(w, "无效的故障切换条件，仅支持 high_latency_or_unavailable 或 unavailable_only", http.StatusBadRequest)
+		return
+	}
+	if group.HighLatencyMS != 0 && (group.HighLatencyMS < 100 || group.HighLatencyMS > 10000) {
+		http.Error(w, "高延迟阈值需为 0（继承全局）或 100~10000 毫秒", http.StatusBadRequest)
+		return
+	}
+	if strat == "loadbalance" {
+		if group.LoadBalanceShards < 0 || group.LoadBalanceShards > storage.MaxLoadBalanceShardsLimit {
+			http.Error(w, fmt.Sprintf("负载均衡并发节点数需为 0（默认 %d）或 1~%d", storage.DefaultLoadBalanceShards, storage.MaxLoadBalanceShardsLimit), http.StatusBadRequest)
+			return
+		}
 		group.SelectedNodeID = ""
 		group.ManualPin = false
-	} else if strings.TrimSpace(group.SelectedNodeID) == "" {
-		group.ManualPin = false
+	} else {
+		group.LoadBalanceShards = 0
+		if strings.TrimSpace(group.SelectedNodeID) == "" {
+			group.ManualPin = false
+		}
 	}
 	if err := sbcfg.ValidateGroupInterval(group.Interval); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -71,7 +93,8 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.ensureOrchestrator().Status().Running {
 		s.opMu.Lock()
-		_, _ = s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, s.tunEnabled)
+		rs := s.runtimeState()
+		_, _ = s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled)
 		s.opMu.Unlock()
 	}
 	writeJSON(w, http.StatusOK, group)
@@ -95,7 +118,8 @@ func (s *Server) handleReorderGroups(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.ensureOrchestrator().Status().Running {
 		s.opMu.Lock()
-		_, _ = s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, s.tunEnabled)
+		rs := s.runtimeState()
+		_, _ = s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled)
 		s.opMu.Unlock()
 	}
 	groups, err := s.store.ListGroups()
@@ -123,8 +147,8 @@ func (s *Server) handleGroup(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.clearDetourReferences(id)
-		if s.activeGroupID == id {
-			s.activeGroupID = ""
+		if s.runtimeState().activeGroupID == id {
+			s.setActiveGroupID("")
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -141,11 +165,33 @@ func (s *Server) handleGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	group.ID = id
 	group.DetourID = strings.TrimSpace(group.DetourID)
-	if storage.CanonicalGroupStrategy(group.Strategy) == "loadbalance" {
+	strat := storage.CanonicalGroupStrategy(group.Strategy)
+	if strat != "selector" {
+		// AutoFailover toggle only governs selector groups; non-selector strategies manage failover natively.
+		group.AutoFailover = nil
+	}
+	rawTrigger := strings.TrimSpace(group.FailoverTrigger)
+	group.FailoverTrigger = storage.CanonicalFailoverTrigger(rawTrigger)
+	if rawTrigger != "" && group.FailoverTrigger == "" {
+		http.Error(w, "无效的故障切换条件，仅支持 high_latency_or_unavailable 或 unavailable_only", http.StatusBadRequest)
+		return
+	}
+	if group.HighLatencyMS != 0 && (group.HighLatencyMS < 100 || group.HighLatencyMS > 10000) {
+		http.Error(w, "高延迟阈值需为 0（继承全局）或 100~10000 毫秒", http.StatusBadRequest)
+		return
+	}
+	if strat == "loadbalance" {
+		if group.LoadBalanceShards < 0 || group.LoadBalanceShards > storage.MaxLoadBalanceShardsLimit {
+			http.Error(w, fmt.Sprintf("负载均衡并发节点数需为 0（默认 %d）或 1~%d", storage.DefaultLoadBalanceShards, storage.MaxLoadBalanceShardsLimit), http.StatusBadRequest)
+			return
+		}
 		group.SelectedNodeID = ""
 		group.ManualPin = false
-	} else if strings.TrimSpace(group.SelectedNodeID) == "" {
-		group.ManualPin = false
+	} else {
+		group.LoadBalanceShards = 0
+		if strings.TrimSpace(group.SelectedNodeID) == "" {
+			group.ManualPin = false
+		}
 	}
 	if err := sbcfg.ValidateGroupInterval(group.Interval); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -178,7 +224,8 @@ func (s *Server) handleGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.ensureOrchestrator().Status().Running {
 		s.opMu.Lock()
-		_, _ = s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, s.tunEnabled)
+		rs := s.runtimeState()
+		_, _ = s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled)
 		s.opMu.Unlock()
 	}
 	writeJSON(w, http.StatusOK, group)
@@ -243,7 +290,8 @@ func (s *Server) handleGroupSelect(w http.ResponseWriter, r *http.Request) {
 		orch := s.ensureOrchestrator()
 		if orch.Status().Running {
 			if err := orch.HotSwitch(r.Context(), sbcfg.GroupTag(groupID), sbcfg.GroupAutoTag(groupID)); err != nil {
-				if _, applyErr := s.reconcileRuntime(r.Context(), s.activeNodeID, s.activeGroupID, s.tunEnabled); applyErr != nil {
+				rs := s.runtimeState()
+				if _, applyErr := s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled); applyErr != nil {
 					respondError(w, applyErr, http.StatusBadGateway)
 					return
 				}
@@ -279,13 +327,14 @@ func (s *Server) handleGroupSelect(w http.ResponseWriter, r *http.Request) {
 				memberTag = sbcfg.GroupScopedNodeTag(req.NodeID, groupID)
 			}
 		}
+		rs := s.runtimeState()
 		if err := orch.HotSwitch(r.Context(), sbcfg.GroupTag(groupID), memberTag); err != nil {
-			if _, applyErr := s.reconcileRuntime(r.Context(), s.activeNodeID, groupID, s.tunEnabled); applyErr != nil {
+			if _, applyErr := s.reconcileRuntime(r.Context(), rs.activeNodeID, rs.activeGroupID, rs.tunEnabled); applyErr != nil {
 				respondError(w, applyErr, http.StatusBadGateway)
 				return
 			}
-		} else if s.activeGroupID == "" || s.activeGroupID == groupID {
-			// Also steer top-level "proxy" selector to this group when active.
+		} else if rs.activeGroupID == groupID {
+			// Also steer top-level "proxy" selector to this group only when it is already active.
 			if err := orch.HotSwitch(r.Context(), "proxy", sbcfg.GroupTag(groupID)); err == nil {
 				s.setKillSwitchBaseline(sbcfg.GroupTag(groupID))
 			}
@@ -362,8 +411,13 @@ func groupPriorityBetter(aNode, bNode *config.Node, aRes, bRes orchestrator.Prob
 	}
 	aLat := effectiveProbeLatency(aNode, aRes, aHas)
 	bLat := effectiveProbeLatency(bNode, bRes, bHas)
-	aDown := aNode.DownSpeedMbps
-	bDown := bNode.DownSpeedMbps
+	var aDown, bDown float64
+	if aNode != nil {
+		aDown = aNode.DownSpeedMbps
+	}
+	if bNode != nil {
+		bDown = bNode.DownSpeedMbps
+	}
 	if aHas && aRes.DownSpeedMbps > 0 {
 		aDown = aRes.DownSpeedMbps
 	}
@@ -465,8 +519,9 @@ func (s *Server) probeAndReorderGroup(
 		if len(healthy) == 0 {
 			healthy = append([]string(nil), ids...)
 		}
-		if len(healthy) > sbcfg.MaxLoadBalanceShards {
-			healthy = healthy[:sbcfg.MaxLoadBalanceShards]
+		shardLimit := sbcfg.EffectiveLoadBalanceShards(*target)
+		if len(healthy) > shardLimit {
+			healthy = healthy[:shardLimit]
 		}
 		return healthy
 	}
@@ -494,10 +549,8 @@ func (s *Server) probeAndReorderGroup(
 	bestLat := effectiveProbeLatency(nodeByID[bestID], bestRes, hasBestRes)
 
 	strat := storage.CanonicalGroupStrategy(target.Strategy)
-	highLatMS := int64(hs.HighLatencyMS)
-	if highLatMS <= 0 {
-		highLatMS = defaultHighLatencyMS
-	}
+	trigger := effectiveGroupFailoverTrigger(*target)
+	highLatMS := effectiveGroupHighLatencyMS(*target, hs)
 
 	switch strat {
 	case "loadbalance":
@@ -508,13 +561,13 @@ func (s *Server) probeAndReorderGroup(
 	case "urltest", "failover":
 		// When user manually pinned a node inside urltest/failover, keep it pinned until either:
 		// 1. Pinned node becomes unreachable (timeout/error), OR
-		// 2. Pinned node exceeds HighLatencyMS (default 800ms) while a faster healthy member exists.
+		// 2. trigger is high_latency_or_unavailable AND pinned node exceeds effective highLatMS while a faster healthy member exists.
 		if target.ManualPin && target.SelectedNodeID != "" {
 			prevSelected := target.SelectedNodeID
 			prevRes, hasPrevRes := rawResults[prevSelected]
 			prevReachable := isProbeReachable(normMode, nodeByID[prevSelected], prevRes, hasPrevRes)
 			prevLat := effectiveProbeLatency(nodeByID[prevSelected], prevRes, hasPrevRes)
-			highLatencyExceeded := prevLat >= highLatMS && bestReachable && bestID != prevSelected && bestLat > 0 && bestLat < highLatMS
+			highLatencyExceeded := trigger != "unavailable_only" && prevLat >= highLatMS && bestReachable && bestID != prevSelected && bestLat > 0 && bestLat < highLatMS
 			if !prevReachable || highLatencyExceeded {
 				reason := "不可达"
 				if prevReachable {
@@ -551,7 +604,8 @@ func (s *Server) probeAndReorderGroup(
 				if tol <= 0 {
 					tol = 50
 				}
-				if !prevReachable || (bestLat > 0 && prevLat-bestLat >= tol) {
+				highLatencyTriggered := trigger != "unavailable_only" && prevLat >= highLatMS && bestLat > 0 && bestLat < highLatMS && prevLat-bestLat >= tol
+				if !prevReachable || highLatencyTriggered {
 					target.SelectedNodeID = bestID
 				}
 			}
@@ -576,7 +630,7 @@ func (s *Server) probeAndReorderGroup(
 			_ = orch.HotSwitch(ctx, sbcfg.GroupTag(target.ID), memberTag)
 		} else if (strat == "urltest" || strat == "failover") && revertedToAuto {
 			_ = orch.HotSwitch(ctx, sbcfg.GroupTag(target.ID), sbcfg.GroupAutoTag(target.ID))
-		} else if strat == "loadbalance" && s.activeGroupID == target.ID {
+		} else if strat == "loadbalance" && s.runtimeState().activeGroupID == target.ID {
 			newLBShards := computeLBShards(target.NodeIDs)
 			shardsChanged := len(newLBShards) != len(prevLBShards)
 			if !shardsChanged {
@@ -588,7 +642,8 @@ func (s *Server) probeAndReorderGroup(
 				}
 			}
 			if shardsChanged {
-				_, _ = s.reconcileRuntime(ctx, s.activeNodeID, s.activeGroupID, s.tunEnabled)
+				rs := s.runtimeState()
+				_, _ = s.reconcileRuntime(ctx, rs.activeNodeID, rs.activeGroupID, rs.tunEnabled)
 			}
 		}
 		s.opMu.Unlock()
@@ -598,13 +653,30 @@ func (s *Server) probeAndReorderGroup(
 }
 
 func effectiveGroupAutoFailover(g storage.Group, globalDefault bool) bool {
+	if storage.CanonicalGroupStrategy(g.Strategy) != "selector" {
+		return true
+	}
 	if g.AutoFailover != nil {
 		return *g.AutoFailover
 	}
-	if storage.CanonicalGroupStrategy(g.Strategy) == "selector" {
-		return globalDefault
+	return globalDefault
+}
+
+func effectiveGroupFailoverTrigger(g storage.Group) string {
+	if t := storage.CanonicalFailoverTrigger(g.FailoverTrigger); t != "" {
+		return t
 	}
-	return true
+	return "high_latency_or_unavailable"
+}
+
+func effectiveGroupHighLatencyMS(g storage.Group, hs HealthSettings) int64 {
+	if g.HighLatencyMS >= 100 && g.HighLatencyMS <= 10000 {
+		return int64(g.HighLatencyMS)
+	}
+	if hs.HighLatencyMS >= 100 && hs.HighLatencyMS <= 10000 {
+		return int64(hs.HighLatencyMS)
+	}
+	return defaultHighLatencyMS
 }
 
 func (s *Server) handleGroupProbe(w http.ResponseWriter, r *http.Request) {
