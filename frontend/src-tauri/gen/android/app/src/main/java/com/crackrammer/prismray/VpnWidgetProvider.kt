@@ -34,6 +34,10 @@ class VpnWidgetProvider : AppWidgetProvider() {
         @Volatile
         private var lastStatsPushMs: Long = 0L
 
+        // Tri-state cache: null = unknown (check once), false = zero widgets pinned (skip Binder IPC), true = active.
+        @Volatile
+        private var hasPinnedWidgets: Boolean? = null
+
         fun updateAllWidgets(
             context: Context,
             running: Boolean,
@@ -42,6 +46,7 @@ class VpnWidgetProvider : AppWidgetProvider() {
             speedText: String? = null,
             throttleStats: Boolean = false,
         ) {
+            if (hasPinnedWidgets == false) return
             val now = System.currentTimeMillis()
             if (throttleStats && running == cachedRunning && connecting == cachedConnecting) {
                 if (now - lastStatsPushMs < 3500L) return
@@ -64,7 +69,11 @@ class VpnWidgetProvider : AppWidgetProvider() {
             val appCtx = context.applicationContext
             val manager = AppWidgetManager.getInstance(appCtx) ?: return
             val ids = manager.getAppWidgetIds(ComponentName(appCtx, VpnWidgetProvider::class.java))
-            if (ids.isEmpty()) return
+            if (ids.isEmpty()) {
+                hasPinnedWidgets = false
+                return
+            }
+            hasPinnedWidgets = true
 
             for (widgetId in ids) {
                 val options = manager.getAppWidgetOptions(widgetId)
@@ -142,57 +151,95 @@ class VpnWidgetProvider : AppWidgetProvider() {
             return views
         }
 
-        internal fun handleToggleClick(context: Context) {
-            val statusRes = RuntimeIpc.request(context, "GET", "/api/vpn/android/status")
-            val backendAlive = statusRes != null && statusRes.statusCode in 200..299
-            val isActive = ProxyVpnService.isVpnRunning || (backendAlive && try {
-                val json = JSONObject(statusRes!!.body)
-                json.optBoolean("active", false) && json.optBoolean("running", false)
-            } catch (_: Throwable) {
-                false
-            })
+        private val toggleInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
-            if (isActive) {
-                updateAllWidgets(context, running = false, connecting = false)
-                val stopIntent = Intent(context, ProxyVpnService::class.java).apply {
-                    action = ProxyVpnService.ACTION_STOP
-                }
-                try {
-                    context.startService(stopIntent)
-                } catch (_: Throwable) {
-                    // Service may already be stopped.
-                }
+        internal fun handleToggleClick(context: Context) {
+            if (!toggleInFlight.compareAndSet(false, true)) {
                 return
             }
+            try {
+                val statusRes = RuntimeIpc.request(context, "GET", "/api/vpn/android/status")
+                val backendAlive = statusRes != null && statusRes.statusCode in 200..299
+                val isActive = ProxyVpnService.isVpnRunning || (backendAlive && try {
+                    val json = JSONObject(statusRes!!.body)
+                    json.optBoolean("active", false) && json.optBoolean("running", false)
+                } catch (_: Throwable) {
+                    false
+                })
 
-            val prepareIntent = VpnService.prepare(context)
-            if (prepareIntent == null) {
-                updateAllWidgets(context, running = false, connecting = true)
-                if (backendAlive || AndroidBackendLauncher.ensureBackendRunning(context, timeoutMs = 6000L)) {
-                    val startIntent = Intent(context, ProxyVpnService::class.java).apply {
-                        action = ProxyVpnService.ACTION_START
+                if (isActive) {
+                    updateAllWidgets(context, running = false, connecting = false)
+                    val stopIntent = Intent(context, ProxyVpnService::class.java).apply {
+                        action = ProxyVpnService.ACTION_STOP
                     }
                     try {
-                        context.startForegroundService(startIntent)
-                        return
+                        context.startService(stopIntent)
                     } catch (_: Throwable) {
-                        // Fall through to launch MainActivity if background FGS start is restricted.
+                        // Android 12+ may restrict background startService when the VPN service already exited;
+                        // fall back to stopping the local backend directly via IPC.
+                        Thread({
+                            try {
+                                RuntimeIpc.request(context, "POST", "/api/vpn/android/stop", "{}", readTimeoutMs = 3000)
+                            } catch (_: Throwable) {
+                            }
+                            updateAllWidgets(context, running = false, connecting = false)
+                        }, "prismray-widget-stop-fallback").apply {
+                            isDaemon = true
+                            start()
+                        }
+                    }
+                    return
+                }
+
+                val prepareIntent = VpnService.prepare(context)
+                if (prepareIntent == null) {
+                    updateAllWidgets(context, running = false, connecting = true)
+                    if (backendAlive || AndroidBackendLauncher.ensureBackendRunning(context, timeoutMs = 6000L)) {
+                        val startIntent = Intent(context, ProxyVpnService::class.java).apply {
+                            action = ProxyVpnService.ACTION_START
+                        }
+                        try {
+                            context.startForegroundService(startIntent)
+                            return
+                        } catch (_: Throwable) {
+                            // Fall through to launch MainActivity if background FGS start is restricted.
+                        }
                     }
                 }
+                // Either first-time VPN permission consent is required or background FGS was blocked:
+                // launch MainActivity with auto-start flag so it completes authorization & connects automatically.
+                updateAllWidgets(context, running = false, connecting = true)
+                val launchIntent = Intent(context, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    putExtra(MainActivity.EXTRA_AUTO_START_VPN, true)
+                    putExtra(MainActivity.EXTRA_AUTO_START_NONCE, MainActivity.issueAutoStartNonce())
+                }
+                try {
+                    context.startActivity(launchIntent)
+                } catch (_: Throwable) {
+                    // Android 14+ Background Activity Launch (BAL) may reject startActivity from a receiver;
+                    // reset widget state immediately instead of leaving it permanently stuck on "Connecting...".
+                    updateAllWidgets(context, running = ProxyVpnService.isVpnRunning, connecting = false)
+                }
+            } finally {
+                toggleInFlight.set(false)
             }
-            // Either first-time VPN permission consent is required or background FGS was blocked:
-            // launch MainActivity with auto-start flag so it completes authorization & connects automatically.
-            updateAllWidgets(context, running = false, connecting = true)
-            val launchIntent = Intent(context, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-                putExtra(MainActivity.EXTRA_AUTO_START_VPN, true)
-            }
-            context.startActivity(launchIntent)
         }
+    }
+
+    override fun onEnabled(context: Context) {
+        super.onEnabled(context)
+        hasPinnedWidgets = true
+    }
+
+    override fun onDisabled(context: Context) {
+        super.onDisabled(context)
+        hasPinnedWidgets = false
     }
 
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
         super.onUpdate(context, appWidgetManager, appWidgetIds)
+        hasPinnedWidgets = appWidgetIds.isNotEmpty()
         val running = ProxyVpnService.isVpnRunning
         updateAllWidgets(context, running = running, connecting = false)
     }

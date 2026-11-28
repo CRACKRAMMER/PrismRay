@@ -7,7 +7,7 @@ pkgbase = prismray-git
 	arch = aarch64
 	license = MPL-2.0
 	makedepends = git
-	makedepends = go>=1.26.0
+	makedepends = go>=1.26.3
 	makedepends = rust
 	makedepends = nodejs>=22
 	makedepends = npm
@@ -19,7 +19,6 @@ pkgbase = prismray-git
 	depends = openssl
 	depends = librsvg
 	depends = hicolor-icon-theme
-	optdepends = sing-box: primary proxy & TUN core (auto-downloaded if omitted)
 	optdepends = xray: on-demand XHTTP / VLESS encryption coprocessor (auto-downloaded if omitted)
 	optdepends = fprintd: optional fingerprint unlock
 	optdepends = polkit: system authentication fallback for biometric unlock and privileged TUN

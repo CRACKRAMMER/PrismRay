@@ -86,7 +86,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: backend/go.mod
-          cache-dependency-path: backend/go.sum
+          cache-dependency-path: |
+            backend/go.sum
+            backend/singbox-android/go.sum
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
@@ -105,9 +107,37 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
         run: python scripts/build_sidecar.py
-      - name: Use ad-hoc signing on macOS
+      - name: Configure macOS code signing (Developer ID if configured, else ad-hoc)
         if: runner.os == 'macOS'
-        run: printf '%s\n' 'APPLE_SIGNING_IDENTITY=-' >> "$GITHUB_ENV"
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY_SECRET: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_SIGNING_IDENTITY_SECRET" ]; then
+            echo "Importing Apple Developer ID certificate into temporary keychain"
+            KEYCHAIN_PATH="$RUNNER_TEMP/prismray-signing.keychain-db"
+            KEYCHAIN_PASS="$(openssl rand -hex 16)"
+            CERT_PATH="$RUNNER_TEMP/prismray-devid.p12"
+            printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+            security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+            security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+            security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+            security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+            security list-keychain -d user -s "$KEYCHAIN_PATH"
+            rm -f "$CERT_PATH"
+            printf '%s\n' "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY_SECRET" >> "$GITHUB_ENV"
+            if [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+              printf '%s\n' "APPLE_ID=$APPLE_ID" "APPLE_PASSWORD=$APPLE_PASSWORD" "APPLE_TEAM_ID=$APPLE_TEAM_ID" >> "$GITHUB_ENV"
+            fi
+          else
+            echo "APPLE_CERTIFICATE not configured; falling back to ad-hoc signing"
+            printf '%s\n' 'APPLE_SIGNING_IDENTITY=-' >> "$GITHUB_ENV"
+          fi
       - name: Configure signed updater artifacts
         env:
           UPDATER_PUBLIC_KEY: ${{ vars.UPDATER_PUBLIC_KEY }}
@@ -172,6 +202,41 @@ jobs:
         env:
           PACKAGE_PLATFORM: ${{ matrix.platform }}
         run: python scripts/package_artifacts.py --platform "$PACKAGE_PLATFORM" --target "$RUST_TARGET" --variant full
+      - name: Sign Windows installers (Authenticode when configured)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) {
+            Write-Host "WINDOWS_CERTIFICATE secret not configured; skipping Authenticode signing."
+            exit 0
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP "prismray-codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $timestampUrl = if ($env:WINDOWS_TIMESTAMP_URL) { $env:WINDOWS_TIMESTAMP_URL } else { "http://timestamp.digicert.com" }
+          $signtool = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Filter "signtool.exe" -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "x64" } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) {
+            Write-Error "signtool.exe not found on Windows runner"
+            exit 1
+          }
+          Get-ChildItem -Path "artifacts","frontend/src-tauri/target/$($env:RUST_TARGET)/release/bundle" -Include "*.exe","*.msi" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "Signing $($_.FullName)"
+            & $signtool.FullName sign /fd SHA256 /f $pfxPath /p $env:WINDOWS_CERTIFICATE_PASSWORD /tr $timestampUrl /td SHA256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $sigFile = "$($_.FullName).sig"
+            if ((Test-Path $sigFile) -and $env:TAURI_SIGNING_PRIVATE_KEY) {
+              Write-Host "Regenerating Tauri updater signature $sigFile"
+              npx --prefix frontend tauri signer sign $_.FullName
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
+          Remove-Item -Force -ErrorAction SilentlyContinue $pfxPath
       - name: Upload platform packages (Lite + Full)
         id: upload_pkg
         continue-on-error: true
@@ -237,8 +302,10 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: backend/go.mod
-          cache-dependency-path: backend/go.sum
-      - uses: actions/setup-java@v5
+          cache-dependency-path: |
+            backend/go.sum
+            backend/singbox-android/go.sum
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: temurin
           java-version: '21'
@@ -338,7 +405,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: backend/go.mod
-          cache-dependency-path: backend/go.sum
+          cache-dependency-path: |
+            backend/go.sum
+            backend/singbox-android/go.sum
       - name: Build production Web frontend
         working-directory: frontend
         run: |

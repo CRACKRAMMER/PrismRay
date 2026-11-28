@@ -8,8 +8,13 @@ import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
 
 class ProxyTileService : TileService() {
+    companion object {
+        private val toggling = AtomicBoolean(false)
+    }
+
     override fun onStartListening() {
         super.onStartListening()
         refreshTileState()
@@ -17,29 +22,41 @@ class ProxyTileService : TileService() {
 
     override fun onClick() {
         super.onClick()
+        if (!toggling.compareAndSet(false, true)) return
         Thread({
-            val active = queryActive()
-            if (active) {
-                val stopIntent = Intent(this, ProxyVpnService::class.java).apply {
-                    action = ProxyVpnService.ACTION_STOP
+            try {
+                val active = queryActive()
+                if (active) {
+                    val stopIntent = Intent(this, ProxyVpnService::class.java).apply {
+                        action = ProxyVpnService.ACTION_STOP
+                    }
+                    try {
+                        startService(stopIntent)
+                    } catch (_: Throwable) {
+                        RuntimeIpc.request(this, "POST", "/api/vpn/android/stop", "{}", readTimeoutMs = 3000)
+                    }
+                    updateTile(isActive = false)
+                    return@Thread
                 }
-                startService(stopIntent)
-                updateTile(isActive = false)
-                return@Thread
-            }
 
-            val prepareIntent = VpnService.prepare(this)
-            val backendAlive = RuntimeIpc.request(this, "GET", "/api/vpn/android/status")?.statusCode in 200..299
-            if (prepareIntent == null && backendAlive) {
-                val startIntent = Intent(this, ProxyVpnService::class.java).apply {
-                    action = ProxyVpnService.ACTION_START
+                val prepareIntent = VpnService.prepare(this)
+                val backendAlive = RuntimeIpc.request(this, "GET", "/api/vpn/android/status")?.statusCode in 200..299
+                if (prepareIntent == null && backendAlive) {
+                    val startIntent = Intent(this, ProxyVpnService::class.java).apply {
+                        action = ProxyVpnService.ACTION_START
+                    }
+                    try {
+                        startForegroundService(startIntent)
+                        updateTile(isActive = true)
+                        return@Thread
+                    } catch (_: Throwable) {
+                        // Fall through to launch MainActivity if background FGS start is restricted.
+                    }
                 }
-                startForegroundService(startIntent)
-                updateTile(isActive = true)
-            } else {
                 val launchIntent = Intent(this, MainActivity::class.java).apply {
                     flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
                     putExtra(MainActivity.EXTRA_AUTO_START_VPN, true)
+                    putExtra(MainActivity.EXTRA_AUTO_START_NONCE, MainActivity.issueAutoStartNonce())
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     val pending = PendingIntent.getActivity(
@@ -53,6 +70,8 @@ class ProxyTileService : TileService() {
                     @Suppress("DEPRECATION")
                     startActivityAndCollapse(launchIntent)
                 }
+            } finally {
+                toggling.set(false)
             }
         }, "prismray-tile-click").start()
     }

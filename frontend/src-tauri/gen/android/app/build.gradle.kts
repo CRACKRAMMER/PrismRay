@@ -61,6 +61,25 @@ fun resolveReleaseSigning(): Map<String, String>? {
 
 val releaseSigning = resolveReleaseSigning()
 
+val baseVersionName = tauriProperties.getProperty("tauri.android.versionName", "1.0.1").trim().ifEmpty { "1.0.1" }
+val localBuildSeq = System.getenv("PRISMRAY_ANDROID_LOCAL_BUILD_SEQ")?.trim()?.toIntOrNull()?.takeIf { it in 1..998 }
+
+fun computeMonotonicVersionCode(verName: String, localSeq: Int?): Int {
+    val parts = verName.split("-", limit = 2)[0].split(".")
+    val major = parts.getOrNull(0)?.toIntOrNull() ?: 1
+    val minor = parts.getOrNull(1)?.toIntOrNull() ?: 0
+    val patch = parts.getOrNull(2)?.toIntOrNull() ?: 0
+    // Monotonic formula: major*10_000_000 + minor*100_000 + patch*1_000 + buildOffset
+    // - Official CI releases: buildOffset = 999 (e.g. 1.0.2 -> 10002999)
+    // - Local iterative builds: buildOffset = 1..998 (e.g. 1.0.2-local.1 -> 10002001)
+    // Strictly > legacy 1.0.1 (1000001) and local builds always upgrade cleanly to official releases.
+    val offset = localSeq ?: 999
+    return major * 10_000_000 + minor * 100_000 + patch * 1_000 + offset
+}
+
+val resolvedVersionCode = computeMonotonicVersionCode(baseVersionName, localBuildSeq)
+val resolvedVersionName = if (localBuildSeq != null) "$baseVersionName-local.$localBuildSeq" else baseVersionName
+
 android {
     compileSdk = 36
     namespace = "com.crackrammer.prismray"
@@ -69,8 +88,8 @@ android {
         applicationId = "com.crackrammer.prismray"
         minSdk = 26
         targetSdk = 36
-        versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
-        versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        versionCode = resolvedVersionCode
+        versionName = resolvedVersionName
     }
     signingConfigs {
         if (releaseSigning != null) {

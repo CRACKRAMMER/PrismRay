@@ -29,7 +29,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: backend/go.mod
-          cache-dependency-path: backend/go.sum
+          cache-dependency-path: |
+            backend/go.sum
+            backend/singbox-android/go.sum
       - name: Test artifact packaging
         working-directory: .
         run: python -m unittest discover -s scripts -p 'test_*.py'
@@ -43,6 +45,11 @@ jobs:
       - run: go test -race -coverprofile=coverage.out ./...
       - run: go vet ./...
       - run: go build -trimpath -o server ./cmd/server
+      - name: Vet and test unified sing-box wrapper
+        working-directory: backend/singbox-android
+        run: |
+          go vet -tags "with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_tailscale" ./...
+          go test -race -tags "with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_tailscale" ./...
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: go-coverage-${{ github.run_id }}-${{ github.run_attempt }}

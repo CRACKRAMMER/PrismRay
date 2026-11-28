@@ -5,4 +5,11 @@
     <string name="widget_status_disconnected">未连接</string>
     <string name="widget_status_connecting">连接中…</string>
     <string name="widget_toggle_cd">切换 PrismRay VPN</string>
+    <string name="vpn_err_ipc_not_ready">本地后台 IPC 尚未就绪 (runtime-ipc.json 未找到)</string>
+    <string name="vpn_err_core_start">内核启动失败 (%1$d): %2$s</string>
+    <string name="vpn_err_start_request">本地后台 /api/vpn/android/start 请求失败 (HTTP %1$d)</string>
+    <string name="vpn_err_establish_exception">VpnService.establish 异常: %1$s</string>
+    <string name="vpn_err_establish_denied">Android 系统拒绝建立 VPN 隧道 (可能未授予 VPN 权限或被其他 VPN 占用)</string>
+    <string name="vpn_err_hev_start">原生 hev-socks5-tunnel 启动失败 (port=%1$d, mtu=%2$d)</string>
+    <string name="vpn_err_tun_attach">TUN 转发引擎挂载失败: %1$s</string>
 </resources>

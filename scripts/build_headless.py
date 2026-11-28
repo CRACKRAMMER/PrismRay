@@ -65,6 +65,29 @@ def build_headless(
         if goos != 'windows':
             binary.chmod(0o755)
 
+        singbox_dir = root / 'backend' / 'singbox-android'
+        if (singbox_dir / 'go.mod').is_file():
+            sb_name = 'sing-box.exe' if goos == 'windows' else 'sing-box'
+            sb_binary = staging / sb_name
+            subprocess.run(
+                [
+                    'go',
+                    'build',
+                    '-trimpath',
+                    '-tags',
+                    'with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_tailscale',
+                    '-ldflags=-s -w',
+                    '-o',
+                    str(sb_binary),
+                    '.',
+                ],
+                cwd=singbox_dir,
+                env=env,
+                check=True,
+            )
+            if goos != 'windows':
+                sb_binary.chmod(0o755)
+
         shutil.copytree(web_dist, staging / 'web')
         for name in ('LICENSE', 'THIRD_PARTY_NOTICES.md'):
             shutil.copy2(root / name, staging / name)

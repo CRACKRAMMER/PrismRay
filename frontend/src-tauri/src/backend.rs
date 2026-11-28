@@ -2,24 +2,127 @@
 use std::{
     io::{BufRead, BufReader},
     path::PathBuf,
-    process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
-    time::Duration,
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
 };
 use tauri::Manager;
 
-#[derive(Default)]
 pub struct Backend {
-    pub child: Option<Child>,
+    pub child_stdin: Option<ChildStdin>,
+    pub child_pid: Option<u32>,
     pub connection: Option<serde_json::Value>,
+    pub data_dir: Option<PathBuf>,
+    pub biometric_hmac_key: [u8; 32],
+    pub exit_signal: Arc<(Mutex<bool>, Condvar)>,
     pub error: String,
     pub stopping: bool,
 }
 
+impl Default for Backend {
+    fn default() -> Self {
+        Self {
+            child_stdin: None,
+            child_pid: None,
+            connection: None,
+            data_dir: None,
+            biometric_hmac_key: generate_hmac_key(),
+            exit_signal: Arc::new((Mutex::new(false), Condvar::new())),
+            error: String::new(),
+            stopping: false,
+        }
+    }
+}
+
 pub type State = Arc<Mutex<Backend>>;
+
+fn generate_hmac_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            if f.read_exact(&mut key).is_ok() {
+                return key;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "bcrypt")]
+        extern "system" {
+            fn BCryptGenRandom(
+                h_algorithm: *mut core::ffi::c_void,
+                pb_buffer: *mut u8,
+                cb_buffer: u32,
+                dw_flags: u32,
+            ) -> i32;
+        }
+        const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                key.as_mut_ptr(),
+                key.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status == 0 {
+            return key;
+        }
+    }
+    // Defensive fallback if OS RNG is unavailable in a restricted sandbox.
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    for chunk in key.chunks_mut(8) {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            h.write_u128(d.as_nanos());
+        }
+        let bytes = h.finish().to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+    key
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+pub fn biometric_hmac_key_bytes(state: &State) -> [u8; 32] {
+    state
+        .lock()
+        .map(|s| s.biometric_hmac_key)
+        .unwrap_or([0u8; 32])
+}
 
 #[tauri::command]
 pub fn backend_connection(state: tauri::State<'_, State>) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        let existing_dir = {
+            let s = state.lock().map_err(|e| e.to_string())?;
+            if let Some(conn) = s.connection.clone() {
+                return Ok(conn);
+            }
+            s.data_dir.clone()
+        };
+        if let Some(dir) = existing_dir {
+            if let Some(conn) = probe_existing_android_ipc(&dir) {
+                let mut s = state.lock().map_err(|e| e.to_string())?;
+                s.connection = Some(conn.clone());
+                s.error.clear();
+                return Ok(conn);
+            }
+        }
+    }
     let s = state.lock().map_err(|e| e.to_string())?;
     s.connection.clone().ok_or_else(|| {
         if s.error.is_empty() {
@@ -28,6 +131,36 @@ pub fn backend_connection(state: tauri::State<'_, State>) -> Result<serde_json::
             s.error.clone()
         }
     })
+}
+
+#[cfg(target_os = "android")]
+fn detect_android_timezone() -> (Option<String>, Option<i32>) {
+    let tz_name = Command::new("/system/bin/getprop")
+        .arg("persist.sys.timezone")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let offset_sec = Command::new("/system/bin/date")
+        .arg("+%z")
+        .output()
+        .or_else(|_| Command::new("date").arg("+%z").output())
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if raw.len() == 5 && (raw.starts_with('+') || raw.starts_with('-')) {
+                let sign = if raw.starts_with('-') { -1 } else { 1 };
+                let hours: i32 = raw[1..3].parse().ok()?;
+                let mins: i32 = raw[3..5].parse().ok()?;
+                Some(sign * (hours * 3600 + mins * 60))
+            } else {
+                None
+            }
+        });
+    (tz_name, offset_sec)
 }
 
 #[cfg(target_os = "android")]
@@ -119,29 +252,23 @@ pub fn start(app: &tauri::AppHandle, state: State) -> Result<(), Box<dyn std::er
         (Some(cfg_dir.join("settings.json")), run_dir, None, None, bin)
     };
 
+    {
+        let mut s = state.lock().unwrap();
+        s.data_dir = Some(data_dir.clone());
+    }
+    let hmac_hex = encode_hex(&biometric_hmac_key_bytes(&state));
+
     std::thread::spawn(move || loop {
         if state.lock().unwrap().stopping {
             break;
         }
         #[cfg(target_os = "android")]
         if let Some(existing) = probe_existing_android_ipc(&data_dir) {
-            {
-                let mut s = state.lock().unwrap();
-                s.connection = Some(existing);
-                s.error.clear();
-            }
-            loop {
-                std::thread::sleep(Duration::from_secs(2));
-                if state.lock().unwrap().stopping {
-                    return;
-                }
-                if probe_existing_android_ipc(&data_dir).is_none() {
-                    let mut s = state.lock().unwrap();
-                    s.connection = None;
-                    break;
-                }
-            }
-            continue;
+            let mut s = state.lock().unwrap();
+            s.connection = Some(existing);
+            s.error.clear();
+            // Attached to an existing Kotlin-managed libprismray.so; exit monitor cleanly with zero wakeups.
+            return;
         }
         let result = (|| -> Result<Child, String> {
             let mut cmd = Command::new(&exe);
@@ -153,10 +280,20 @@ pub fn start(app: &tauri::AppHandle, state: State) -> Result<(), Box<dyn std::er
                 if let Some(ref tmp_dir) = cache_dir {
                     cmd.env("TMPDIR", tmp_dir);
                 }
-                let _ = &config_path;
+                let _ = (&config_path, &hmac_hex);
                 if let Some(ref lib_dir) = native_dir {
                     cmd.env("PRISMRAY_NATIVE_LIB_DIR", lib_dir);
                 }
+                let (tz_name, tz_offset) = detect_android_timezone();
+                if let Some(ref tz) = tz_name {
+                    cmd.env("TZ", tz);
+                    cmd.env("PRISMRAY_TZ_NAME", tz);
+                }
+                if let Some(off) = tz_offset {
+                    cmd.env("PRISMRAY_TZ_OFFSET_SEC", off.to_string());
+                }
+                cmd.env("GOGC", "200");
+                cmd.env("GOMEMLIMIT", "96MiB");
             }
             #[cfg(not(target_os = "android"))]
             {
@@ -165,6 +302,7 @@ pub fn start(app: &tauri::AppHandle, state: State) -> Result<(), Box<dyn std::er
                     cmd.arg("--config").arg(cfg_file);
                 }
                 cmd.arg("--data-dir").arg(&data_dir);
+                cmd.env("PRISMRAY_BIOMETRIC_HMAC_KEY", &hmac_hex);
                 if let Ok(appimage) = std::env::var("APPIMAGE") {
                     if !appimage.trim().is_empty() {
                         cmd.env("PRISMRAY_DESKTOP_EXECUTABLE", appimage);
@@ -243,29 +381,44 @@ pub fn start(app: &tauri::AppHandle, state: State) -> Result<(), Box<dyn std::er
             Ok(child)
         })();
         match result {
-            Ok(child) => state.lock().unwrap().child = Some(child),
+            Ok(mut child) => {
+                let exit_signal = {
+                    let mut s = state.lock().unwrap();
+                    s.child_stdin = child.stdin.take();
+                    s.child_pid = Some(child.id());
+                    let sig = Arc::clone(&s.exit_signal);
+                    if let Ok(mut exited) = sig.0.lock() {
+                        *exited = false;
+                    }
+                    if s.stopping {
+                        s.child_stdin = None;
+                    }
+                    sig
+                };
+                // Event-driven blocking wait: zero periodic wakeups while child is running.
+                let _ = child.wait();
+                let stopping = {
+                    let mut s = state.lock().unwrap();
+                    s.connection = None;
+                    s.child_stdin = None;
+                    s.child_pid = None;
+                    s.stopping
+                };
+                if let Ok(mut exited) = exit_signal.0.lock() {
+                    *exited = true;
+                    exit_signal.1.notify_all();
+                }
+                if stopping {
+                    return;
+                }
+            }
             Err(e) => {
                 let mut s = state.lock().unwrap();
                 s.error = e;
                 s.connection = None;
-            }
-        }
-        loop {
-            std::thread::sleep(Duration::from_secs(1));
-            let mut s = state.lock().unwrap();
-            if s.stopping {
-                return;
-            }
-            let alive = s
-                .child
-                .as_mut()
-                .and_then(|c| c.try_wait().ok())
-                .map(|v| v.is_none())
-                .unwrap_or(false);
-            if !alive {
-                s.connection = None;
-                s.child = None;
-                break;
+                if s.stopping {
+                    return;
+                }
             }
         }
         std::thread::sleep(Duration::from_secs(3));
@@ -273,26 +426,80 @@ pub fn start(app: &tauri::AppHandle, state: State) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+fn force_terminate_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .creation_flags(0x08000000)
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
+    }
+}
+
 pub fn stop(state: &State) {
-    let mut s = state.lock().unwrap();
-    s.stopping = true;
-    if let Some(mut child) = s.child.take() {
-        drop(child.stdin.take());
-        for _ in 0..100 {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return;
+    let (pid, exit_signal) = {
+        let mut s = state.lock().unwrap();
+        s.stopping = true;
+        // Closing child stdin triggers graceful shutdown inside prismray-server.
+        drop(s.child_stdin.take());
+        (s.child_pid, Arc::clone(&s.exit_signal))
+    };
+    if let Some(pid) = pid {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut exited = exit_signal.0.lock().unwrap();
+        while !*exited {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (guard, timeout) = exit_signal.1.wait_timeout(exited, remaining).unwrap();
+            exited = guard;
+            if timeout.timed_out() {
+                break;
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        let still_running = !*exited;
+        drop(exited);
+        if still_running {
+            force_terminate_pid(pid);
+        }
     }
 }
 
 #[tauri::command]
-pub fn prepare_update(state: tauri::State<'_, State>) {
+pub async fn prepare_update(state: tauri::State<'_, State>) -> Result<(), String> {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    stop(state.inner());
+    {
+        let cloned = state.inner().clone();
+        tauri::async_runtime::spawn_blocking(move || stop(&cloned))
+            .await
+            .map_err(|e| format!("prepare_update failed: {}", e))?;
+    }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     let _ = state;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn resume_backend(app: tauri::AppHandle, state: tauri::State<'_, State>) -> Result<(), String> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let needs_start = {
+            let mut s = state.lock().map_err(|e| e.to_string())?;
+            s.stopping = false;
+            s.child_pid.is_none()
+        };
+        if needs_start {
+            start(&app, state.inner().clone()).map_err(|e| e.to_string())?;
+        }
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let _ = (app, state);
+    Ok(())
 }

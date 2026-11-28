@@ -14,6 +14,9 @@
 -keep class com.crackrammer.prismray.QrScannerActivity { *; }
 -keep class com.crackrammer.prismray.generated.** { *; }
 
+# Keep hev-socks5-tunnel JNI entrypoint (registered via JNI_OnLoad).
+-keep class hev.htproxy.TProxyService { *; }
+
 # Keep Tauri Android bridge classes and JNI entrypoints.
 -keep class app.tauri.** { *; }
 -keepclassmembers class * {

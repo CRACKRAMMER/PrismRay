@@ -118,13 +118,14 @@ fn parse_cli_override() -> Option<GpuMode> {
         match arg {
             "-h" | "--help" => {
                 println!(
-                    "PrismRay v1.0.0\n\
+                    "PrismRay v{}\n\
                      Usage: prismray [OPTIONS]\n\
                        --gpu=auto|on|off    Configure GPU hardware rendering (overrides saved preference)\n\
                        --enable-gpu         Force enable GPU hardware acceleration\n\
                        --disable-gpu        Force software compatibility rendering\n\
                        --minimized          Start minimized in the system tray\n\
-                       -h, --help           Show this help message"
+                       -h, --help           Show this help message",
+                    env!("CARGO_PKG_VERSION")
                 );
                 std::process::exit(0);
             }

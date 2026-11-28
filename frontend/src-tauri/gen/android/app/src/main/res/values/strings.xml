@@ -7,4 +7,11 @@
     <string name="widget_status_disconnected">Disconnected</string>
     <string name="widget_status_connecting">Connecting…</string>
     <string name="widget_toggle_cd">Toggle PrismRay VPN</string>
+    <string name="vpn_err_ipc_not_ready">Local backend IPC is not ready (runtime-ipc.json missing)</string>
+    <string name="vpn_err_core_start">Core failed to start (%1$d): %2$s</string>
+    <string name="vpn_err_start_request">Local backend /api/vpn/android/start failed (HTTP %1$d)</string>
+    <string name="vpn_err_establish_exception">VpnService.establish failed: %1$s</string>
+    <string name="vpn_err_establish_denied">Android denied VPN tunnel creation (VPN permission revoked or occupied by another VPN)</string>
+    <string name="vpn_err_hev_start">Native hev-socks5-tunnel failed to start (port=%1$d, mtu=%2$d)</string>
+    <string name="vpn_err_tun_attach">TUN forwarder failed to attach: %1$s</string>
 </resources>

@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import java.io.File
+import java.util.TimeZone
 
 internal object AndroidBackendLauncher {
     private const val TAG = "PrismRayBackend"
@@ -87,6 +88,14 @@ internal object AndroidBackendLauncher {
                     env["HOME"] = dataDir.absolutePath
                     env["TMPDIR"] = tmpDir.absolutePath
                     env["PRISMRAY_NATIVE_LIB_DIR"] = nativeDir
+                    val tz = TimeZone.getDefault()
+                    if (!tz.id.isNullOrBlank()) {
+                        env["TZ"] = tz.id
+                        env["PRISMRAY_TZ_NAME"] = tz.id
+                    }
+                    env["PRISMRAY_TZ_OFFSET_SEC"] = (tz.getOffset(System.currentTimeMillis()) / 1000).toString()
+                    env.putIfAbsent("GOGC", "200")
+                    env.putIfAbsent("GOMEMLIMIT", "96MiB")
                     pb.redirectErrorStream(true)
                     val proc = pb.start()
                     managedProcess = proc

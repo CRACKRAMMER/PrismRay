@@ -7,12 +7,11 @@ pkgbase = prismray-server-git
 	arch = aarch64
 	license = MPL-2.0
 	makedepends = git
-	makedepends = go>=1.26.0
+	makedepends = go>=1.26.3
 	makedepends = nodejs>=22
 	makedepends = npm
 	makedepends = python
 	depends = ca-certificates
-	optdepends = sing-box: primary proxy & TUN core
 	optdepends = xray: on-demand XHTTP / VLESS encryption coprocessor
 	optdepends = systemd: optional user service
 	provides = prismray-server=1.0.0.r0.g0000000

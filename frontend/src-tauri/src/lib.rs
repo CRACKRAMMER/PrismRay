@@ -45,7 +45,72 @@ struct TrayStatePayload {
     mode: String,
     active_label: String,
     #[serde(default)]
+    locale: String,
+    #[serde(default)]
+    tailscale_enabled: bool,
+    #[serde(default)]
+    tailscale_state: String,
+    #[serde(default)]
+    speed_summary: String,
+    #[serde(default)]
     recent_targets: Vec<TrayTargetItem>,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct TrayStrings {
+    show_window: &'static str,
+    tun_tunnel: &'static str,
+    system_proxy: &'static str,
+    tailscale_mesh: &'static str,
+    mode_rule: &'static str,
+    mode_global: &'static str,
+    mode_direct: &'static str,
+    recent_header: &'static str,
+    disconnect: &'static str,
+    connect: &'static str,
+    quit: &'static str,
+    disconnected: &'static str,
+    connected: &'static str,
+    port_listening: &'static str,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn tray_strings(locale: &str) -> TrayStrings {
+    if locale.trim().to_ascii_lowercase().starts_with("en") {
+        TrayStrings {
+            show_window: "Show Window",
+            tun_tunnel: "TUN Tunnel",
+            system_proxy: "System Proxy",
+            tailscale_mesh: "Tailscale Mesh",
+            mode_rule: "Rule Mode",
+            mode_global: "Global Mode",
+            mode_direct: "Direct Mode",
+            recent_header: "Recent",
+            disconnect: "Disconnect",
+            connect: "Connect",
+            quit: "Quit PrismRay",
+            disconnected: "Disconnected",
+            connected: "Connected",
+            port_listening: "Proxy Port",
+        }
+    } else {
+        TrayStrings {
+            show_window: "显示主窗口",
+            tun_tunnel: "TUN 透明隧道",
+            system_proxy: "系统代理",
+            tailscale_mesh: "Tailscale 组网",
+            mode_rule: "规则模式",
+            mode_global: "全局模式",
+            mode_direct: "直连模式",
+            recent_header: "最近连接",
+            disconnect: "断开连接",
+            connect: "连接代理",
+            quit: "退出 PrismRay",
+            disconnected: "已断开",
+            connected: "已连接",
+            port_listening: "端口监听",
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -73,25 +138,34 @@ fn is_double_click_trigger(last_click: &Mutex<Option<Instant>>, now: Instant) ->
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn build_tray_tooltip(payload: &TrayStatePayload) -> String {
+    let s = tray_strings(&payload.locale);
     if !payload.running {
-        return "PrismRay · 已断开".to_string();
+        return format!("PrismRay · {}", s.disconnected);
     }
     let mut channels = Vec::new();
     if payload.tun_enabled {
         channels.push("TUN");
     }
     if payload.system_proxy_enabled {
-        channels.push("系统代理");
+        channels.push(s.system_proxy);
+    }
+    if payload.tailscale_enabled {
+        channels.push("Tailscale");
     }
     if channels.is_empty() {
-        channels.push("端口监听");
+        channels.push(s.port_listening);
     }
     let target = if payload.active_label.trim().is_empty() {
-        "已连接"
+        s.connected
     } else {
         payload.active_label.trim()
     };
-    format!("PrismRay · {} · {}", channels.join(" + "), target)
+    let speed = payload.speed_summary.trim();
+    if speed.is_empty() {
+        format!("PrismRay · {} · {}", channels.join(" + "), target)
+    } else {
+        format!("PrismRay · {} · {}\n{}", channels.join(" + "), target, speed)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -322,11 +396,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             backend::backend_connection,
             backend::prepare_update,
+            backend::resume_backend,
             biometric::biometric_status,
             biometric::biometric_authenticate,
             gpu::get_gpu_status,
             gpu::set_gpu_mode,
-            update_tray
+            update_tray,
+            update_tray_tooltip
         ]);
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -361,9 +437,10 @@ fn update_tray(app: tauri::AppHandle, payload: TrayStatePayload) -> Result<(), S
         tray.set_tooltip(Some(build_tray_tooltip(&payload)))
             .map_err(|e| e.to_string())?;
 
+        let s = tray_strings(&payload.locale);
         let menu = Menu::new(&app).map_err(|e| e.to_string())?;
         let show_item =
-            MenuItem::with_id(&app, "show", "显示主窗口", true, None::<&str>).map_err(|e| e.to_string())?;
+            MenuItem::with_id(&app, "show", s.show_window, true, None::<&str>).map_err(|e| e.to_string())?;
         menu.append(&show_item).map_err(|e| e.to_string())?;
 
         let sep1 = PredefinedMenuItem::separator(&app).map_err(|e| e.to_string())?;
@@ -372,7 +449,7 @@ fn update_tray(app: tauri::AppHandle, payload: TrayStatePayload) -> Result<(), S
         let tun_item = CheckMenuItem::with_id(
             &app,
             "toggle:tun",
-            "TUN 透明隧道",
+            s.tun_tunnel,
             true,
             payload.tun_enabled,
             None::<&str>,
@@ -381,22 +458,37 @@ fn update_tray(app: tauri::AppHandle, payload: TrayStatePayload) -> Result<(), S
         let sys_item = CheckMenuItem::with_id(
             &app,
             "toggle:sysproxy",
-            "系统代理",
+            s.system_proxy,
             true,
             payload.system_proxy_enabled,
             None::<&str>,
         )
         .map_err(|e| e.to_string())?;
+        let ts_label = if payload.tailscale_enabled && !payload.tailscale_state.trim().is_empty() {
+            format!("{} ({})", s.tailscale_mesh, payload.tailscale_state.trim())
+        } else {
+            s.tailscale_mesh.to_string()
+        };
+        let ts_item = CheckMenuItem::with_id(
+            &app,
+            "toggle:tailscale",
+            ts_label,
+            true,
+            payload.tailscale_enabled,
+            None::<&str>,
+        )
+        .map_err(|e| e.to_string())?;
         menu.append(&tun_item).map_err(|e| e.to_string())?;
         menu.append(&sys_item).map_err(|e| e.to_string())?;
+        menu.append(&ts_item).map_err(|e| e.to_string())?;
 
         let sep2 = PredefinedMenuItem::separator(&app).map_err(|e| e.to_string())?;
         menu.append(&sep2).map_err(|e| e.to_string())?;
 
         for (id, label, key) in [
-            ("mode:rule", "规则模式", "rule"),
-            ("mode:global", "全局模式", "global"),
-            ("mode:direct", "直连模式", "direct"),
+            ("mode:rule", s.mode_rule, "rule"),
+            ("mode:global", s.mode_global, "global"),
+            ("mode:direct", s.mode_direct, "direct"),
         ] {
             let item = CheckMenuItem::with_id(
                 &app,
@@ -413,7 +505,7 @@ fn update_tray(app: tauri::AppHandle, payload: TrayStatePayload) -> Result<(), S
         if !payload.recent_targets.is_empty() {
             let sep_nodes = PredefinedMenuItem::separator(&app).map_err(|e| e.to_string())?;
             menu.append(&sep_nodes).map_err(|e| e.to_string())?;
-            let recent_hdr = MenuItem::with_id(&app, "recent:header", "最近连接", false, None::<&str>)
+            let recent_hdr = MenuItem::with_id(&app, "recent:header", s.recent_header, false, None::<&str>)
                 .map_err(|e| e.to_string())?;
             menu.append(&recent_hdr).map_err(|e| e.to_string())?;
             for target in payload.recent_targets.into_iter().take(5) {
@@ -436,13 +528,13 @@ fn update_tray(app: tauri::AppHandle, payload: TrayStatePayload) -> Result<(), S
         let toggle_conn = MenuItem::with_id(
             &app,
             if payload.running { "disconnect" } else { "connect" },
-            if payload.running { "断开连接" } else { "连接代理" },
+            if payload.running { s.disconnect } else { s.connect },
             true,
             None::<&str>,
         )
         .map_err(|e| e.to_string())?;
         let quit_item =
-            MenuItem::with_id(&app, "quit", "退出 PrismRay", true, None::<&str>).map_err(|e| e.to_string())?;
+            MenuItem::with_id(&app, "quit", s.quit, true, None::<&str>).map_err(|e| e.to_string())?;
         menu.append(&toggle_conn).map_err(|e| e.to_string())?;
         menu.append(&quit_item).map_err(|e| e.to_string())?;
 
@@ -453,6 +545,24 @@ fn update_tray(app: tauri::AppHandle, payload: TrayStatePayload) -> Result<(), S
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let _ = (app, payload);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn update_tray_tooltip(app: tauri::AppHandle, tooltip: String) -> Result<(), String> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        if let Some(tray) = app.tray_by_id("main") {
+            let trimmed = tooltip.trim();
+            if !trimmed.is_empty() {
+                tray.set_tooltip(Some(trimmed)).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = (app, tooltip);
     }
     Ok(())
 }
@@ -546,14 +656,17 @@ mod linux_tray_radio {
                 continue;
             };
             let label = mi.label().map(|s| s.to_string()).unwrap_or_default();
-            if label == "最近连接" {
+            if label == "最近连接" || label == "Recent" {
                 in_recent_section = true;
                 continue;
             }
             let Some(check) = child.dynamic_cast_ref::<gtk::CheckMenuItem>() else {
                 continue;
             };
-            let is_mode_radio = matches!(label.as_str(), "规则模式" | "全局模式" | "直连模式");
+            let is_mode_radio = matches!(
+                label.as_str(),
+                "规则模式" | "全局模式" | "直连模式" | "Rule Mode" | "Global Mode" | "Direct Mode"
+            );
             if is_mode_radio || in_recent_section {
                 check.set_draw_as_radio(true);
                 set_dbusmenu_toggle_type_radio(check);
@@ -573,7 +686,7 @@ mod linux_tray_radio {
                 let is_prismray_menu = gtk_menu.children().iter().any(|item| {
                     item.dynamic_cast_ref::<gtk::MenuItem>()
                         .and_then(|mi| mi.label())
-                        .map(|lbl| lbl == "显示主窗口")
+                        .map(|lbl| lbl == "显示主窗口" || lbl == "Show Window")
                         .unwrap_or(false)
                 });
                 if is_prismray_menu {

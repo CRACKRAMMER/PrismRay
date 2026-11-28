@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -41,7 +43,16 @@ def verify_full_linux_appimage(appimage_path: Path) -> None:
     print(f'Verified Full AppImage: {appimage_path.name} (no libwayland-client, includes sing-box + xray)', flush=True)
 
 
-def build_linux_full_appimage(output_dir: Path) -> Path:
+def format_versioned_artifact_name(version: str, target_suffix: str) -> str:
+    """Format a versioned filename under releases/ such as prismray-v1.0.1-local.1-android-arm64.apk."""
+    clean_ver = version.strip().lstrip('vV')
+    if not clean_ver:
+        raise ValueError('Version must not be empty')
+    clean_suffix = target_suffix.strip().lstrip('-')
+    return f'prismray-v{clean_ver}-{clean_suffix}'
+
+
+def build_linux_full_appimage(output_dir: Path, *, version: str | None = None) -> Path:
     sidecar_env = os.environ.copy()
     sidecar_env['RUST_TARGET'] = LINUX_RUST_TARGET
     sidecar_env['GOOS'] = 'linux'
@@ -92,7 +103,8 @@ def build_linux_full_appimage(output_dir: Path) -> Path:
     src = candidates[0]
     verify_full_linux_appimage(src)
 
-    dest = output_dir / 'prismray-linux-x64-full.AppImage'
+    base_version = (version or read_repo_version(ROOT)).strip()
+    dest = output_dir / format_versioned_artifact_name(base_version, 'linux-x64-full.AppImage')
     tmp = dest.with_name(f'.{dest.name}.tmp.{os.getpid()}')
     shutil.copy2(src, tmp)
     tmp.chmod(0o755)
@@ -100,31 +112,143 @@ def build_linux_full_appimage(output_dir: Path) -> Path:
     return dest
 
 
-def build_headless_archives(output_dir: Path) -> list[Path]:
+def build_headless_archives(output_dir: Path, *, version: str | None = None) -> list[Path]:
     web_dist = ROOT / 'frontend' / 'dist'
     if not (web_dist / 'index.html').is_file():
         run(['npm', '--prefix', str(ROOT / 'frontend'), 'run', 'build'])
 
+    base_version = (version or read_repo_version(ROOT)).strip()
     built: list[Path] = []
-    for platform, goarch in (('linux-x64', 'amd64'), ('linux-arm64', 'arm64')):
-        run(
-            [
-                sys.executable,
-                str(ROOT / 'scripts' / 'build_headless.py'),
-                '--platform',
-                platform,
-                '--goos',
-                'linux',
-                '--goarch',
-                goarch,
-                '--web-dist',
-                str(web_dist),
-                '--output-dir',
-                str(output_dir),
-            ]
-        )
-        built.append(output_dir / f'prismray-headless-{platform}.tar.gz')
+    with tempfile.TemporaryDirectory(prefix='prismray-headless-stage-') as stage_dir:
+        stage_path = Path(stage_dir)
+        for platform, goarch in (('linux-x64', 'amd64'), ('linux-arm64', 'arm64')):
+            run(
+                [
+                    sys.executable,
+                    str(ROOT / 'scripts' / 'build_headless.py'),
+                    '--platform',
+                    platform,
+                    '--goos',
+                    'linux',
+                    '--goarch',
+                    goarch,
+                    '--web-dist',
+                    str(web_dist),
+                    '--output-dir',
+                    str(stage_path),
+                ]
+            )
+            src = stage_path / f'prismray-headless-{platform}.tar.gz'
+            dest = output_dir / format_versioned_artifact_name(base_version, f'headless-{platform}.tar.gz')
+            tmp = dest.with_name(f'.{dest.name}.tmp.{os.getpid()}')
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dest)
+            built.append(dest)
     return built
+
+
+SEMVER_RE = re.compile(r'^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$')
+
+
+def compute_android_version_code(version: str, local_seq: int | None = None) -> int:
+    """Mirror frontend/src-tauri/gen/android/app/build.gradle.kts monotonic versionCode formula."""
+    match = SEMVER_RE.fullmatch(version.strip())
+    if not match:
+        raise ValueError(f'Invalid semver version: {version!r}')
+    major, minor, patch = int(match.group(1)), int(match.group(2)), int(match.group(3))
+    if local_seq is not None and not (1 <= local_seq <= 998):
+        raise ValueError(f'local_seq must be in 1..998, got {local_seq}')
+    offset = local_seq if local_seq is not None else 999
+    return major * 10_000_000 + minor * 100_000 + patch * 1_000 + offset
+
+
+def read_repo_version(root: Path = ROOT) -> str:
+    data = json.loads((root / 'frontend' / 'src-tauri' / 'tauri.conf.json').read_text(encoding='utf-8'))
+    return str(data['version']).strip()
+
+
+def next_local_build_seq(state_file: Path, base_version: str) -> int:
+    """Persistently increment 1..998 build counter per base_version without dirtying git."""
+    seq = 1
+    if state_file.is_file():
+        try:
+            saved = json.loads(state_file.read_text(encoding='utf-8'))
+            if saved.get('version') == base_version and isinstance(saved.get('seq'), int):
+                seq = saved['seq'] + 1
+        except (ValueError, OSError):
+            seq = 1
+    if seq > 998:
+        seq = 998
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps({'version': base_version, 'seq': seq}, indent=2) + '\n', encoding='utf-8')
+    return seq
+
+
+def bump_repo_version(root: Path, new_version: str) -> list[str]:
+    """Synchronize version string across frontend, Tauri, Cargo, i18n, and Go backend."""
+    clean = new_version.strip().lstrip('v')
+    if not SEMVER_RE.fullmatch(clean):
+        raise ValueError(f'Expected MAJOR.MINOR.PATCH[-prerelease], got {new_version!r}')
+    updated: list[str] = []
+
+    for rel in ('frontend/package.json', 'frontend/src-tauri/tauri.conf.json'):
+        p = root / rel
+        if p.is_file():
+            text = p.read_text(encoding='utf-8')
+            next_text, n = re.subn(r'("version"\s*:\s*")[^"]+(")', rf'\g<1>{clean}\2', text, count=1)
+            if n:
+                p.write_text(next_text, encoding='utf-8')
+                updated.append(rel)
+
+    lock_path = root / 'frontend/package-lock.json'
+    if lock_path.is_file():
+        lock = json.loads(lock_path.read_text(encoding='utf-8'))
+        lock['version'] = clean
+        if isinstance(lock.get('packages'), dict) and isinstance(lock['packages'].get(''), dict):
+            lock['packages']['']['version'] = clean
+        lock_path.write_text(json.dumps(lock, indent=2) + '\n', encoding='utf-8')
+        updated.append('frontend/package-lock.json')
+
+    cargo_path = root / 'frontend/src-tauri/Cargo.toml'
+    if cargo_path.is_file():
+        text = cargo_path.read_text(encoding='utf-8')
+        head, sep, tail = text.partition('[package]')
+        if sep:
+            pkg_block, next_sep, rest = tail.partition('\n[')
+            pkg_block, n = re.subn(r'^(version\s*=\s*")[^"]+(")', rf'\g<1>{clean}\2', pkg_block, count=1, flags=re.M)
+            if n:
+                cargo_path.write_text(head + sep + pkg_block + next_sep + rest, encoding='utf-8')
+                updated.append('frontend/src-tauri/Cargo.toml')
+
+    i18n_path = root / 'frontend/src/lib/i18n.ts'
+    if i18n_path.is_file():
+        text = i18n_path.read_text(encoding='utf-8')
+        next_text, n = re.subn(r'("app\.version"\s*:\s*"v)[^"]+(")', rf'\g<1>{clean}\2', text)
+        if n:
+            i18n_path.write_text(next_text, encoding='utf-8')
+            updated.append('frontend/src/lib/i18n.ts')
+
+    go_patterns: list[tuple[str, str, str]] = [
+        ('backend/internal/api/app_update.go', r'(AppVersion\s*=\s*")[^"]+(")', rf'\g<1>{clean}\2'),
+        ('backend/cmd/server/main.go', r'("version",\s*")[^"]+(")', rf'\g<1>{clean}\2'),
+        ('backend/internal/api/tools.go', r'("version"\s*:\s*")[^"]+(")', rf'\g<1>{clean}\2'),
+        ('backend/internal/api/handlers.go', r'(PrismRay/)[\d.]+(?:-[0-9A-Za-z.-]+)?', rf'\g<1>{clean}'),
+        ('backend/internal/api/subscriptions.go', r'(PrismRay/)[\d.]+(?:-[0-9A-Za-z.-]+)?', rf'\g<1>{clean}'),
+        ('backend/internal/api/core.go', r'(PrismRay/)[\d.]+(?:-[0-9A-Za-z.-]+)?', rf'\g<1>{clean}'),
+        ('backend/internal/orchestrator/orchestrator.go', r'(PrismRay/)[\d.]+(?:-[0-9A-Za-z.-]+)?', rf'\g<1>{clean}'),
+        ('packaging/arch/prismray/PKGBUILD', r'^(pkgver=)[^\s]+', rf'\g<1>{clean.replace("-", ".")}'),
+        ('packaging/arch/prismray-server/PKGBUILD', r'^(pkgver=)[^\s]+', rf'\g<1>{clean.replace("-", ".")}'),
+    ]
+    for rel, pat, repl in go_patterns:
+        p = root / rel
+        if p.is_file():
+            text = p.read_text(encoding='utf-8')
+            next_text, n = re.subn(pat, repl, text, flags=re.M)
+            if n:
+                p.write_text(next_text, encoding='utf-8')
+                updated.append(rel)
+
+    return updated
 
 
 def has_android_release_signing() -> bool:
@@ -139,10 +263,27 @@ def has_android_release_signing() -> bool:
     ).is_file()
 
 
-def build_android_apk(output_dir: Path, *, force_download_cores: bool = False) -> Path:
+def build_android_apk(
+    output_dir: Path,
+    *,
+    force_download_cores: bool = False,
+    local_build_seq: int | None = None,
+    use_release_version_code: bool = False,
+) -> Path:
     jni_dir = ROOT / 'frontend' / 'src-tauri' / 'gen' / 'android' / 'app' / 'src' / 'main' / 'jniLibs' / 'arm64-v8a'
-    has_staged_cores = (jni_dir / 'libsingbox.so').is_file() and (jni_dir / 'libxray.so').is_file()
+    has_staged_cores = (
+        (jni_dir / 'libsingbox.so').is_file()
+        and (jni_dir / 'libxray.so').is_file()
+        and (jni_dir / 'libhev-socks5-tunnel.so').is_file()
+    )
     release_signed = has_android_release_signing()
+    base_version = read_repo_version(ROOT)
+    seq: int | None = None
+    if not use_release_version_code:
+        seq = local_build_seq if local_build_seq is not None else next_local_build_seq(output_dir / '.local_build_seq.json', base_version)
+    resolved_code = compute_android_version_code(base_version, seq)
+    resolved_name = f'{base_version}-local.{seq}' if seq is not None else base_version
+    print(f'==> Android APK version: versionName={resolved_name} versionCode={resolved_code}', flush=True)
 
     if release_signed:
         print('==> Detected Android release keystore; building signed Release APK (aarch64)')
@@ -165,6 +306,10 @@ def build_android_apk(output_dir: Path, *, force_download_cores: bool = False) -
             'AR_aarch64_linux_android': f'{ndk_home}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar',
             'CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER': f'{ndk_home}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang',
         }
+        if seq is not None:
+            env['PRISMRAY_ANDROID_LOCAL_BUILD_SEQ'] = str(seq)
+        else:
+            env.pop('PRISMRAY_ANDROID_LOCAL_BUILD_SEQ', None)
         if java_home:
             env['JAVA_HOME'] = java_home
             env['PATH'] = f'{java_home}/bin:{env.get("PATH", "")}'
@@ -193,10 +338,15 @@ def build_android_apk(output_dir: Path, *, force_download_cores: bool = False) -
         )
     else:
         print('==> No Android release keystore configured; falling back to Debug APK (arm64-v8a)')
+        debug_env = dict(os.environ)
+        if seq is not None:
+            debug_env['PRISMRAY_ANDROID_LOCAL_BUILD_SEQ'] = str(seq)
+        else:
+            debug_env.pop('PRISMRAY_ANDROID_LOCAL_BUILD_SEQ', None)
         cmd = [sys.executable, str(ROOT / 'scripts' / 'android_studio_dev.py'), '--abis', 'arm64-v8a']
         if has_staged_cores and not force_download_cores:
             cmd.append('--skip-cores')
-        run(cmd)
+        run(cmd, env=debug_env)
 
     apk_root = ROOT / 'frontend' / 'src-tauri' / 'gen' / 'android' / 'app' / 'build' / 'outputs' / 'apk'
     candidates = sorted(p for p in apk_root.rglob('*.apk') if p.is_file())
@@ -226,7 +376,7 @@ def build_android_apk(output_dir: Path, *, force_download_cores: bool = False) -
             continue
         break
 
-    dest = output_dir / 'prismray-android-arm64.apk'
+    dest = output_dir / format_versioned_artifact_name(resolved_name, 'android-arm64.apk')
     tmp = dest.with_name(f'.{dest.name}.tmp.{os.getpid()}')
     shutil.copy2(selected, tmp)
     os.replace(tmp, dest)
@@ -237,7 +387,7 @@ def write_checksums(output_dir: Path) -> Path:
     checksum_file = output_dir / 'SHA256SUMS.txt'
     assets = sorted(
         p for p in output_dir.iterdir()
-        if p.is_file() and p.name != checksum_file.name
+        if p.is_file() and p.name != checksum_file.name and not p.name.startswith('.')
     )
     lines: list[str] = []
     for asset in assets:
@@ -268,7 +418,27 @@ def main() -> int:
         action='store_true',
         help='Force re-downloading Android sing-box + Xray cores even when already staged',
     )
+    parser.add_argument(
+        '--bump-version',
+        default='',
+        help='Synchronize repository version across manifests, i18n, and Go backend (e.g. 1.0.2) before building',
+    )
+    parser.add_argument(
+        '--android-local-seq',
+        type=int,
+        default=None,
+        help='Explicit local Android build sequence (1..998); defaults to auto-incrementing releases/.local_build_seq.json',
+    )
+    parser.add_argument(
+        '--release-version-code',
+        action='store_true',
+        help='Build Android APK with official release versionCode offset (999) instead of local sequence',
+    )
     args = parser.parse_args()
+
+    if args.bump_version:
+        updated_files = bump_repo_version(ROOT, args.bump_version)
+        print(f'==> Bumped repo version to {args.bump_version.lstrip("v")} ({len(updated_files)} files updated)')
 
     targets = [t.strip().lower() for t in args.targets.split(',') if t.strip()]
     invalid = [t for t in targets if t not in DEFAULT_TARGETS]
@@ -287,7 +457,14 @@ def main() -> int:
     if 'headless' in targets:
         exported.extend(build_headless_archives(output_dir))
     if 'android' in targets:
-        exported.append(build_android_apk(output_dir, force_download_cores=args.download_android_cores))
+        exported.append(
+            build_android_apk(
+                output_dir,
+                force_download_cores=args.download_android_cores,
+                local_build_seq=args.android_local_seq,
+                use_release_version_code=args.release_version_code,
+            )
+        )
 
     checksum_file = write_checksums(output_dir)
     exported.append(checksum_file)

@@ -7,9 +7,8 @@ arch=('x86_64' 'aarch64')
 url='https://github.com/CRACKRAMMER/PrismRay'
 license=('MPL-2.0')
 depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'openssl' 'librsvg' 'hicolor-icon-theme')
-makedepends=('git' 'go>=1.26.0' 'rust' 'nodejs>=22' 'npm' 'python' 'pkgconf')
+makedepends=('git' 'go>=1.26.3' 'rust' 'nodejs>=22' 'npm' 'python' 'pkgconf')
 optdepends=(
-  'sing-box: primary proxy & TUN core (auto-downloaded if omitted)'
   'xray: on-demand XHTTP / VLESS encryption coprocessor (auto-downloaded if omitted)'
   'fprintd: optional fingerprint unlock'
   'polkit: system authentication fallback for biometric unlock and privileged TUN'
@@ -33,6 +32,8 @@ prepare() {
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')" --manifest-path src-tauri/Cargo.toml
   cd ../backend
   go mod download
+  cd singbox-android
+  go mod download
 }
 
 build() {
@@ -41,6 +42,13 @@ build() {
   export CARGO_TARGET_DIR="$srcdir/target"
   export CGO_ENABLED=0
   python scripts/build_sidecar.py
+  (
+    cd backend/singbox-android
+    go build -trimpath \
+      -tags "with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_tailscale" \
+      -ldflags='-s -w' \
+      -o "$srcdir/sing-box" .
+  )
   cd frontend
   npm run tauri -- build --ci --ignore-version-mismatches --no-bundle --target "$RUST_TARGET" -- --locked --offline
 }
@@ -48,6 +56,8 @@ build() {
 check() {
   cd "$srcdir/prismray/backend"
   go test ./...
+  cd singbox-android
+  go test -tags "with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_tailscale" ./...
 }
 
 package() {
@@ -56,6 +66,7 @@ package() {
   target="$(rustc -vV | sed -n 's/^host: //p')"
   install -Dm755 "$srcdir/target/$target/release/prismray" "$pkgdir/usr/lib/prismray/prismray"
   install -Dm755 "frontend/src-tauri/binaries/prismray-server-$target" "$pkgdir/usr/lib/prismray/prismray-server"
+  install -Dm755 "$srcdir/sing-box" "$pkgdir/usr/lib/prismray/sing-box"
   install -d "$pkgdir/usr/bin"
   ln -s /usr/lib/prismray/prismray "$pkgdir/usr/bin/prismray"
   install -Dm644 packaging/prismray.desktop "$pkgdir/usr/share/applications/prismray.desktop"
